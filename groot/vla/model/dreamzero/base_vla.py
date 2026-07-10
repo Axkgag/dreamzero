@@ -501,8 +501,6 @@ class VLA(PreTrainedModel):
         pretrained_model_name_or_path: str,
         config: VLAConfig = None
     ):
-        del config
-
         from safetensors.torch import load_file
         import os
         import json
@@ -531,12 +529,15 @@ class VLA(PreTrainedModel):
             print(f"Loading weights from safetensors: {safetensors_path}")
             state_dict.update(load_file(safetensors_path))
         
-        # Load config
-        print("loading config@@")
-        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        config = VLAConfig(**config_dict)
+        # Load config unless the caller supplied an overridden config.
+        if config is None:
+            print("loading config@@")
+            config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+            config = VLAConfig(**config_dict)
+        else:
+            print("using provided config@@")
         print("loading model")
         print("config.action_head_cfg", config.action_head_cfg)
         # Always disable defer_lora_injection

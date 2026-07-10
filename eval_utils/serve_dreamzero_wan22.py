@@ -116,6 +116,46 @@ def _maybe_init_distributed():
     torch.cuda.set_device(0)
 
 
+def _resolve_wan_pretrained_dir(wan_pretrained_dir: str | None) -> Path | None:
+    """Resolve optional local Wan component directory.
+
+    If no explicit path is provided, prefer WAN_PRETRAINED_DIR. Full DreamZero
+    checkpoints should normally rely on skip_component_loading instead.
+    """
+    candidate = wan_pretrained_dir or os.getenv("WAN_PRETRAINED_DIR")
+    if candidate:
+        path = Path(candidate).expanduser()
+        return path if path.is_absolute() else (Path.cwd() / path).resolve()
+    return None
+
+
+def _wan_component_overrides(wan_dir: Path | None) -> list[str]:
+    if wan_dir is None:
+        return []
+
+    files = {
+        "text_encoder": wan_dir / "models_t5_umt5-xxl-enc-bf16.pth",
+        "image_encoder": wan_dir / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        "vae": wan_dir / "Wan2.1_VAE.pth",
+    }
+    missing = [str(path) for path in files.values() if not path.exists()]
+    missing_index = wan_dir / "diffusion_pytorch_model.safetensors.index.json"
+    missing_single = wan_dir / "diffusion_pytorch_model.safetensors"
+    if not missing_index.exists() and not missing_single.exists():
+        missing.append(str(missing_index))
+    if missing:
+        raise FileNotFoundError(
+            "Wan pretrained directory is incomplete. Missing: " + ", ".join(missing)
+        )
+
+    return [
+        f"action_head_cfg.config.text_encoder_cfg.text_encoder_pretrained_path={files['text_encoder']}",
+        f"action_head_cfg.config.image_encoder_cfg.image_encoder_pretrained_path={files['image_encoder']}",
+        f"action_head_cfg.config.vae_cfg.vae_pretrained_path={files['vae']}",
+        f"action_head_cfg.config.diffusion_model_cfg.diffusion_model_pretrained_path={wan_dir}",
+    ]
+
+
 # Modality key mappings: client observation keys -> model input keys per embodiment.
 # Client sends: observation/exterior_image_0_left, exterior_image_1_left, wrist_image_left.
 VIDEO_KEY_MAPPING = {
@@ -332,6 +372,7 @@ def main(
     model_path: str = "./checkpoints/dreamzero_droid_wan22_smoke",
     embodiment_tag: str = "oxe_droid",
     tokenizer_path: str | None = None,
+    wan_pretrained_dir: str | None = None,
     port: int = 8000,
     host: str = "0.0.0.0",
     image_height: int | None = None,
@@ -347,9 +388,18 @@ def main(
     logger.info("Loading DreamZero Wan22 policy from %s (embodiment=%s)", model_path, embodiment_tag)
     checkpoint_name = os.path.basename(model_path.rstrip("/"))
     video_output_dir = os.path.join(video_output_dir, checkpoint_name)
+    resolved_wan_dir = _resolve_wan_pretrained_dir(wan_pretrained_dir)
+    model_config_overrides = ["action_head_cfg.config.skip_component_loading=true"]
+    model_config_overrides.extend(_wan_component_overrides(resolved_wan_dir))
+    if resolved_wan_dir is not None:
+        logger.info("Using local Wan pretrained components from %s", resolved_wan_dir)
+        model_config_overrides.append("action_head_cfg.config.skip_component_loading=false")
+    else:
+        logger.info("Skipping external Wan component preload; using weights from checkpoint")
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag(embodiment_tag),
         model_path=model_path,
+        model_config_overrides=model_config_overrides,
         tokenizer_path_override=tokenizer_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,

@@ -20,9 +20,9 @@ authors = [
 requires-python = "~=3.11,<3.13"
 dependencies = [
     "av==15.0.0",
-    "torch==2.8.0",
-    "torchvision==0.23.0",
-    "torchaudio==2.8.0",
+    # "torch==2.8.0",
+    # "torchvision==0.23.0",
+    # "torchaudio==2.8.0",
     "pyttsx3==2.90",
     "scipy==1.15.3",
     "numpy==1.26.4",
