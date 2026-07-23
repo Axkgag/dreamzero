@@ -341,6 +341,79 @@ transform_yam:
     # Model-specific transform
     - ${model_specific_transform}
 
+################################################################################
+# xdof (MobileManiBench G1/XHand baseline: EEF state/action, head+wrist RGB)
+#
+# Both robot variants use the same semantic keys and are trained from separate
+# dataset roots. The hand slice is discovered from each root's modality.json:
+# one dimension for G1 and twelve dimensions for XHand.
+################################################################################
+
+modality_config_xdof:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.head
+      - video.wrist
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.eef_position
+      - state.eef_rotation_rpy
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.eef_delta_position_normalized
+      - action.eef_delta_rotation_rpy_normalized
+      - action.hand_target_normalized
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_xdof:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_xdof.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_xdof.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_xdof.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_xdof.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_xdof.video.modality_keys}
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_xdof.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_xdof.state.modality_keys}
+      normalization_modes:
+        state.eef_position: q99
+        state.eef_rotation_rpy: q99
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_xdof.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_xdof.action.modality_keys}
+      normalization_modes:
+        action.eef_delta_position_normalized: q99
+        action.eef_delta_rotation_rpy_normalized: q99
+        action.hand_target_normalized: q99
+
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_xdof.video.modality_keys}
+      state_concat_order: ${modality_config_xdof.state.modality_keys}
+      action_concat_order: ${modality_config_xdof.action.modality_keys}
+
+    - ${model_specific_transform}
+
 
 ################################################################################
 # Modality Configs
@@ -350,6 +423,7 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  xdof: ${modality_config_xdof}
 
 ################################################################################
 # Transforms
@@ -359,6 +433,7 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  xdof: ${transform_xdof}
 
 ################################################################################
 # Metadata Versions
@@ -368,6 +443,7 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  xdof: 'local'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -375,3 +451,4 @@ metadata_versions:
 
 fps:
   yam: 30
+  xdof: 30
