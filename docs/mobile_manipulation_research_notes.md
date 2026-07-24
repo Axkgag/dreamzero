@@ -139,7 +139,96 @@ L = L_video
 
 该设计的关键不是多加一个 depth loss，而是要求 video future 和 3D future 在几何上描述同一个未来。
 
-### 2.6 最小可行实现路径
+### 2.6 VGGT-Based 3D Token Pretraining
+
+当前一个更具体的第一阶段方案是使用 VGGT 作为多视角 image encoder，并在其 image tokens 之上构建一组共享的 metric 3D tokens。VGGT 的价值在于提供更强的多视角几何先验，但核心贡献不应表述为“换了更好的 image encoder”，而应表述为：
+
+> 用相机内外参约束 2D-to-3D lifting，使共享 3D tokens 具备明确的空间语义，并能被重新渲染回各个视角的 depth。
+
+#### 3D Tokens 的构造
+
+3D tokens 不应是普通 learnable latent，而应绑定到机器人 base frame、world frame 或 reference camera frame 下的固定 3D 坐标。可以定义局部 BEV / voxel / BEV-height 网格：
+
+```text
+token_i <-> cell center P_i = (x_i, y_i, z_i)
+F_i = MLP(pos_embed(P_i)) + learnable_feature_i
+```
+
+这样每个 token 的 index 对应一个真实空间位置，例如机器人前方某个 `x, y, z` cell。为了控制计算量，第一版可以优先使用 BEV-height tokens，而不是高分辨率 dense voxel。
+
+#### 2D-to-3D 聚合
+
+对每个 3D query `P_i`，利用相机内参 `K_v` 和外参 `T_v` 投影到每个视角：
+
+```text
+p_{i,v} = project(P_i, K_v, T_v)
+```
+
+然后在该投影点附近从 VGGT image tokens 中采样特征，并通过 deformable attention 或加权融合写入同一组 3D tokens：
+
+```text
+f_{i,v} = bilinear_sample(image_tokens_v, p_{i,v})
+F_i = Attention(query=F_i, key/value={f_{i,v}})
+```
+
+这一步是几何可解释性的关键：3D token 只能从其投影位置附近获得多视角证据，而不是任意 attend 全图。多视角图片因此共享同一组 3D tokens，同一个空间 cell 的证据会来自所有可见视角。
+
+#### Ray-Based Depth Decoder
+
+从共享 3D tokens 解码某个视角的 depth 时，不建议直接用普通 CNN / MLP 生成 depth image。更合理的方式是 ray-based decoder：对目标 view 的每个像素 `(u, v)`，根据相机参数构造 3D ray：
+
+```text
+P(d) = O + d * r(u, v)
+```
+
+沿 ray 采样多个候选深度 `d_j`，在每个采样点从 3D token grid 中插值得到特征：
+
+```text
+P_j = O + d_j * r
+g_j = trilinear_sample(3D_tokens, P_j)
+logit_j = MLP(g_j, pos_embed(P_j), ray_dir)
+```
+
+对所有 `logit_j` 做 softmax 得到每个候选深度是表面的概率，再用期望得到预测深度：
+
+```text
+p_j = softmax(logit_j)
+D_pred(u, v) = sum_j p_j * d_j
+```
+
+监督可以使用：
+
+```text
+L_depth = L1(D_pred, D_gt)
+        + CE(depth_bin_logits, gt_depth_bin)
+        + optional scale-invariant log depth loss
+```
+
+这个 decoder 可以理解为一个轻量可微渲染器：同一组 3D tokens 是场景表示，不同相机的 rays 决定从哪个视角渲染 depth。
+
+#### 避免 2D / 3D 分支退化为独立 Autoencoder
+
+如果 image tokens 只负责重建 RGB，3D tokens 只负责预测 depth，模型可能学成两个相对独立的 autoencoder。为避免这种退化，第一阶段应加入跨视角和跨模态约束：
+
+- masked view training：随机 drop 某些视角的 image tokens，仍要求从共享 3D tokens 解码被遮掉视角的 depth 或 feature。
+- cross-view depth consistency：将一个视角预测的 depth unproject 成点云，再 project 到其他视角，与对应 depth 对齐。
+- 3D-to-2D feature reconstruction：用 `3D tokens + target camera pose` 重建目标视角的 VGGT / DINO / VAE feature，而不仅是 depth。
+- image-token dropout / bottleneck：限制 image decoder 直接复制完整 image tokens，迫使跨视角结构进入 3D tokens。
+- occupancy / free-space supervision：如果有 RGB-D 或仿真数据，可从 depth 构造 occupied / free / unknown voxel label，对 metric 3D tokens 加空间占用监督。
+
+一个最小可行的第一阶段目标为：
+
+```text
+L_stage1 =
+    L_depth_all_views
+  + lambda_1 L_cross_view_depth
+  + lambda_2 L_masked_view_feature_or_depth
+  + optional lambda_3 L_occupancy
+```
+
+这样训练得到的 3D tokens 既能从多视角 image tokens 中聚合信息，又能通过相机 rays 解码回各个视角的 depth，并保留明确的几何可解释性。
+
+### 2.7 最小可行实现路径
 
 建议分三阶段实现：
 
@@ -149,7 +238,7 @@ L = L_video
 
 初期不建议直接做完整 occupancy 或 object-level SE(3)，因为标注和工程复杂度更高。
 
-### 2.7 为什么适合 Mobile Manipulation
+### 2.8 为什么适合 Mobile Manipulation
 
 Mobile manipulation 中至少有三类变化混在一起：
 
@@ -161,7 +250,7 @@ Mobile manipulation 中至少有三类变化混在一起：
 
 这正是 mobile manipulation 需要的物理世界模型能力。
 
-### 2.8 Base-Prior Guided Joint Action Flow
+### 2.9 Base-Prior Guided Joint Action Flow
 
 在 action 设计上，当前更倾向于采用 **base-prior guided joint action flow**，而不是完全解耦 base 和 arm。完全解耦虽然能处理执行频率差异，但容易导致 base 和 arm 动作割裂；两段式独立模型虽然能先预测粗 base action 再预测 whole-body action，但会增加模型重量、推理延迟和训练复杂度。
 
@@ -392,17 +481,17 @@ Mobile manipulation 的失败模式很多，例如：
 
 ### 4.1 真实数据
 
-- [AIRoA MoMa Dataset](https://arxiv.org/abs/2509.25032)：目前非常贴近 mobile manipulation 的真实数据选择。它包含 Human Support Robot 上采集的 25,469 episodes / 约 94 小时真实 mobile manipulation 数据，提供 RGB、joint states、六轴 wrist force-torque、internal robot states，并带有 sub-goal 和 primitive action 的两层 annotation；数据标准化为 LeRobot v2.1。
-  - 适合点：与 DreamZero 当前 LeRobot / GEAR 数据管线兼容性好；sub-goal / primitive annotation 很适合监督 base prior tokens；failure cases 和 contact-rich 任务适合做 error analysis 和 recovery。
-  - 局限：公开摘要中未强调 RGB-D / point cloud，因此它更适合 action coordination、base prior、hierarchical learning，不一定直接满足 Video-3D Projection Consistency 的全部几何监督需求。
+- [BRMData](https://arxiv.org/abs/2405.18860)：bimanual-mobile household manipulation 数据集，包含单臂/双臂、桌面/移动操作、多视角 RGB、depth sensing、base action 和 arm action。
+  - 适合点：真实 household mobile manipulation，传感器和动作字段与当前方案高度匹配，适合验证 base waypoint + EEF delta、video-depth consistency 和 3D spatial tokens。
+  - 局限：规模和任务覆盖相比大规模真实数据集更有限，更适合作为真实几何验证和小规模 fine-tuning。
+
+- [AIRoA MoMa Dataset](https://arxiv.org/abs/2509.25032)：真实 mobile manipulation 数据，包含 Human Support Robot 上采集的 25,469 episodes / 约 94 小时数据，提供 RGB、joint states、六轴 wrist force-torque、internal robot states，并带有 sub-goal 和 primitive action 的两层 annotation；数据标准化为 LeRobot v2.1。
+  - 适合点：与 DreamZero 当前 LeRobot / GEAR 数据管线兼容性好；sub-goal / primitive annotation 很适合监督 base prior tokens、primitive tokens 和 failure-aware recovery。
+  - 局限：公开信息中未强调 RGB-D / point cloud，因此它更适合 action coordination、hierarchical learning 和真实策略 fine-tuning，不应作为第一阶段 3D tokenizer 的唯一几何监督来源。
 
 - [RoboMIND 2.0](https://arxiv.org/abs/2512.24653)：大规模真实多 embodiment 数据，包含 310K+ dual-arm manipulation trajectories、739 tasks、12K tactile-enhanced episodes、20K mobile manipulation trajectories，并提供 20K digital-twin simulated trajectories。
   - 适合点：规模大，包含 mobile manipulation 和 digital twin，适合真实 fine-tuning、cross-embodiment generalization、sim-to-real transfer。
   - 局限：需要进一步确认其公开数据字段是否包含足够的 camera pose / depth / point cloud，以支持精确 projection consistency。
-
-- [BRMData](https://arxiv.org/abs/2405.18860)：bimanual-mobile household manipulation 数据集，包含单臂/双臂、桌面/移动操作、多视角和 depth-sensing data，任务贴近家庭场景。
-  - 适合点：真实 household mobile manipulation，带 depth，适合验证 base waypoint + EEF delta 和 Video-3D Consistency。
-  - 局限：规模和任务覆盖相比 RoboMIND 2.0 / AIRoA MoMa 可能更有限。
 
 - [Mobile ALOHA](https://arxiv.org/abs/2401.02117)：低成本 whole-body teleoperation 系统和 bimanual mobile manipulation demos，任务包括厨房、柜子、电梯、水槽等长程移动双臂操作。
   - 适合点：任务形态非常贴近 mobile manipulation，适合参考 action representation、whole-body control 和小数据 co-training 方案。
@@ -414,7 +503,15 @@ Mobile manipulation 的失败模式很多，例如：
 
 - [MobileManiBench](https://arxiv.org/abs/2602.05233)：非常适合本方案的仿真 benchmark。它基于 NVIDIA Isaac Sim，包含 2 个 mobile platform、head / wrist 两个同步相机、RGB-depth-segmentation、多对象和机器人状态/动作、语言指令、630 objects、100 realistic scenes、100+ tasks 和 300K trajectories。
   - 适合点：几乎完整覆盖 Tri-Factorized 所需监督：RGB-D、segmentation、object / robot states、actions、language。非常适合做 future depth、point flow、occupancy、projection consistency 和 base-prior ablation。
-  - 建议定位：第一阶段主实验 / 架构验证数据集。
+  - 建议定位：当前方案的第一优先级主数据和主 benchmark，尤其适合 VGGT spatiotemporal tokenizer、dynamic 3D tokens 和 WAM video-action-3D 联合训练。
+
+- [BiGym](https://proceedings.mlr.press/v270/chernyadev25a.html)：面向 bimanual mobile manipulation 的家庭任务 benchmark，包含 40 个长程家庭任务、human demonstrations，并支持 RGB、depth、多相机视角和 proprioception。
+  - 适合点：任务形态与 household mobile manipulation 高度贴合，适合评估长程双臂移动操作、遮挡、base repositioning 和多视角视频建模。
+  - 局限：需要确认其动作空间和数据导出格式能否直接接入 LeRobot / GEAR；更适合作为仿真评测和中等规模验证。
+
+- ManiSkill / ManiSkill-HAB：适合快速构造可控 ablation 和大规模仿真数据。ManiSkill 支持 RGB-D、segmentation、robot/object states 和 GPU 并行采集；ManiSkill-HAB 面向 Home Assistant Benchmark 的移动操作任务，工程上比 BEHAVIOR-1K 更适合快速迭代。
+  - 适合点：非常适合验证 tokenizer 压缩比、depth / occupancy supervision、projection consistency、action factorization 等模块级消融。
+  - 局限：任务复杂度和真实家庭长程交互不一定覆盖完整 mobile manipulation，需要与更真实的 benchmark 搭配使用。
 
 - BEHAVIOR-1K / OmniGibson：1000 个日常活动，长程复杂交互，适合 benchmark 和 sim pretraining。2025 BEHAVIOR Challenge 也体现了其对 long-horizon mobile manipulation 的评测价值。
   - 适合点：复杂家庭任务和长程 mobile manipulation，适合评估 generalization 和系统能力。
@@ -445,13 +542,16 @@ Mobile manipulation 的失败模式很多，例如：
 
 ### 4.4 当前优先级建议
 
-按照与本方案的匹配度，推荐优先级为：
+按照与当前 VGGT video tokenizer + dynamic 3D tokens + WAM 联合训练方案的匹配度，推荐优先级为：
 
-1. **MobileManiBench**：最适合验证 Tri-Factorized Flow Matching 和 Video-3D Projection Consistency，因为它有 RGB-D、segmentation、object / robot states、actions 和 language。
-2. **AIRoA MoMa**：最适合真实 mobile manipulation + LeRobot pipeline，尤其适合 base prior tokens、subgoal / primitive supervision、failure-aware analysis。
-3. **RoboMIND 2.0**：适合大规模真实 fine-tuning 和 sim-to-real，如果字段支持 depth / pose / point cloud，则很适合做主数据。
-4. **BRMData / Mobile ALOHA**：适合 household bimanual mobile manipulation 的真实任务验证。
-5. **PointWorld / 3DFlowAction / FlowDreamer / RynnWorld-4D**：不一定作为主 benchmark，但非常适合借鉴 3D flow supervision、pseudo-label 构造和 video-3D consistency 训练方式。
+1. **MobileManiBench**：最适合作为主实验和架构验证数据集。它同时提供多视角 RGB-D、segmentation、robot/object states、actions 和 language，能直接支撑 video compression、3D token 聚合、future depth / occupancy / point flow 和 projection consistency。
+2. **BRMData + BiGym**：最适合验证真实或仿真 household bimanual mobile manipulation。BRMData 更偏真实多视角 RGB-D 和 base/arm action 验证；BiGym 更适合长程家庭任务 benchmark。
+3. **AIRoA MoMa**：最适合接入 LeRobot / GEAR pipeline，并用于 base prior tokens、subgoal / primitive supervision、contact-rich action learning 和 failure recovery，但不是最强的几何监督来源。
+4. **RoboMIND 2.0**：适合大规模真实 fine-tuning、cross-embodiment generalization 和 sim-to-real。如果确认公开字段包含稳定 depth / camera pose / point cloud，可以提升为主数据之一。
+5. **ManiSkill / ManiSkill-HAB**：适合快速做模块级消融和合成数据生成，尤其是 depth、segmentation、occupancy、camera pose、action factorization 和 tokenizer 压缩比实验。
+6. **BEHAVIOR-1K / OmniGibson**：适合中后期 long-horizon benchmark，用于验证复杂家庭任务、unseen layout、long-horizon spatial memory 和系统级 generalization。
+7. **DROID**：只建议作为 manipulation-only pretraining 数据，帮助保留 DreamZero 原有局部操作能力，不适合作为 mobile manipulation 或 3D-consistent WAM 的主数据。
+8. **PointWorld / 3DFlowAction / FlowDreamer / RynnWorld-4D**：不建议作为主 benchmark，但非常适合借鉴 3D flow supervision、pseudo-label 构造、RGB-D-flow consistency 和 video-3D consistency 训练方式。
 
 ## 5. 推荐论文方案
 

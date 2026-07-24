@@ -600,11 +600,86 @@ class WANPolicyHead(ActionHead):
             param.data = param.to(torch.float32)
         return model
 
+    def prepare_action_model_kwargs(self, action_input: BatchFeature) -> dict:
+        """Hook for research action heads that pass extra token metadata to the DiT."""
+        return {}
+
+    def align_action_timestep_ids(
+        self, timestep_action_id: torch.Tensor
+    ) -> torch.Tensor:
+        """Hook for multi-stream heads that require tied diffusion timesteps."""
+        return timestep_action_id
+
+    def validate_action_video_layout(
+        self,
+        actions: torch.Tensor,
+        noise: torch.Tensor,
+        state_features: torch.Tensor,
+        videos: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> None:
+        """Validate the legacy per-video-block action/state register layout."""
+        assert actions.shape[1] / (noise.shape[1] - 1) == (
+            self.model.num_action_per_block // self.num_frame_per_block
+        ), (
+            f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, "
+            f"video.shape, {videos.shape}, latents.shape, {latents.shape}"
+        )
+        assert (noise.shape[1] - 1) / state_features.shape[1] == (
+            self.num_frame_per_block // self.model.num_state_per_block
+        ), (
+            f"state_features.shape, {state_features.shape}, "
+            f"noise.shape, {noise.shape}, video.shape, {videos.shape}, "
+            f"latents.shape, {latents.shape}"
+        )
+
+    def build_coupled_action_timestep_ids(
+        self,
+        timestep_id_block: torch.Tensor,
+        actions: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map legacy per-frame video timesteps onto action tokens."""
+        timestep_action_id = timestep_id_block.repeat(
+            1, 1, actions.shape[1] // (noise.shape[1] - 1)
+        )
+        return timestep_action_id.reshape(timestep_action_id.shape[0], -1)
+
+    def compute_action_losses(
+        self,
+        action_noise_pred: torch.Tensor,
+        training_target_action: torch.Tensor,
+        action_mask: torch.Tensor,
+        has_real_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute the legacy single-stream masked flow-matching objective."""
+        action_loss_per_sample = torch.nn.functional.mse_loss(
+            action_noise_pred.float(),
+            training_target_action.float(),
+            reduction="none",
+        ) * action_mask
+        action_loss_per_sample = (
+            has_real_action[:, None].float() * action_loss_per_sample
+        )
+        weight_action = action_loss_per_sample.mean(
+            dim=2
+        ) * self.scheduler.training_weight(
+            timestep_action.flatten(0, 1),
+        ).unflatten(
+            0, (action_noise_pred.shape[0], action_noise_pred.shape[1])
+        ).to(
+            self._device
+        )
+        weighted_action_loss = weight_action.mean()
+        return {"action_loss": weighted_action_loss}
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
         data = action_input 
+        action_model_kwargs = self.prepare_action_model_kwargs(action_input)
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
         # print("embodiment_id", embodiment_id)
@@ -700,8 +775,9 @@ class WANPolicyHead(ActionHead):
         
         if actions.numel() > 0:
             noise_action = torch.randn_like(actions)
-            assert actions.shape[1] / (noise.shape[1]-1) == (self.model.num_action_per_block // self.num_frame_per_block), f"actions.shape, {actions.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
-            assert (noise.shape[1]-1) / state_features.shape[1] == (self.num_frame_per_block // self.model.num_state_per_block), f"state_features.shape, {state_features.shape}, noise.shape, {noise.shape}, video.shape, {videos.shape}, latents.shape, {latents.shape}"
+            self.validate_action_video_layout(
+                actions, noise, state_features, videos, latents
+            )
             
             # ============ ACTION TIMESTEP SAMPLING ============
             if self.config.decouple_video_action_noise:
@@ -714,9 +790,11 @@ class WANPolicyHead(ActionHead):
                 action_mode = "INDEPENDENT"
             else:
                 # Original coupled: action timestep derived from video timestep
-                timestep_action_id = timestep_id_block.repeat(1, 1, actions.shape[1]//(noise.shape[1]-1))
-                timestep_action_id = timestep_action_id.reshape(timestep_action_id.shape[0], -1)
+                timestep_action_id = self.build_coupled_action_timestep_ids(
+                    timestep_id_block, actions, noise
+                )
                 action_mode = "COUPLED"
+            timestep_action_id = self.align_action_timestep_ids(timestep_action_id)
             
             # Log noise mode once
             if not self._noise_logged:
@@ -765,6 +843,7 @@ class WANPolicyHead(ActionHead):
                     state=state_features, embodiment_id=embodiment_id,
                     action=noisy_actions, timestep_action=timestep_action, 
                     clean_x=latents.transpose(1, 2),
+                    **action_model_kwargs,
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
@@ -772,6 +851,7 @@ class WANPolicyHead(ActionHead):
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
                     clean_x=latents.transpose(1, 2),
+                    **action_model_kwargs,
                 )
 
             # Per-sample dynamics loss
@@ -789,16 +869,17 @@ class WANPolicyHead(ActionHead):
             weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
-                action_loss_per_sample = torch.nn.functional.mse_loss(
-                    action_noise_pred.float(), training_target_action.float(), reduction='none'
-                ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
-                weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
-                    timestep_action.flatten(0, 1),
-                ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
-                weighted_action_loss = weight_action.mean()
+                action_losses = self.compute_action_losses(
+                    action_noise_pred=action_noise_pred,
+                    training_target_action=training_target_action,
+                    action_mask=action_mask,
+                    has_real_action=has_real_action,
+                    timestep_action=timestep_action,
+                )
+                weighted_action_loss = action_losses["action_loss"]
                 loss = weighted_dynamics_loss + weighted_action_loss
             else:
+                action_losses = {}
                 weighted_action_loss = torch.tensor(0.0, device=self._device)
                 loss = weighted_dynamics_loss
             # loss = dynamics_loss_per_sample.mean()
@@ -809,6 +890,7 @@ class WANPolicyHead(ActionHead):
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
         }
+        output_dict.update(action_losses)
 
         return BatchFeature(data=output_dict)
 
@@ -864,7 +946,9 @@ class WANPolicyHead(ActionHead):
         kv_caches: list[KVCacheType],
         crossattn_caches: list[KVCacheType],
         kv_cache_metadata: dict[str, bool | int],
+        action_model_kwargs: dict | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        action_model_kwargs = action_model_kwargs or {}
         predictions = []
         for index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[index]
@@ -896,6 +980,7 @@ class WANPolicyHead(ActionHead):
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_cache,
                     current_start_frame=kv_cache_metadata["start_frame"],
+                    **action_model_kwargs,
                 )
                 if kv_cache_metadata["update_kv_cache"]:
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
@@ -921,11 +1006,21 @@ class WANPolicyHead(ActionHead):
         other_predictions = [torch.empty_like(pred) for pred in my_predictions]
 
         send_ops = [
-            dist.P2POp(op=dist.isend, tensor=pred, group_peer=(self.ip_rank + 1) % self.ip_size, group=self.ip_group)
+            dist.P2POp(
+                op=dist.isend,
+                tensor=pred,
+                peer=(self.ip_rank + 1) % self.ip_size,
+                group=self.ip_group,
+            )
             for pred in my_predictions
         ]
         recv_ops = [
-            dist.P2POp(op=dist.irecv, tensor=other_pred, group_peer=(self.ip_rank + 1) % self.ip_size, group=self.ip_group)
+            dist.P2POp(
+                op=dist.irecv,
+                tensor=other_pred,
+                peer=(self.ip_rank + 1) % self.ip_size,
+                group=self.ip_group,
+            )
             for other_pred in other_predictions
         ]
         ops = send_ops + recv_ops
@@ -972,6 +1067,7 @@ class WANPolicyHead(ActionHead):
 
     def lazy_joint_video_action(self, backbone_output: BatchFeature, action_input: BatchFeature, latent_video: torch.Tensor | None = None) -> BatchFeature:
         start_time = time.perf_counter()
+        action_model_kwargs = self.prepare_action_model_kwargs(action_input)
 
         # Tracking time taken on GPU for various operations.
         start_text_encoder_event = torch.cuda.Event(enable_timing=True)
@@ -1159,6 +1255,7 @@ class WANPolicyHead(ActionHead):
                     start_frame=0,
                     update_kv_cache=True,
                 ),
+                action_model_kwargs=action_model_kwargs,
             )
             self.current_start_frame += 1
             
@@ -1187,6 +1284,7 @@ class WANPolicyHead(ActionHead):
                     start_frame=self.current_start_frame - self.num_frame_per_block,
                     update_kv_cache=True,
                 ),
+                action_model_kwargs=action_model_kwargs,
             )
 
         end_kv_event.record()
@@ -1270,6 +1368,7 @@ class WANPolicyHead(ActionHead):
                         start_frame=self.current_start_frame,
                         update_kv_cache=False,
                     ),
+                    action_model_kwargs=action_model_kwargs,
                 )
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
                 flow_pred_uncond, flow_pred_uncond_action = predictions[1]

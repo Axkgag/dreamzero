@@ -245,3 +245,4 @@ groot/control/envs/yam/data/eval/*
 checkpoints/
 video_pred_output*/
 work_dirs/
+sim-evals

@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - wan_flow_matching_action_tf
+  - _self_
+
+plan_horizon: 6
+plan_time_offsets: [1, 4, 8, 12, 16, 24]
+base_action_dim: 4
+max_manipulator_action_dim: 21
+control_fps: 30.0
+
+# The Wan attention register contains both semantic streams.
+action_horizon: 12
+max_action_dim: 21
+num_action_per_block: 12
+
+action_head_cfg:
+  _target_: groot.vla.model.dreamzero.action_head.mobile_plan_flow_matching.MobilePlanFlowMatchingActionHead
+  config:
+    _target_: groot.vla.model.dreamzero.action_head.mobile_plan_flow_matching.MobilePlanPolicyHeadConfig
+    action_dim: ${max_manipulator_action_dim}
+    action_horizon: ${action_horizon}
+    plan_horizon: ${plan_horizon}
+    base_action_dim: ${base_action_dim}
+    manipulator_action_dim: ${max_manipulator_action_dim}
+    plan_time_offsets: ${plan_time_offsets}
+    control_fps: ${control_fps}
+    base_flow_loss_weight: 1.0
+    manipulator_flow_loss_weight: 1.0
+    diffusion_model_cfg:
+      _target_: groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan.WanVideoDiTDualPlan
+      action_dim: ${max_manipulator_action_dim}
+      num_action_per_block: ${num_action_per_block}
+      plan_horizon: ${plan_horizon}
+      base_action_dim: ${base_action_dim}
+      manipulator_action_dim: ${max_manipulator_action_dim}
+      max_state_dim: ${max_state_dim}
+      plan_time_offsets: ${plan_time_offsets}
+      control_fps: ${control_fps}

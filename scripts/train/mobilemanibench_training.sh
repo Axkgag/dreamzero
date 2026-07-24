@@ -8,23 +8,31 @@
 set -euo pipefail
 export HYDRA_FULL_ERROR=1
 
-export WAN_CKPT_DIR=/mnt/yihao/codes/checkpoints/Wan2.1-I2V-14B-480P
-export TOKENIZER_DIR=/mnt/yihao/codes/checkpoints/umt5-xxl
-export PRETRAINED_MODEL_PATH=/mnt/yihao/codes/checkpoints/DreamZero-AgiBot
-
-export WANDB_MODE=offline
-
 MOBILEMANIBENCH_DATA_ROOT=${MOBILEMANIBENCH_DATA_ROOT:-"/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_smoke_v2/g1"}
 OUTPUT_DIR=${OUTPUT_DIR:-"./work_dirs/dreamzero_mobilemanibench_overfit"}
+WAN_CKPT_DIR=${WAN_CKPT_DIR:-"/mnt/yihao/codes/checkpoints/Wan2.1-I2V-14B-480P"}
+TOKENIZER_DIR=${TOKENIZER_DIR:-"/mnt/yihao/codes/checkpoints/umt5-xxl"}
+PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-"/mnt/yihao/codes/checkpoints/DreamZero-AgiBot"}
+WANDB_MODE=${WANDB_MODE:-offline}
+REPORT_TO=${REPORT_TO:-wandb}
+WANDB_PROJECT=${WANDB_PROJECT:-dreamzero}
+MAX_STEPS=${MAX_STEPS:-1000}
+SAVE_STEPS=${SAVE_STEPS:-100}
+SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-5}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
+LOGGING_STEPS=${LOGGING_STEPS:-1}
+PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
+export WANDB_MODE
 
 if [ -z "${NUM_GPUS:-}" ]; then
   NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 fi
 NUM_GPUS=${NUM_GPUS:-1}
 
-WAN_CKPT_DIR=${WAN_CKPT_DIR:-"./checkpoints/Wan2.1-I2V-14B-480P"}
-TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
-PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-"./checkpoints/DreamZero-AgiBot"}
+if [ "$SAVE_TOTAL_LIMIT" -lt 5 ]; then
+  echo "ERROR: SAVE_TOTAL_LIMIT must be >= 5 for standardized evaluation." >&2
+  exit 1
+fi
 
 for required_file in \
   "$MOBILEMANIBENCH_DATA_ROOT/meta/info.json" \
@@ -53,12 +61,25 @@ for required_dir in "$WAN_CKPT_DIR" "$TOKENIZER_DIR" "$PRETRAINED_MODEL_PATH"; d
   fi
 done
 
+echo "MobileManiBench baseline configuration:"
+echo "  data_root=$MOBILEMANIBENCH_DATA_ROOT"
+echo "  output_dir=$OUTPUT_DIR"
+echo "  num_gpus=$NUM_GPUS"
+echo "  max_steps=$MAX_STEPS"
+echo "  save_steps=$SAVE_STEPS"
+echo "  report_to=$REPORT_TO (WANDB_MODE=$WANDB_MODE)"
+
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  echo "Preflight checks passed; training was not started."
+  exit 0
+fi
+
 torchrun --nproc_per_node "$NUM_GPUS" --standalone \
   groot/vla/experiment/experiment.py \
-  report_to=wandb \
+  report_to="$REPORT_TO" \
   data=dreamzero/mobilemanibench_relative \
   mobilemanibench_data_root="$MOBILEMANIBENCH_DATA_ROOT" \
-  wandb_project=dreamzero \
+  wandb_project="$WANDB_PROJECT" \
   train_architecture=lora \
   num_frames=33 \
   action_horizon=24 \
@@ -72,13 +93,14 @@ torchrun --nproc_per_node "$NUM_GPUS" --standalone \
   seed=42 \
   training_args.learning_rate=1e-5 \
   training_args.deepspeed="groot/vla/configs/deepspeed/zero2.json" \
-  save_steps=100 \
+  save_steps="$SAVE_STEPS" \
+  logging_steps="$LOGGING_STEPS" \
   training_args.warmup_ratio=0.05 \
   output_dir="$OUTPUT_DIR" \
-  per_device_train_batch_size=1 \
-  max_steps=1000 \
+  per_device_train_batch_size="$PER_DEVICE_TRAIN_BATCH_SIZE" \
+  max_steps="$MAX_STEPS" \
   weight_decay=1e-5 \
-  save_total_limit=5 \
+  save_total_limit="$SAVE_TOTAL_LIMIT" \
   upload_checkpoints=false \
   bf16=true \
   tf32=true \

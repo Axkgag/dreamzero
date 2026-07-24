@@ -1,0 +1,37 @@
+# @package _global_
+
+defaults:
+  - dreamzero_cotrain
+  - _self_
+
+max_action_dim: 21
+# Keep the pretrained DreamZero state projector width. MobileManip contributes
+# six normalized EEF state values; DreamTransform pads the remaining slots.
+max_state_dim: 64
+
+data_collator:
+  _target_: groot.vla.model.dreamzero.transform.mobile_plan_cotrain.MobilePlanDataCollator
+  tokenizer_path: ${tokenizer_path}
+  max_length: ${max_length}
+  num_views: ${num_views}
+  embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
+
+model_specific_transform:
+  _target_: groot.vla.model.dreamzero.transform.mobile_plan_cotrain.MobilePlanCotrainTransform
+  default_instruction: "Perform the default behavior."
+  language_dropout_prob: ${language_dropout_prob}
+  always_use_default_instruction: false
+  max_state_dim: ${max_state_dim}
+  max_action_dim: ${max_action_dim}
+  max_length: ${max_length}
+  state_horizon: ${state_horizon}
+  action_horizon: ${action_horizon}
+  plan_horizon: ${plan_horizon}
+  base_action_dim: ${base_action_dim}
+  manipulator_action_dim: ${max_manipulator_action_dim}
+  state_stats_path: ${mobilemanibench_data_root}/meta/stats.json
+  control_fps: ${control_fps}
+  image_resolution_height: ${image_resolution_height}
+  image_resolution_width: ${image_resolution_width}
+  embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
+  tokenizer_path: ${tokenizer_path}

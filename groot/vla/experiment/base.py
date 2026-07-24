@@ -90,9 +90,9 @@ class LossLoggerCallback(TrainerCallback):
         if not state.is_world_process_zero or logs is None:
             return
         entry = {"step": state.global_step}
-        for key in ("loss", "dynamics_loss_avg", "action_loss_avg", "learning_rate"):
-            if key in logs:
-                entry[key] = logs[key]
+        for key, value in logs.items():
+            if key in ("loss", "learning_rate") or key.endswith("_loss_avg"):
+                entry[key] = value
         if len(entry) > 1:  # more than just "step"
             with open(self.output_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
