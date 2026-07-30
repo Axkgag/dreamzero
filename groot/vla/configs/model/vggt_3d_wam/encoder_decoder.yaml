@@ -1,0 +1,94 @@
+# @package _global_
+
+model:
+  _target_: groot.vla.model.vggt_3d_wam.model.VGGT3DWAMModel
+  config:
+    _target_: groot.vla.model.vggt_3d_wam.configuration.VGGT3DWAMConfig
+    image_size:
+      - ${image_height}
+      - ${image_width}
+    patch_size: 14
+    patch_embed_type: dinov2_vitl14_reg
+    vggt_pretrain_image_size: 518
+    backbone_dim: 1024
+    backbone_depth: 24
+    backbone_heads: 16
+    backbone_mlp_ratio: 4.0
+    vggt_checkpoint_path: ${vggt_checkpoint_path}
+    init_random: ${init_random}
+    min_checkpoint_match_fraction: 0.05
+    freeze_backbone: true
+    # DINOv2 is a frozen per-image 2D feature extractor. It receives no LoRA
+    # and runs chunked under no_grad; 3D adaptation lives in the aggregator
+    # LoRA and the metric-token branch.
+    freeze_dino: true
+    dino_image_chunk_size: 4
+    lora_rank: 8
+    lora_alpha: 32.0
+    lora_dropout: 0.05
+    # Model one Wan-aligned four-frame chunk at a time instead of treating
+    # every source frame independently.
+    global_temporal_window: 4
+    backbone_gradient_checkpointing: true
+    latent_dim: 48
+    # Exact Wan2.2 tokenizer tensor contract: 33x160x320 -> 9x10x20.
+    latent_spatial_stride: 16
+    latent_temporal_stride: 4
+    video_temporal_layers: 2
+    video_temporal_heads: 8
+    video_decoder_dim: 256
+    video_reconstruction_loss_weight: 1.0
+    lpips_loss_weight: 0.1
+    lpips_net: alex
+    lpips_chunk_size: 8
+    ssim_loss_weight: 0.2
+    spatial_gradient_loss_weight: 0.1
+    temporal_difference_loss_weight: 0.1
+    geometry_dim: 256
+    geometry_heads: 8
+    geometry_temporal_layers: 2
+    # Iterative query-conditioned multi-scale deformable image injection.
+    geometry_deformable_layers: 2
+    geometry_deformable_levels: 2
+    deformable_points: 4
+    deformable_offset_scale: 2.0
+    # grid_size is [z,y,x]. Double vertical resolution from 0.625 m to
+    # 0.3125 m while retaining 0.333 m lateral and 0.375 m forward cells.
+    grid_size: [8, 12, 8]
+    grid_x_range: [0.0, 3.0]
+    grid_y_range: [-2.0, 2.0]
+    grid_z_range: [-0.5, 2.0]
+    pointmap_size:
+      - ${pointmap_height}
+      - ${pointmap_width}
+    # Ray classification remains moderately sized. A learned 2x spatial
+    # refinement head produces the final 80x160 metric PointMap.
+    pointmap_ray_size: [40, 80]
+    pointmap_depth_bins: 64
+    pointmap_min_range: 0.05
+    pointmap_max_range: 5.0
+    pointmap_ray_chunk_size: 128
+    pointmap_decoder_dim: 256
+    pointmap_decoder_residual_layers: 2
+    beta_2d: 1.0e-6
+    pointmap_loss_weight: 0.4
+    # Five-task QA gives 91.7% B0-grid coverage and strong optical-axis
+    # agreement, but K and H.264 pseudo-range remain unverified. This explicit
+    # multiplier downweights the whole geometry branch; set to 1.0 only after
+    # metric calibration is independently verified.
+    geometry_quality_weight: 0.25
+    pointmap_loss_warmup_steps: 2000
+    ray_loss_weight: 0.1
+    # Relative to the warmed-up geometry objective. Free samples are before
+    # the pseudo surface; samples behind it remain unknown and are ignored.
+    free_space_loss_weight: 0.1
+    free_space_surface_margin: 0.1
+    # Conservative cross-view weight because MP4 depth and calibration are
+    # coarse. Correspondences use pseudo PointMaps and an occlusion gate.
+    multiview_consistency_loss_weight: 0.05
+    multiview_occlusion_threshold: 0.15
+    temporal_geometry_loss_weight: 0.1
+    surface_normal_loss_weight: 0.1
+    depth_gradient_loss_weight: 0.1
+    masked_view_probability: 0.0
+    model_dtype: float32

@@ -1,403 +1,450 @@
-# MobileManiBench 双路 Plan：现阶段代码改动逐文件说明
+# MobileManiBench WAM Phase 0–2 当前实现指南
 
-## 1. 文档目的与统计范围
+## 1. 文档定位
 
-本文用于帮助逐文件学习当前 MobileManiBench → DreamZero 双路 Action Plan 实现。
+本文是当前 MobileManiBench WAM（Wan Action Model）Phase 0–2 代码的学习入口。
 
-统计基准是远程仓库：
+它回答的是：
+
+- 训练标签如何从真实轨迹构造；
+- Base 与 Manipulator plan 的坐标系、shape 和 mask 是什么；
+- 数据如何进入 DreamZero/Wan；
+- 6 个 Base tokens 和 6 个 Manipulator tokens 如何编码、交互和解码；
+- video dynamics loss 与两路 action flow loss 如何计算；
+- 当前有哪些训练、validation 和离线评估入口；
+- 哪些能力已经实现，哪些仍只是后续计划。
+
+本文以服务器当前代码为准：
 
 ```text
 /mnt/yihao/codes/dreamzero
 ```
 
-并以该仓库当前工作树相对当前 Git `HEAD` 的差异为准。
+本文不再按“相对 Git HEAD 修改了哪些文件”组织，也不使用 `M/N` 工作树状态。Git
+状态会随提交变化，不适合作为理解当前模型实现的长期入口。
 
-本文明确排除：
+本文只介绍纯 WAM Phase 0–2 baseline。仓库中已经存在独立的 VGGT tokenizer 和
+VGGT-3D-WAM 路径，但纯 WAM baseline 不消费 VGGT 2D/3D tokens。
 
-```text
-docs/
-sim-evals/
-```
+---
 
-因此：
+## 2. 一页总览
 
-- 不总结已有研究文档的变化；
-- 不总结嵌套 `sim-evals` 仓库及其依赖锁文件；
-- 不重复介绍当前 Git `HEAD` 中已经存在且没有工作树差异的文件；
-- 只覆盖 DreamZero 主仓库中当前 22 个已修改或新增的代码、配置、脚本和测试文件。
+### 2.1 Phase 0–2 的当前目标
 
-文件状态含义：
+Phase 0–2 已经把原 DreamZero 的单路 step-action 路径扩展为双路、长时域 plan
+预测：
 
 ```text
-M = 相对当前 HEAD 已修改
-N = 当前工作树新增、尚未被当前 HEAD 跟踪
+MobileManiBench realized future states
+        │
+        ├── Base plan        [6, 4]
+        └── Manipulator plan [6, native_dim]
+                    │
+                    ▼
+          train-only statistics
+          normalization + masks
+                    │
+                    ▼
+       packed action [12, 21]
+       ├── token 0..5  : Base
+       └── token 6..11 : Manipulator
+                    │
+                    ▼
+       independent branch encoders
+       + branch type embeddings
+       + physical-time embeddings
+                    │
+                    ▼
+          shared causal Wan DiT
+        video/action/state joint attention
+                    │
+                    ▼
+       independent branch decoders
+                    │
+                    ▼
+       base_flow_loss
+       + manipulator_flow_loss
+       + dynamics_loss
 ```
 
-## 2. 当前实现处于什么阶段
+“双路”不是两个互不通信的网络。两路只在输入投影、type embedding、输出投影和
+loss 统计上解耦；12 个 action tokens 位于同一个 Wan action block，在共享
+Transformer 中可以完整交互。
 
-当前完成的是 MobileManiBench 最终研究路线中的 Phase 0、Phase 1 和 Phase 2 核心链路：
+### 2.2 当前关键常量
 
 ```text
-转换后的 realized future state
-        ↓
-Base waypoint plan [6, 4]
-Manipulator plan [6, 21]
-        ↓
-分路归一化、有效维度 mask、未来时刻 valid mask
-        ↓
-DreamZero 兼容打包 action [12, 21]
-        ↓
-6 个 Base tokens + 6 个 Manipulator tokens
-        ↓
-共享 Wan video DiT
-        ↓
-独立 Base/Manipulator decoder
-        ↓
-base_flow_loss + manipulator_flow_loss
+plan_horizon              = 6
+plan_time_offsets         = [1, 4, 8, 12, 16, 24]
+control_fps               = 30
+base_action_dim           = 4
+max_manipulator_action_dim= 21
+packed_action_horizon     = 12
+state_horizon             = 1
+max_state_dim             = 64
+num_frame_per_block       = 8
+num_action_per_block      = 12
+num_state_per_block       = 1
 ```
 
-这里的“解耦”表示：
-
-- Base 和 Manipulator 有独立的输入投影；
-- 有不同的 token type embedding；
-- 有独立的输出投影；
-- 分别计算 loss；
-- 但两路 token 进入同一个 Wan DiT，可以在共享 Transformer 中交互。
-
-它不是两个完全独立、互不通信的网络。
-
-当前已经真实通过一次训练 step：
-
-```text
-输入视频            [1, 3, 33, 352, 640]
-Base tokens         6
-Manipulator tokens  6
-总 action tokens    12
-Forward             通过
-Backward            通过
-Optimizer step      通过
-```
-
-当前尚未实现：
-
-- MobileManip validation dataset；
-- checkpoint 批量推理评估器；
-- Base ADE/FDE；
-- EEF position/orientation error；
-- Hand joint error；
-- Base/Manipulator consistency metric；
-- reachability metric；
-- MobileManip 闭环仿真评测。
-
-## 3. 必须先理解的张量协议
-
-### 3.1 时间接口
-
-```text
-plan_horizon      = 6
-plan_time_offsets = [1, 4, 8, 12, 16, 24]
-control_fps       = 30
-```
-
-这 6 个 waypoint 对应的未来时间为：
+6 个 waypoint 的物理时间为：
 
 ```text
 [1/30, 4/30, 8/30, 12/30, 16/30, 24/30] 秒
 ```
 
-它们不是均匀时间采样，所以代码显式保留 `plan_time_offsets`，不能只给 token 普通序号 `0..5`。
+这些时间点不均匀，因此模型不能只依赖普通 token ordinal `0..5`。
 
-### 3.2 Base plan
+### 2.3 当前没有单独的 base prior token stream
 
-```text
-shape = [6, 4]
-
-slice:
-0:2  relative XY
-2:4  yaw 的 sin/cos
-```
-
-归一化策略：
+当前 `CausalWanModel` 的 action register 是：
 
 ```text
-XY       q01/q99 → [-1, 1]
-yaw      保持 sin/cos，不做 q99
+[12 noisy plan tokens] + [1 state token]
 ```
 
-### 3.3 Manipulator plan
+前 6 个 Base plan tokens 本身是 diffusion 预测目标，不是额外的 coarse base
+prior。当前代码中没有一组独立的“先预测 coarse base，再作为 Base/Manipulator
+先验”的 base-prior tokens。若 proposal 中保留该设计，应明确标记为后续方案，
+不能描述成 Phase 0–2 已实现代码。
 
-统一最大形状：
+---
+
+## 3. 当前实现边界
+
+### 3.1 已实现
+
+- 从 realized future state 构造 anchor-relative Base/Manipulator labels；
+- G1 与 XHand 的统一 21 维 Manipulator 表示；
+- terminal waypoint valid mask；
+- train/val episode split；
+- train-only 流式统计量；
+- slice-aware normalization 和 inverse normalization；
+- 双路 action packing、encoder、type embedding、physical-time embedding；
+- 共享 Wan video/action/state Transformer；
+- 独立 Base/Manipulator decoder；
+- 分路 masked flow-matching loss；
+- Wan2.1 smoke/兼容训练入口；
+- Wan2.2-TI2V-5B 五任务正式训练入口；
+- 训练内 validation dataset、固定 validation 子集；
+- DreamZero 专用 Trainer validation 调用；
+- checkpoint-before-eval 保存顺序；
+- checkpoint 离线 sampling 和轨迹指标代码；
+- normalization、dataset、双路投影、loss、timestep 和 validation 回归测试。
+
+### 3.2 尚未实现或尚未完整验证
+
+- 独立的 Base coarse prior token stream；
+- Base/Manipulator consistency training loss；
+- 基于机器人模型的 reachability/collision loss；
+- MobileManip 闭环 task-success 仿真；
+- 纯 WAM baseline 中的 VGGT 2D/3D conditioning；
+- 当前 Wan2.2-5B 正式 checkpoint 的离线 evaluator 兼容修复；
+- validation 修复后的下一次正式大模型 eval 结果。
+
+离线 evaluator 虽然已经实现，但 `scripts/eval/evaluate_mobilemanibench_plan.py`
+当前会无条件把 `cfg.pretrained_model_path` 当作基础 checkpoint 加载。Wan2.2 正式
+配置中该值是 `null`，因此当前 evaluator 不能直接用于该 Wan2.2 checkpoint；
+Wan2.2 需要按 raw Wan component + LoRA overlay 的实际加载方式修复。
+
+---
+
+## 4. 文件地图
+
+### 4.1 标签、数据与统计
 
 ```text
-shape = [6, 21]
+scripts/data/convert_mobilemanibench_to_gear.py
+    原始 MobileManiBench → DreamZero/LeRobot 格式；
+    构造 realized Base/Manipulator plan labels。
+
+scripts/data/prepare_mobilemanibench_splits.py
+    生成稳定的 train/val episode split。
+
+scripts/data/prepare_mobilemanibench_plan_metadata.py
+    只在选定 split 上计算 plan_stats.json；
+    mean/std/min/max 精确，q01/q99 流式采样估计。
+
+groot/vla/data/dataset/mobilemanibench_plan.py
+    observation 交给 LeRobotSingleDataset；
+    plan 直接从当前 parquet row 读取。
+
+groot/vla/data/transform/mobile_plan.py
+    normalization、geometry QA、mask 合成和反归一化。
+
+scripts/data/inspect_mobilemanibench_plan_batch.py
+    人工检查视频、Base XY、EEF XY 和 mask。
 ```
 
-语义：
+### 4.2 模型输入与训练
 
 ```text
-0:3     EEF XYZ
-3:9     EEF rotation6d
-9:      hand configuration
+groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py
+    视频 grid、state normalization、action packing、collator。
+
+groot/vla/model/dreamzero/base_vla.py
+    VLA 顶层编排：prepare_input → backbone → action_head。
+
+groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
+    双路 timestep/layout 协议、分路 flow loss、推理输出拆分。
+
+groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+    Wan video/action flow-matching 主训练与 sampling 流程。
+
+groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
+    双路 action encoder/decoder 和 physical offset embedding。
+
+groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+    Wan action/state register、attention mask、teacher forcing 和 DiT blocks。
+
+groot/vla/experiment/base.py
+    Trainer、loss logging、validation positional batch 调用和保存顺序。
 ```
 
-不同机器人实际 hand 维度不同：
+### 4.3 Hydra 与启动入口
 
 ```text
-G1     原生 manipulator_dim = 10
-XHand  原生 manipulator_dim = 21
+groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml
+groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml
+groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml
+groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_wan22.yaml
+
+scripts/train/mobilemanibench_training.sh
+    原 DreamZero step-action baseline，不是 dual-plan。
+
+scripts/train/mobilemanibench_plan_training.sh
+    Wan2.1-I2V-14B smoke/兼容 dual-plan。
+
+scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+    当前五任务 Wan2.2-TI2V-5B 正式 dual-plan baseline。
 ```
 
-G1 不存在的尾部维度补零，并由 `manipulator_dim_mask` 排除。
-
-归一化策略：
+### 4.4 推理与分析
 
 ```text
-EEF XYZ       q01/q99 → [-1, 1]
-rotation6d    保持原值
-hand joints   每关节 q01/q99 → [-1, 1]
-padding       保持 0，loss mask 为 false
+scripts/eval/evaluate_mobilemanibench_plan.py
+scripts/eval/mobilemanibench_plan_eval.sh
+    checkpoint flow sampling、inverse normalization、轨迹指标和结果保存。
+
+scripts/eval/evaluate_mobilemanibench_fixed_timestep_flow.py
+scripts/eval/mobilemanibench_fixed_timestep_flow_eval.sh
+    固定 timestep 的 flow 诊断。
+
+scripts/eval/analyze_mobilemanibench_plan_predictions.py
+    prediction 分布、slice regression、per-horizon 和样本可视化。
 ```
 
-### 3.4 DreamZero 内部打包
+---
 
-DreamZero 原有 action head 接收一个矩形 action 张量。双路计划因此被打包为：
+## 5. Phase 1：标签是如何构造的
+
+核心函数：
 
 ```text
-packed action [12, 21]
-
-token 0..5:
-    Base plan
-    只有前 4 维有效
-    后 17 维补零且 mask=false
-
-token 6..11:
-    Manipulator plan
-    最多 21 维
+scripts/data/convert_mobilemanibench_to_gear.py::build_plan_labels
 ```
 
-这只是存储层面的矩形打包，不表示 Base 是 21 维动作。
-
-### 3.5 视频和 Wan block
-
-每路原始相机先缩放到：
+对于当前 anchor 时刻 `t`，future indices 为：
 
 ```text
-[33, 176, 320, 3]
+t + [1, 4, 8, 12, 16, 24]
 ```
 
-再组成 DreamZero 2×2 grid：
+超出 episode 末尾的 index 先 clamp 到最后一帧以保证数组读取安全，随后对应 label
+被置零，并由：
 
 ```text
-top-left      head
-top-right     wrist
-bottom-left   black
-bottom-right  black
+action.plan.valid [6]
 ```
 
-最终 Wan 视频输入：
+标记为无效。置零本身不是 loss 保护，真正的保护来自后续 valid mask。
+
+### 5.1 坐标系
+
+所有未来位姿都表达在 anchor 时刻的 Base frame `B(t)` 中。
+
+设：
 
 ```text
-[B, 3, 33, 352, 640]
+R_B(t), p_B(t)       anchor Base world pose
+R_target, p_target   future target world pose
 ```
 
-经过 Wan VAE：
+则：
 
 ```text
-33 RGB frames → 9 latent frames
-9 = 1 condition frame + 8 future latent frames
+p_rel = R_B(t)^T · (p_target - p_B(t))
+R_rel = R_B(t)^T · R_target
 ```
 
-因此当前双路计划使用：
+所以 Base 与 EEF 两路共享同一个 anchor frame。这使两路几何关系可比较，也为后续
+consistency metric/loss 留出接口。
+
+### 5.2 Base plan
 
 ```text
-num_frame_per_block  = 8
-num_action_per_block = 12
-num_state_per_block  = 1
+base_plan shape = [6, 4]
+
+0:2  future Base relative XY in B(t)
+2    sin(relative yaw)
+3    cos(relative yaw)
 ```
 
-即一个完整的 8-frame future video block 对应一个 12-token plan window。
+只预测平面移动与 yaw，不包含 Base Z、roll、pitch。
 
-## 4. 文件总览
-
-| 状态 | 文件 | 核心职责 |
-|---|---|---|
-| M | `groot/vla/data/dataset/__init__.py` | 导出双路 Plan dataset |
-| M | `groot/vla/data/transform/__init__.py` | 导出 Plan normalization transform |
-| M | `groot/vla/experiment/base.py` | 记录任意新增的分支 loss |
-| M | `groot/vla/model/dreamzero/action_head/__init__.py` | 导出双路 action head |
-| M | `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py` | 为研究 action head 增加可重写 hook |
-| M | `groot/vla/model/dreamzero/modules/__init__.py` | 导出双路 Wan DiT |
-| M | `groot/vla/model/dreamzero/transform/__init__.py` | 导出模型 transform 和 collator |
-| M | `scripts/train/mobilemanibench_training.sh` | 加固原 step-action baseline 启动脚本 |
-| N | `groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml` | 双路 Plan 数据配置 |
-| N | `groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml` | 双路 action head 配置 |
-| N | `groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml` | 双路模型 transform 配置 |
-| N | `groot/vla/data/dataset/mobilemanibench_plan.py` | 读取 materialized realized plans |
-| N | `groot/vla/data/transform/mobile_plan.py` | slice-aware normalization、mask 和反归一化 |
-| N | `groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py` | 双路 flow loss 和时间/block 协议 |
-| N | `groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py` | 独立双路 token 编解码器 |
-| N | `groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py` | 数据到 DreamZero action/video/state 的适配 |
-| N | `scripts/data/inspect_mobilemanibench_plan_batch.py` | 人工检查一个计划样本 |
-| N | `scripts/data/prepare_mobilemanibench_plan_metadata.py` | 生成计划统计量和几何 QA |
-| N | `scripts/train/mobilemanibench_plan_training.sh` | 双路 Plan smoke 训练入口 |
-| N | `tests/data/test_mobilemanibench_plan_dataset.py` | dataset 和标签重建测试 |
-| N | `tests/data/test_mobilemanibench_plan_transform.py` | normalization/mask/inverse 测试 |
-| N | `tests/model/test_mobile_plan_phase2.py` | 双路模型投影、loss、timestep 测试 |
-
-## 5. 数据层文件
-
-### 5.1 `groot/vla/data/dataset/mobilemanibench_plan.py`
-
-状态：新增。
-
-这是双路计划数据入口，也是理解整个 Phase 1 的第一个核心文件。
-
-#### 为什么不继续使用普通 LeRobot action loader
-
-普通 loader 通常把 action 的第一维理解成额外的时间采样维度。但转换后的每一行 parquet 已经包含完整未来计划：
+### 5.3 Manipulator plan
 
 ```text
-action.plan.base_waypoints [6, 4]
-action.plan.manipulator    [6, native_dim]
-action.plan.valid          [6]
+manipulator_plan native shape = [6, 9 + hand_dim]
+
+0:3   future EEF XYZ in B(t)
+3:9   future EEF rotation6d in B(t)
+9:    future hand joint configuration
 ```
 
-如果再让普通 loader 对其采样一次 horizon，就会把计划 horizon 扩展两次。
-
-`MobileManiBenchPlanDataset` 的原则是：
+rotation6d 使用相对旋转矩阵的前两行：
 
 ```text
-observation 仍交给 LeRobotSingleDataset 读取
-plan 直接从当前 parquet row 取出
+R_rel[:2, :].reshape(6)
 ```
 
-#### 初始化时读取的元数据
+当前机器人：
 
 ```text
-meta/robot_schema.json
-meta/extensions.json
-meta/plan_stats.json（存在时）
+G1:
+    hand_dim = 1
+    native manipulator_dim = 10
+
+XHand:
+    hand_dim = 12
+    native manipulator_dim = 21
 ```
 
-从中确定：
+Dataset 将 G1 从 `[6,10]` pad 到 `[6,21]`，同时保留
+`manipulator_dim_mask`，因此 padding 不进入 loss。
 
-- waypoint offsets；
-- control FPS；
-- hand joint indices；
-- 当前机器人原生 manipulator 维度；
-- Base/Manipulator 声明形状。
+### 5.4 当前 state
 
-#### observation modalities
+`build_core_state` 将当前 EEF pose 表达在当前 Base frame 中：
 
 ```text
-state.eef_position
-state.eef_rotation_rpy
-annotation.task
-video.head
-video.wrist
+state = [EEF relative XYZ, EEF relative RPY]  # 6 dims
 ```
 
-dataset 使用 `xdof` embodiment tag，并将底层 metadata 暴露为：
+该 state 是 condition，不是未来监督目标。
 
-```python
-self.merged_metadata = {"xdof": self.observation_dataset.metadata}
-```
+---
 
-这是为了兼容 `BaseExperiment` 保存训练 metadata 的接口。
+## 6. Dataset、split 与统计量
 
-#### `__getitem__` 输出
+### 6.1 为什么需要专用 Dataset
 
-主要字段：
+每个 parquet row 已经存有一个完整的 `[6,...]` future plan。若继续让普通 action
+loader 把第一维当成待采样时间轴，就会二次扩展 horizon。
+
+`MobileManiBenchPlanDataset` 因此采用：
 
 ```text
-base_plan
-manipulator_plan
-plan_valid
-base_dim_mask
-manipulator_dim_mask
-plan_time_offsets
-plan_time_seconds
+observation:
+    LeRobotSingleDataset 按 video_delta_indices 读取
+
+plan:
+    直接读取 anchor row 中已物化的三个 action.plan.* 列
+```
+
+主要输出：
+
+```text
+base_plan                [6,4]
+manipulator_plan         [6,21]
+plan_valid               [6]
+base_dim_mask            [6,4]
+manipulator_dim_mask     [6,21]
+plan_time_offsets        [6]
+plan_time_seconds        [6]
 episode_index
 frame_index
 hand_dim
 ```
 
-原生 Manipulator 计划被复制到统一 `[6,21]` 张量前部，剩余部分补零。
+### 6.2 train/val split
 
-#### 学习重点
-
-重点看清三类 mask 的区别：
+Dataset 当前支持：
 
 ```text
-plan_valid             某个未来时刻是否真实存在
-base_dim_mask          Base 的哪些维度属于真实语义
-manipulator_dim_mask   当前机器人有哪些 hand 维度
+split = train | val | all
+split_manifest_path = meta/plan_splits.json
 ```
 
-它们在下一层组合成最终 loss mask。
+episode IDs 在构造底层 `LeRobotSingleDataset` 时过滤，避免同一 episode 的 anchors
+跨 train/val 泄漏。
 
-#### 当前边界
-
-- dataset 没有 train/validation split 管理；
-- `_trajectory_cache` 一次只保留一个 episode；
-- 只面向当前 `xdof` MobileManiBench root；
-- 依赖转换后的 parquet 已经物化 plan labels。
-
-### 5.2 `groot/vla/data/dataset/__init__.py`
-
-状态：修改。
-
-新增导出：
-
-```python
-MobileManiBenchPlanDataset
-```
-
-作用是让 Hydra 配置可以使用：
+validation 可设置：
 
 ```text
-_target_: groot.vla.data.dataset.MobileManiBenchPlanDataset
+max_samples = 1024
 ```
 
-这个文件没有算法逻辑，只负责 Python package public API。
+当完整 validation 大于该值时，代码使用 `np.linspace` 选择固定、等间隔 anchors。
+它不是每次随机抽样，所以不同 checkpoint 使用相同 validation 子集。
 
-### 5.3 `groot/vla/data/transform/mobile_plan.py`
+### 6.3 统计量
 
-状态：新增。
-
-这是 Phase 1 的第二个核心文件，负责：
-
-- 按 slice 归一化；
-- 检查几何表示；
-- 构造最终 action mask；
-- 将预测值反归一化回物理量。
-
-#### 统计量输入
-
-必须二选一：
+`prepare_mobilemanibench_plan_metadata.py` 支持：
 
 ```text
-stats_path
-statistics
+--split train|val|all
+--split-manifest ...
+--write-core-stats
 ```
 
-同时提供或同时不提供都会报错。
-
-必须包含：
+正式训练必须用：
 
 ```text
-statistics.base_xy
-statistics.eef_xyz
-statistics.hand
+--split train
 ```
 
-#### q01/q99 归一化
+Wan2.2 启动脚本会检查：
+
+```text
+plan_stats.json["fit_split"] == "train"
+```
+
+统计策略：
+
+```text
+mean/std/min/max  流式精确统计
+q01/q99           确定性均匀 Bernoulli sample 估计
+```
+
+只有 `plan_valid=true` 的 waypoint 进入 plan statistics。
+
+---
+
+## 7. Normalization、geometry QA 与 mask
+
+核心类：
+
+```text
+groot/vla/data/transform/mobile_plan.py::MobilePlanTransform
+```
+
+### 7.1 q01/q99 slice
+
+需要归一化的量：
+
+```text
+Base XY
+EEF XYZ
+每个 hand joint
+```
 
 正向：
 
 ```text
 x_norm = 2 * (x - q01) / (q99 - q01) - 1
-clip 到 [-1, 1]
+x_norm = clip(x_norm, -1, 1)
 ```
 
 逆向：
@@ -406,29 +453,29 @@ clip 到 [-1, 1]
 x = (x_norm + 1) / 2 * (q99 - q01) + q01
 ```
 
-常量维度使用 0 作为归一化结果，逆变换恢复为 q01。
+当 `q01 == q99` 时，正向固定为 0，逆向恢复 q01，避免除零。
 
-#### 不归一化的几何 slice
+### 7.2 保持原值的几何 slice
 
 ```text
 Base yaw sin/cos
 EEF rotation6d
 ```
 
-原因是这两组值自身已经是有结构的旋转表示，直接逐维 q99 会破坏单位圆或正交结构。
+它们不做逐维 quantile normalization，否则会破坏单位圆或旋转正交结构。
 
-#### 几何 QA
+### 7.3 geometry QA
 
-只在 `plan_valid=true` 的 waypoint 上检查：
+有效 waypoint 上检查：
 
 ```text
-所有值有限
-sin²(yaw)+cos²(yaw) ≈ 1
-rotation6d 两行分别为单位向量
+所有 Base/Manipulator 值有限
+||[sin(yaw), cos(yaw)]|| ≈ 1
+rotation6d 两行范数 ≈ 1
 rotation6d 两行点积 ≈ 0
 ```
 
-#### 最终 mask
+### 7.4 最终 loss mask
 
 ```text
 base_action_mask =
@@ -440,94 +487,31 @@ manipulator_action_mask =
 
 因此：
 
-- episode 尾部不存在的未来 waypoint 不进 loss；
-- G1 不存在的 hand padding 不进 loss。
+- terminal 不存在的 future waypoint 不进 loss；
+- G1 为对齐 21 维而额外补出的 11 个 channels 不进 loss；
+- Base packed tensor 的后 17 维不进 loss。
 
-#### `unapply`
+---
 
-将：
+## 8. 模型输入适配
 
-```text
-base_action        → base_plan
-manipulator_action → manipulator_plan
-```
-
-这将是后续离线 ADE/FDE 评估的基础，但当前还没有评估 runner 使用它。
-
-### 5.4 `groot/vla/data/transform/__init__.py`
-
-状态：修改。
-
-新增导出：
-
-```python
-MobilePlanTransform
-```
-
-同样属于 package registration，没有额外算法。
-
-## 6. 模型输入适配文件
-
-### 6.1 `groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py`
-
-状态：新增。
-
-这个文件连接：
+核心类：
 
 ```text
-Phase-1 dataset sample
-        ↓
-DreamZero 原有 DreamTransform
-        ↓
-WANPolicyHead 输入
-```
-
-包含两个类：
-
-```text
-MobilePlanDataCollator
 MobilePlanCotrainTransform
+MobilePlanDataCollator
 ```
 
-#### `MobilePlanDataCollator`
+### 8.1 视频 grid
 
-复用原 `DefaultDataCollator` 完成：
-
-- NumPy stack；
-- tokenizer；
-- text attention mask；
-- embodiment ID batch。
-
-然后强制检查：
+输入相机：
 
 ```text
-base_action              [B, 6, 4]
-manipulator_action       [B, 6, 21]
-base_action_mask         [B, 6, 4]
-manipulator_action_mask  [B, 6, 21]
-plan_time_offsets        [B, 6]
+video.head
+video.wrist
 ```
 
-这些检查让 shape 错误在进入 14B 模型之前尽早暴露。
-
-#### 相机缩放
-
-`_resize_video` 将每路 THWC 视频缩放为：
-
-```text
-[T, 176, 320, 3]
-```
-
-使用 bilinear interpolation，整数图像 round/clamp 后恢复 `uint8`。
-
-这一步是后续修复中新增的关键逻辑。没有它时，两路 520×520 图像会拼成 1040×1040，导致：
-
-- Wan token 数与 `frame_seqlen=880` 不一致；
-- 显存和计算量异常增大。
-
-#### 视频 canonicalization
-
-构造三个 view：
+canonical view 顺序：
 
 ```text
 view 0 = head
@@ -535,50 +519,53 @@ view 1 = black
 view 2 = wrist
 ```
 
-再交给 `DreamTransform` 的普通 2×2 grid 逻辑，形成：
+DreamTransform 的普通 2×2 布局是：
 
 ```text
-top-left=head, top-right=wrist
-bottom row=black
++----------------+----------------+
+| head           | wrist          |
++----------------+----------------+
+| black          | black          |
++----------------+----------------+
 ```
 
-#### state canonicalization
+### 8.2 state
 
-当前 state 由：
+6 维 EEF-relative state 使用 `meta/stats.json["observation.state"]` 的 q01/q99
+归一化，然后由 DreamTransform pad 到：
 
 ```text
-EEF position [3]
-EEF RPY      [3]
+[1,64]
 ```
 
-拼接为 6 维，用 `meta/stats.json` 的 `observation.state` q01/q99 归一化。
+`max_state_dim=64` 是 checkpoint/projector 结构兼容要求，不表示有 64 个真实 state
+维度。
 
-模型配置保持：
-
-```text
-max_state_dim = 64
-```
-
-因此原 `DreamTransform` 会把有效 6 维 state padding 到 checkpoint 兼容的 64 维。不能把网络 state projector 改成 44 或 6，否则无法加载 DreamZero-AgiBot checkpoint。
-
-#### action packing
+### 8.3 action packing
 
 ```text
 Base [6,4]
-  ↓ pad
+    → 在 channel 维 pad
 Base packed [6,21]
 
-Base packed [6,21]
-+ Manipulator [6,21]
-  ↓ concat
-action [12,21]
+[Base packed, Manipulator]
+    → 在 token 维 concat
+packed action [12,21]
 ```
 
-mask 使用完全相同的布局。
+布局：
 
-#### 保留语义分支字段
+```text
+token 0..5:
+    channel 0..3  = Base
+    channel 4..20 = 0, mask=false
 
-即使 DreamZero 主 action 入口读取 packed `action`，transform 仍额外保留：
+token 6..11:
+    channel 0..20 = Manipulator
+    G1 padding channels mask=false
+```
+
+Transform 同时保留 semantic branch 字段：
 
 ```text
 base_action
@@ -590,882 +577,507 @@ plan_time_offsets
 plan_time_seconds
 ```
 
-这样 action head 可以分路算 loss，后续评估也不必从 packed tensor 猜语义。
+Collator 强制检查 batch shape，防止错误进入大模型后才暴露。
 
-### 6.2 `groot/vla/model/dreamzero/transform/__init__.py`
+---
 
-状态：修改。
+## 9. 两个 Wan 运行 profile
 
-导出：
+### 9.1 Wan2.1-I2V-14B smoke/兼容 profile
 
-```python
-MobilePlanCotrainTransform
-MobilePlanDataCollator
-```
-
-### 6.3 `groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml`
-
-状态：新增。
-
-该配置继承：
+入口：
 
 ```text
-dreamzero_cotrain
+scripts/train/mobilemanibench_plan_training.sh
 ```
 
-并替换：
-
-- data collator；
-- model-specific transform。
-
-关键配置：
+当前默认：
 
 ```text
-max_action_dim = 21
-max_state_dim  = 64
+dataset               smoke_v2/g1
+GPUs                  8
+max_steps             5000
+save_steps            500
+per-device batch      1
+learning rate         1e-5
+pretrained base       DreamZero-AgiBot
 ```
 
-`max_state_dim=64` 是预训练 checkpoint 的结构要求，不表示 MobileManip 实际提供 64 个有意义 state。
-
-配置还把以下参数传入 transform：
+视频：
 
 ```text
-plan_horizon
-base_action_dim
-manipulator_action_dim
-state_stats_path
-control_fps
-image_resolution_height
-image_resolution_width
+每视角                 176×320
+2×2 grid              352×640
+33 RGB frames         → 9 latent frames
+latent                9×44×80
+DiT patch grid/frame  22×40
+frame_seqlen          880
 ```
 
-## 7. 双路 Wan DiT 文件
+### 9.2 Wan2.2-TI2V-5B 正式 profile
 
-### 7.1 `groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py`
-
-状态：新增。
-
-这是 Phase 2 最核心的 token architecture 文件。
-
-包含：
+入口：
 
 ```text
-PlanOffsetEmbedding
-DualPlanActionEncoder
-DualPlanActionDecoder
-WanVideoDiTDualPlan
+scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```
 
-#### `PlanOffsetEmbedding`
+当前默认：
 
-输入不是 token ordinal index，而是物理秒：
+```text
+dataset               MobileManipVLA_dreamzero_g1_5tasks/g1
+GPUs                  8
+per-device batch      32
+global batch          256
+max_steps             10000
+save_steps            2000
+eval_steps            2000
+max_eval_samples      1024
+learning rate         1e-5
+LR scheduler          cosine_with_min_lr
+min_lr_rate           0.1
+```
+
+视频存在 transform grid 与最终 DiT 输入两级尺寸：
+
+```text
+每视角                       160×320
+MobilePlan 2×2 grid         320×640
+action head target resize   160×320
+33 RGB frames               → 9 latent frames
+Wan2.2 latent               9×10×20
+DiT patch grid/frame        5×10
+frame_seqlen                50
+```
+
+Wan2.2 没有单独 CLIP 文件，当前脚本从 Wan2.1 checkpoint 目录加载 image encoder。
+
+### 9.3 两个 profile 的共同 block 协议
+
+```text
+9 latent frames =
+    1 condition latent frame
+  + 8 future latent frames
+
+num_frame_per_block  = 8
+num_action_per_block = 12
+num_state_per_block  = 1
+```
+
+因此一次训练 sample 恰好对应一个完整 plan window。
+
+---
+
+## 10. 双路 token encoder/decoder
+
+核心文件：
+
+```text
+groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
+```
+
+### 10.1 Physical-time embedding
 
 ```text
 offset_seconds = plan_time_offsets / control_fps
 ```
 
-先经过 sinusoidal positional encoding，再经过：
+经过：
 
 ```text
-Linear → SiLU → Linear
+SinusoidalPositionalEncoding
+→ Linear
+→ SiLU
+→ Linear
 ```
 
-这使模型能够区分不均匀的真实时间间隔。
+每路第 `h` 个 token 都加上相同的 physical offset embedding。
 
-#### `DualPlanActionEncoder`
+注意：Wan 内部仍有 action RoPE/token position；physical-time embedding 是额外显式
+信息，用来表达 waypoint 间隔不均匀，而不是完全替换 Wan RoPE。
 
-两路分别使用：
+### 10.2 DualPlanActionEncoder
 
 ```text
-base_encoder
-manipulator_encoder
+Base:
+    base_encoder([B,6,4], timestep)
+    + offset_embedding
+    + type_embedding[BASE]
+
+Manipulator:
+    manipulator_encoder([B,6,21], timestep)
+    + offset_embedding
+    + type_embedding[MANIPULATOR]
 ```
 
-还使用两个 learnable type embeddings：
+随后：
 
 ```text
-type_embedding[0] = Base
-type_embedding[1] = Manipulator
+concat → [B,12,dim]
 ```
 
-每路 token 最终为：
+当前 `num_embodiments` 在双路 module 中固定为 1。
+
+### 10.3 DualPlanActionDecoder
 
 ```text
-action projection
-+ physical offset embedding
-+ branch type embedding
+hidden[:, :6]  → base_decoder        → [B,6,4]
+hidden[:, 6:]  → manipulator_decoder → [B,6,21]
 ```
 
-输出仍按：
+Base 输出再 pad 为 `[B,6,21]`，最终返回统一：
 
 ```text
-[6 Base tokens, 6 Manipulator tokens]
+action_noise_pred [B,12,21]
 ```
 
-拼接后进入共享 Wan blocks。
+### 10.4 offset contract
 
-#### `DualPlanActionDecoder`
+`WanVideoDiTDualPlan.forward()` 要求 batch 显式携带 `plan_time_offsets`，并与模型
+buffer 中的 `[1,4,8,12,16,24]` 完全一致。缺失或错序会立即报错。
 
-共享 Transformer hidden states 再次分成两路：
+---
+
+## 11. Wan 内部 action/video/state attention
+
+核心文件：
 
 ```text
-前 6 token → base_decoder → [B,6,4]
-后 6 token → manipulator_decoder → [B,6,21]
+groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
 ```
 
-为了适配统一输出，Base decoder 的 `[B,6,4]` 被补零为 `[B,6,21]`，然后与 Manipulator 输出拼回 `[B,12,21]`。
-
-#### `WanVideoDiTDualPlan`
-
-继承原：
+训练时 noisy half 的逻辑 register 为：
 
 ```text
-CausalWanModel
+[video tokens] [12 action tokens] [1 state token]
 ```
 
-但替换 action encoder/decoder。
+对于当前唯一的 future block：
 
-构造时强制：
+### Video query 可以看到
 
 ```text
-action_dim = manipulator_action_dim
-num_action_per_block = 2 * plan_horizon
+condition clean frame
+当前 noisy 8-frame video block
+当前 12 action tokens
+当前 state token
 ```
 
-forward 时必须显式传入 `plan_time_offsets`，且必须与模型注册的 offsets 完全一致；错误 offsets 会立即报错。
-
-#### 当前架构边界
-
-- 两路只在 projection 和 loss 层面解耦，Transformer 主干共享；
-- `num_embodiments` 当前固定为 1；
-- 还没有加入 Base/Manipulator consistency loss；
-- 还没有 VGGT 2D/3D token；
-- 还没有 reachability/collision 模块。
-
-### 7.2 `groot/vla/model/dreamzero/modules/__init__.py`
-
-状态：修改。
-
-导出：
-
-```python
-WanVideoDiTDualPlan
-```
-
-## 8. Action head 文件
-
-### 8.1 `groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py`
-
-状态：新增。
-
-这个文件负责双路计划在 diffusion/flow matching 训练层面的协议。
-
-#### `MobilePlanPolicyHeadConfig`
-
-新增配置字段：
+### Action query 可以看到
 
 ```text
-plan_horizon
-base_action_dim
-manipulator_action_dim
-plan_time_offsets
-control_fps
-base_flow_loss_weight
-manipulator_flow_loss_weight
+condition clean frame
+当前 noisy 8-frame video block
+同一 block 的全部 12 action tokens
+当前 state token
 ```
 
-初始化时检查：
+所以 Base 和 Manipulator tokens 可以相互建模，不是仅按相同 horizon 一对一连接。
+
+### State query
+
+state block 只做自身 attention；它作为 condition 被 video/action queries 读取。
+
+### clean target 是否泄漏
+
+训练调用会把 `clean_x` 与 noisy stream 一起送进 teacher-forcing 路径，但 causal
+attention 对第一个 future block 只开放 condition clean frame，不开放该 future
+block 的 clean target。当前 one-block 设置因此不会把未来 clean video 直接泄漏给
+action tokens。
+
+---
+
+## 12. Flow-matching 训练与 loss
+
+核心文件：
 
 ```text
-action_horizon == 2 * plan_horizon
-action_dim == manipulator_action_dim
+groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
 ```
 
-#### 显式时间 offsets
+### 12.1 Video 与 action 加噪
 
-`prepare_action_model_kwargs`：
-
-- 从 batch 读取 `plan_time_offsets`；
-- 与 config 中 offsets 做逐元素严格比较；
-- 通过 keyword argument 传给双路 DiT。
-
-#### Base/Manipulator timestep 对齐
-
-当前使用同一 plan window 的 coupled diffusion timestep：
+训练时：
 
 ```text
-t_base(h) = t_manipulator(h)
+video latent  + video noise  → noisy video latent
+packed action + action noise → noisy action
 ```
 
-在当前 one-block 设计中，12 个 action tokens 都使用该 block 的 timestep。
-
-#### action/video block 校验
-
-双路计划要求：
+scheduler 同时提供：
 
 ```text
-future latent frames = num_frame_per_block = 8
-action tokens        = num_action_per_block = 12
-state tokens         = num_state_per_block = 1
+add_noise(...)
+training_target(...)
+training_weight(timestep)
 ```
 
-这取代了原 action head 假设的“每个小视频块分配若干 action token”的比例校验。
+模型预测的是 scheduler 定义的 flow/noise target，而不是直接回归 clean plan。
 
-#### 分路 masked loss
+### 12.2 timestep coupling
+
+默认配置：
+
+```text
+decouple_video_action_noise = false
+```
+
+一个 future video block 采样一个 timestep，并扩展给全部 12 action tokens：
+
+```text
+t_base(0..5) = t_manipulator(0..5) = t_block
+```
+
+`align_action_timestep_ids` 还会强制 Manipulator 复制 Base 的 6 个 timestep，保护
+双路对应关系。
+
+若将 `decouple_video_action_noise=true`，action timestep 会独立采样；这不是当前
+正式 baseline 默认行为。
+
+### 12.3 分路 masked loss
 
 Base：
 
 ```text
-prediction[:, :6, :4]
+prediction = action_noise_pred[:, :6, :4]
+target     = training_target_action[:, :6, :4]
+mask       = action_mask[:, :6, :4]
 ```
 
 Manipulator：
 
 ```text
-prediction[:, 6:, :21]
+prediction = action_noise_pred[:, 6:, :21]
+target     = training_target_action[:, 6:, :21]
+mask       = action_mask[:, 6:, :21]
 ```
 
-每个 token 的 MSE 只对 active dims 求平均，再结合：
+每个 token 的计算顺序：
 
 ```text
-action mask
-has_real_action
-diffusion timestep weight
+1. 对每个 active channel 计算 squared error
+2. 除以该 token 的 active dimension 数
+3. 排除 active_dims == 0 的 token
+4. 乘 has_real_action
+5. 乘 scheduler.training_weight(timestep)
+6. 对有效 tokens 求平均
 ```
+
+这意味着 G1 和 XHand 都先对各自真实维度取 token mean，不会因为 XHand 有更多
+hand channels 就简单获得更大的 loss 权重。
 
 最终：
 
 ```text
 action_loss =
-    base_weight * base_flow_loss
-  + manipulator_weight * manipulator_flow_loss
+    base_flow_loss_weight * base_flow_loss
+  + manipulator_flow_loss_weight * manipulator_flow_loss
+
+loss = dynamics_loss + action_loss
 ```
 
-输出日志字段：
+当前两个 branch weight 都是 1。
+
+### 12.4 训练输出
 
 ```text
+loss
+dynamics_loss
 action_loss
 base_flow_loss
 manipulator_flow_loss
 ```
 
-#### 推理输出拆分
-
-`get_action` 在原 `action_pred` 之外增加：
-
-```text
-base_plan_pred
-manipulator_plan_pred
-```
-
-注意：这里只完成模型输出拆分；完整 checkpoint 推理 runner、反归一化和离线指标尚未实现。
-
-### 8.2 `groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py`
-
-状态：修改。
-
-这个文件是原 DreamZero WAN action head。修改原则是：
-
-```text
-不把 legacy 路径硬改成 MobileManip
-而是增加可由研究 head override 的 hooks
-```
-
-新增 hooks：
-
-```text
-prepare_action_model_kwargs
-align_action_timestep_ids
-validate_action_video_layout
-build_coupled_action_timestep_ids
-compute_action_losses
-```
-
-默认实现保持原单路行为；`MobilePlanFlowMatchingActionHead` 覆盖需要变化的部分。
-
-forward 的结构变化：
-
-```text
-准备额外 model kwargs
-→ 调用可重写 layout validator
-→ 调用可重写 timestep builder
-→ 调用 timestep aligner
-→ 将额外 kwargs 传给 DiT
-→ 调用可重写 action loss
-→ 把分支 loss 加入输出
-```
-
-这是一个重要的可扩展性改造：未来 3D tokens 或其他 embodiment 可以继续增加子类，而不必复制整段 WAN forward。
-
-#### 与原行为的兼容性
-
-默认：
-
-- `prepare_action_model_kwargs` 返回空 dict；
-- timestep 不额外对齐；
-- 使用 legacy layout assertion；
-- 使用原单流 masked MSE。
-
-因此原 DreamZero action head 理论上保持旧行为。
-
-### 8.3 `groot/vla/model/dreamzero/action_head/__init__.py`
-
-状态：修改。
-
-导出：
-
-```python
-MobilePlanFlowMatchingActionHead
-MobilePlanPolicyHeadConfig
-```
-
-### 8.4 `groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml`
-
-状态：新增。
-
-继承：
-
-```text
-wan_flow_matching_action_tf
-```
-
-关键全局配置：
-
-```text
-plan_horizon              = 6
-action_horizon            = 12
-max_action_dim            = 21
-num_action_per_block      = 12
-base_action_dim           = 4
-max_manipulator_action_dim= 21
-```
-
-替换：
-
-```text
-action_head_cfg._target_
-diffusion_model_cfg._target_
-```
-
-分别指向：
-
-```text
-MobilePlanFlowMatchingActionHead
-WanVideoDiTDualPlan
-```
-
-两路 loss 默认权重均为 1。
-
-`max_state_dim` 显式传给双路 DiT，以保证 state encoder 与 transform、checkpoint 一致。
-
-## 9. 数据 Hydra 配置
-
-### 9.1 `groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml`
-
-状态：新增。
-
-该文件选择双路 Plan dataset，而不是原 step-action dataset。
-
-核心参数：
-
-```text
-plan_horizon      = 6
-plan_time_offsets = [1,4,8,12,16,24]
-num_frames        = 33
-action_horizon    = 12
-state_horizon     = 1
-```
-
-`train_dataset` 的视频 delta indices 是：
-
-```text
-0..32
-```
-
-即一次取 33 帧用于 video dynamics。
-
-transform 链：
-
-```text
-MobilePlanTransform
-→ MobilePlanCotrainTransform
-```
-
-第一层处理真实计划的归一化和 mask，第二层将其适配到 DreamZero。
-
-#### 当前边界
-
-该配置只声明 `train_dataset`，没有 MobileManip `val_dataset`。这就是当前训练日志显示：
-
-```text
-eval dataloader length: no eval dataloader
-```
-
-的原因。
-
-## 10. 统计与人工检查脚本
-
-### 10.1 `scripts/data/prepare_mobilemanibench_plan_metadata.py`
-
-状态：新增。
-
-用途是从转换后的 parquet 计算：
-
-```text
-meta/plan_stats.json
-```
-
-支持输入：
-
-- 单个机器人 root；
-- 同时含 `g1/` 和 `xhand/` 的父目录。
-
-只使用 `plan_valid=true` 的 waypoint 拟合统计量。
-
-输出：
-
-- mean/std/min/max；
-- q01/q99；
-- normalization policy；
-- waypoint 数量；
-- hand joint names；
-- 几何 QA。
-
-几何 QA 包括：
-
-```text
-finite 检查
-yaw sin/cos 单位范数误差
-rotation6d 行单位范数误差
-rotation6d 两行点积误差
-```
-
-#### 当前注意事项
-
-`fit_split` 当前字符串写的是：
-
-```text
-train (all episodes selected by the converted smoke dataset)
-```
-
-它准确描述 smoke 数据，但将来用于正式全量 train split 时应同步更新元数据描述。
-
-### 10.2 `scripts/data/inspect_mobilemanibench_plan_batch.py`
-
-状态：新增。
-
-用于从 dataset 读取一个样本并生成：
-
-```text
-PNG  人工可视化
-JSON shape/offset/mask/range 摘要
-```
-
-PNG 横向拼接：
-
-```text
-head image
-wrist image
-Base XY 与 EEF XY 轨迹面板
-```
-
-轨迹点用 horizon index 标注，方便检查：
-
-- 坐标系方向；
-- 未来 waypoint 顺序；
-- terminal mask；
-- Base 与 EEF 轨迹是否明显异常。
-
-这个脚本检查的是真实 label 和 normalization，不是模型 prediction。
-
-## 11. 训练脚本
-
-### 11.1 `scripts/train/mobilemanibench_plan_training.sh`
-
-状态：新增。
-
-这是当前双路 Plan 的正式启动入口。
-
-#### 自包含环境
-
-脚本自动：
-
-- 解析 repo root；
-- 使用 `/mnt/yihao/envs/dreamzero`；
-- 找到该环境的 `torchrun`；
-- 设置 Hydra full error；
-- 禁止 Albumentations 更新提示。
-
-因此可以从任意目录直接运行：
-
-```bash
-bash /mnt/yihao/codes/dreamzero/scripts/train/mobilemanibench_plan_training.sh
-```
-
-#### 当前默认是 smoke overfit
-
-```text
-data root       smoke_v2/g1
-GPU             1
-max steps       200
-save steps      100
-batch size      1
-learning rate   1e-5
-```
-
-脚本显式检查：
-
-- dataset metadata；
-- plan stats；
-- checkpoint directories；
-- `save_total_limit >= 5`。
-
-支持：
-
-```text
-PREFLIGHT_ONLY=1
-```
-
-只检查环境和文件，不启动训练。
-
-#### 双路核心 override
-
-```text
-data=dreamzero/mobilemanibench_plan
-action_head=mobile_plan_flow_matching
-transform=mobile_plan_cotrain
-action_horizon=12
-num_frame_per_block=8
-num_action_per_block=12
-num_state_per_block=1
-frame_seqlen=880
-save_lora_only=true
-```
-
-#### 已知限制 1：默认自动续训不成立
-
-默认：
-
-```text
-RUN_ID = 当前时间
-OUTPUT_DIR = ..._${RUN_ID}
-```
-
-DreamZero 底层会在同一个 `OUTPUT_DIR` 中自动查找最后 checkpoint，但脚本每次默认创建新时间戳目录，所以直接重复运行命令不会命中上一次目录。
-
-#### 已知限制 2：最终保存很大
-
-一次真实 1-step 验证发现最终 root save 可能写出约 30GB，并在 NFS 上耗时很长。虽然配置是：
-
-```text
-save_lora_only=true
-```
-
-但当前完整保存路径仍需要单独审计。全量训练前不应忽略该问题。
-
-#### 已知限制 3：当前没有 evaluation
-
-脚本没有开启 MobileManip validation dataset 或离线轨迹指标。
-
-### 11.2 `scripts/train/mobilemanibench_training.sh`
-
-状态：修改。
-
-这是原 step-action baseline，不是双路 Plan 路径。
-
-修改主要是启动健壮性：
-
-- checkpoint、tokenizer、pretrained path 改为可由环境变量覆盖；
-- 增加 `REPORT_TO`、`WANDB_PROJECT`；
-- 增加可配置 `MAX_STEPS`、`SAVE_STEPS`、batch size、logging steps；
-- 增加 `SAVE_TOTAL_LIMIT >= 5` 检查；
-- 增加配置摘要打印；
-- 增加 `PREFLIGHT_ONLY`；
-- Hydra 参数改为引用上述变量。
-
-学习时必须区分：
-
-```text
-mobilemanibench_training.sh
-    = 原 DreamZero step-action baseline
-
-mobilemanibench_plan_training.sh
-    = 当前 Base/Manipulator dual-plan research path
-```
-
-baseline 脚本没有被改写成双路计划。
-
-## 12. 实验日志文件
-
-### 12.1 `groot/vla/experiment/base.py`
-
-状态：修改。
-
-只修改 `LossLoggerCallback`。
-
-原来只记录固定字段：
-
-```text
-loss
-dynamics_loss_avg
-action_loss_avg
-learning_rate
-```
-
-现在改为：
-
-```text
-loss
-learning_rate
-所有以 _loss_avg 结尾的日志
-```
-
-因此新字段：
-
-```text
-base_flow_loss_avg
-manipulator_flow_loss_avg
-```
-
-能够自动写入：
+`BaseTrainer.compute_loss()` 对所有 `*_loss` 维护最近 10 step 的 moving average，
+`LossLoggerCallback` 将 `*_loss_avg` 写入：
 
 ```text
 OUTPUT_DIR/loss_log.jsonl
 ```
 
-这个修改并不负责计算 loss，只负责将 Trainer 已经 log 出来的所有分支 loss 持久化。
+---
 
-## 13. 测试文件
+## 13. LoRA、预训练权重与 checkpoint
 
-### 13.1 `tests/data/test_mobilemanibench_plan_dataset.py`
-
-状态：新增。
-
-使用远程 smoke_v2 数据执行集成测试。
-
-覆盖：
-
-#### G1
-
-- Base shape `[6,4]`；
-- Manipulator padding 后 `[6,21]`；
-- 只有前 10 维有效；
-- 尾部 padding 为 0；
-- horizon 没有被重复扩展；
-- terminal sample 的未来计划全部 invalid。
-
-#### XHand
-
-- Manipulator shape `[6,21]`；
-- 21 维全部有效；
-- hand dimension 为 12。
-
-#### 标签重建
-
-测试重新调用 converter 的 `build_plan_labels`，从保留的：
+两个 profile 都使用：
 
 ```text
-observation.base.world
-observation.eef.world
-observation.robot_joint
+train_architecture=lora
+lora rank=4
+lora alpha=4
+targets=q,k,v,o,ffn.0,ffn.2
 ```
 
-重建 Base/Manipulator realized plans，并与 parquet 存储标签比较。
-
-这项测试证明 label 不是不可追踪的二次产物，而是可以由保留的真实状态确定性重建。
-
-### 13.2 `tests/data/test_mobilemanibench_plan_transform.py`
-
-状态：新增。
-
-对 G1 和 XHand 同时检查：
-
-- action shape；
-- q99 slice 落在 `[-1,1]`；
-- yaw sin/cos 未被改变；
-- rotation6d 未被改变；
-- valid mask 与 dimension mask 正确合并；
-- `unapply` 能恢复物理量。
-
-因为正向会 clip 到 q01/q99，所以 inverse 的期望值也是 raw value clip 到对应 quantile 范围，而不是无条件恢复所有极端 outlier。
-
-### 13.3 `tests/model/test_mobile_plan_phase2.py`
-
-状态：新增。
-
-这是不依赖 14B checkpoint 的轻量模型单元测试。
-
-覆盖：
-
-#### 双路投影
-
-- encoder/decoder 输出 `[B,12,21]`；
-- Base padding 维严格为 0；
-- Base encoder、Manipulator encoder 和两个 decoder 都能收到梯度。
-
-#### 分路 loss
-
-- padding 维不影响 loss；
-- invalid waypoint 不影响 loss；
-- Base 和 Manipulator loss 分别计算。
-
-#### timestep
-
-- Base/Manipulator 使用一致 timestep；
-- one video block 的 timestep 能扩展为全部 12 个 plan tokens。
-
-## 14. 推荐学习顺序
-
-建议不要按目录字母顺序阅读，而按数据流阅读。
-
-### 第一阶段：理解标签和归一化
+LoRA 注入后，当前代码显式训练：
 
 ```text
-1. groot/vla/data/dataset/mobilemanibench_plan.py
-2. groot/vla/data/transform/mobile_plan.py
-3. scripts/data/prepare_mobilemanibench_plan_metadata.py
-4. scripts/data/inspect_mobilemanibench_plan_batch.py
-5. tests/data/test_mobilemanibench_plan_dataset.py
-6. tests/data/test_mobilemanibench_plan_transform.py
+Wan LoRA adapters
+state_encoder
+dual action_encoder
+dual action_decoder
+type/offset embedding 所在 action module 参数
 ```
 
-读完应能回答：
-
-- realized plan 从哪里来；
-- G1/XHand 维度为何不同；
-- 哪些 slice 归一化；
-- mask 如何组合；
-- terminal waypoint 如何处理。
-
-### 第二阶段：理解 DreamZero 打包
+冻结：
 
 ```text
-7. groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py
-8. groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml
-9. groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml
+text encoder
+image encoder
+VAE
+非 LoRA Wan 主干参数
 ```
 
-读完应能回答：
-
-- `[6,4] + [6,21]` 如何变成 `[12,21]`；
-- state 为什么是 64 维；
-- 两路相机为何必须先 resize；
-- 33 帧和 880 tokens/frame 如何对应。
-
-### 第三阶段：理解双路 tokens
+`save_lora_only=true` 只使 `model.safetensors` overlay 较小，不代表整个 Trainer
+checkpoint 很小。当前 Wan2.2 `checkpoint-2000`：
 
 ```text
-10. groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
-11. groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
-12. groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
-13. groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml
-14. tests/model/test_mobile_plan_phase2.py
+model.safetensors 约 190 MB
+完整 checkpoint 约 49 GB
 ```
 
-读完应能回答：
+大头来自 8 个 ZeRO optimizer state。容量规划必须按完整 checkpoint 计算。
 
-- 两路在哪里解耦；
-- 两路在哪里重新共享计算；
-- physical time offsets 如何注入；
-- flow loss 如何按 slice 计算；
-- 为什么当前 `num_frame_per_block=8`。
+---
 
-### 第四阶段：理解训练入口
+## 14. 训练内 validation
+
+### 14.1 数据
+
+`mobilemanibench_plan.yaml` 同时定义：
 
 ```text
-15. scripts/train/mobilemanibench_plan_training.sh
-16. groot/vla/experiment/base.py
-17. scripts/train/mobilemanibench_training.sh
+train_dataset split=train
+val_dataset   split=val, max_samples=${max_eval_samples}
 ```
 
-读完应能回答：
+只有 `do_eval=true` 时，`BaseExperiment.create_val_dataset()` 才实例化 validation。
 
-- baseline 和 research path 的区别；
-- 哪些参数来自 Hydra，哪些来自 shell 环境变量；
-- checkpoint 保存频率；
-- loss 日志保存位置；
-- 当前自动续训和保存路径的限制。
-
-最后再阅读各个 `__init__.py`，理解 Hydra target 的 Python import 路径即可。
-
-## 15. 当前代码的完整训练数据流
+Wan2.1 smoke 脚本未显式开启 eval；Wan2.2 正式脚本默认：
 
 ```text
-MobileManiBench converted parquet row
-│
-├── observation images/state/language
-│     └── LeRobotSingleDataset
-│
-├── action.plan.base_waypoints
-├── action.plan.manipulator
-└── action.plan.valid
-      │
-      ▼
-MobileManiBenchPlanDataset
-      │
-      ├── pad manipulator to 21 dims
-      ├── dimension masks
-      └── physical plan offsets
-      │
-      ▼
-MobilePlanTransform
-      │
-      ├── q99 normalization by slice
-      ├── geometry validation
-      └── valid × dimension masks
-      │
-      ▼
-MobilePlanCotrainTransform
-      │
-      ├── resize/compose video
-      ├── normalize/pad state
-      └── pack [6 Base + 6 Manipulator] → [12,21]
-      │
-      ▼
-MobilePlanDataCollator
-      │
-      ▼
-MobilePlanFlowMatchingActionHead
-      │
-      ├── shared plan timestep
-      ├── explicit physical offsets
-      └── one 8-frame video block ↔ one plan window
-      │
-      ▼
-WanVideoDiTDualPlan
-      │
-      ├── Base encoder
-      ├── Manipulator encoder
-      ├── type + offset embeddings
-      ├── shared Wan DiT
-      ├── Base decoder
-      └── Manipulator decoder
-      │
-      ▼
-base_flow_loss + manipulator_flow_loss + dynamics_loss
+do_eval=true
+eval_strategy=steps
+eval_steps=2000
+per_device_eval_batch_size=1
+max_eval_samples=1024
 ```
 
-## 16. 现阶段最值得继续检查的风险
+### 14.2 DreamZero positional batch contract
 
-这些不是本轮新增修改，而是阅读当前实现时必须知道的边界：
+DreamZero VLA 接口是：
 
-1. 当前没有 validation dataloader，训练 loss 下降不等于泛化有效。
-2. 当前没有离线 trajectory metrics。
-3. `RUN_ID` 默认时间戳会让直接重启脚本创建新目录，底层自动 resume 无法命中旧 checkpoint。
-4. `save_lora_only=true` 下最终保存仍曾产生约 30GB 输出，需要审计。
-5. 全量数据转换完成前，脚本默认仍指向两 episode smoke_v2/G1。
-6. `plan_stats.json` 必须只用正式 train split 拟合，不能泄漏 validation/test。
-7. reachability、collision 和 task success 仍需要机器人模型或仿真环境。
-8. 当前实现还没有 Phase 3 的 Base/Manipulator consistency loss。
-9. 当前实现还没有 VGGT 2D/3D tokenizer。
-10. 双路计划推理输出已能拆分，但还缺完整 checkpoint inference/反归一化 runner。
+```python
+model(inputs)
+```
 
-## 17. 最小验证命令
+而不是：
 
-数据和模型轻量测试：
+```python
+model(**inputs)
+```
+
+`BaseTrainer.prediction_step()` 因此覆盖 Hugging Face 默认行为，用单个 positional
+batch dictionary 调用模型，只返回 detached validation loss，不收集巨大
+video/action logits。
+
+### 14.3 save-before-eval
+
+当同一 step 同时需要 save/eval 且：
+
+```text
+save_strategy != best
+```
+
+执行顺序为：
+
+```text
+checkpoint save
+→ callback on_save
+→ logging/evaluation
+```
+
+这样 expensive validation 即使失败，该 step checkpoint 也已保存。`best` 策略仍
+必须先 eval 再决定是否保存。
+
+### 14.4 no_grad block tuple 修复
+
+Wan attention block 固定返回：
+
+```text
+(hidden_states, updated_kv_cache)
+```
+
+validation 在 `torch.no_grad()` 下不走 gradient checkpointing。当前
+`_training_block_hidden_states()` 统一解包两条路径，并断言训练/validation
+不得产生非空 KV cache。
+
+---
+
+## 15. 推理与离线指标
+
+`MobilePlanFlowMatchingActionHead.get_action()` 调用 joint video/action flow sampler，
+并把 packed prediction 拆成：
+
+```text
+base_plan_pred        [B,6,4]
+manipulator_plan_pred [B,6,21]
+```
+
+离线 evaluator 的正确推理输入只有当前 RGB observation：
+
+```text
+video_delta_indices = [0]
+```
+
+训练中的未来 32 RGB frames 是 dynamics targets，不能在部署推理时作为 clean
+context 输入。
+
+sampling 完成后使用 `MobilePlanTransform.unapply()` 回到物理单位，再计算：
+
+```text
+Base:
+    ADE/FDE [m]
+    yaw MAE/final error [deg]
+
+Manipulator:
+    EEF position ADE/FDE [m]
+    EEF orientation geodesic error [deg]
+    hand joint MAE
+
+Combined geometry:
+    Base-relative EEF position/orientation error
+
+Aggregation:
+    mean/median/p90
+    per-horizon
+    per-sample
+```
+
+输出包括：
+
+```text
+summary.json
+per_sample_metrics.jsonl
+per_horizon_metrics.csv
+predictions.npz
+```
+
+重要限制：当前 evaluator 的模型加载流程适配带
+`pretrained_model_path` 的 DreamZero overlay。Wan2.2 正式配置将该字段设为
+`null`，所以不能把“评估代码存在”理解为“Wan2.2 checkpoint 已端到端评估通过”。
+
+---
+
+## 16. 当前验证证据
+
+### 16.1 轻量测试
+
+以下 10 个 Phase 1–2 tests 当前通过：
 
 ```bash
 cd /mnt/yihao/codes/dreamzero
+NO_ALBUMENTATIONS_UPDATE=1 \
 /mnt/yihao/envs/dreamzero/bin/python -m unittest \
   tests.model.test_mobile_plan_phase2 \
   tests.data.test_mobilemanibench_plan_transform \
@@ -1473,39 +1085,162 @@ cd /mnt/yihao/codes/dreamzero
   -v
 ```
 
-训练前文件检查：
+覆盖：
+
+- G1/XHand dataset shape、padding、terminal mask；
+- stored labels 可由 preserved realized state 重建；
+- normalization、geometry slice、mask 和 inverse；
+- 双路 projection shape 与 gradients；
+- invalid/padding 不影响 branch loss；
+- Base/Manipulator timestep 对齐；
+- validation block tuple 解包。
+
+Trainer validation tests 建议在外部关闭可见 GPU，避免同一 unittest 进程中先导入
+Torch 后触发 DataParallel 测试副本状态问题：
+
+```bash
+CUDA_VISIBLE_DEVICES='' \
+/mnt/yihao/envs/dreamzero/bin/python -m unittest \
+  tests.experiment.test_base_trainer_prediction_step \
+  -v
+```
+
+它覆盖：
+
+- validation 以 `model(inputs)` 调用；
+- 同 step 的 `save → evaluate` 顺序。
+
+### 16.2 preflight
 
 ```bash
 PREFLIGHT_ONLY=1 \
-bash /mnt/yihao/codes/dreamzero/scripts/train/mobilemanibench_plan_training.sh
+bash scripts/train/mobilemanibench_plan_training.sh
+
+PREFLIGHT_ONLY=1 \
+bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```
 
-当前 smoke 训练：
+当前两者都能通过文件和配置前置检查。
 
-```bash
-bash /mnt/yihao/codes/dreamzero/scripts/train/mobilemanibench_plan_training.sh
-```
+### 16.3 Wan2.2 正式训练证据
 
-观察：
+当前五任务 run 已产生：
 
 ```text
-base_flow_loss
-manipulator_flow_loss
-action_loss
-dynamics_loss
-loss
+checkpoint-2000
+loss_log.jsonl 已记录到 step 3020
 ```
 
-其中应近似满足：
+观测到：
 
 ```text
-action_loss =
-    base_flow_loss
-  + manipulator_flow_loss
+step 0:
+    dynamics_loss_avg = 1.4600
+    action_loss_avg   = 5.3409
 
-loss =
-    dynamics_loss
-  + action_loss
+step 3020:
+    dynamics_loss_avg = 0.2297
+    action_loss_avg   = 0.1259
 ```
 
-默认两个分支 loss 权重均为 1。
+这证明当前双路 forward、backward、optimizer 和 loss logging 已在正式 5B 训练中
+工作。
+
+但 `checkpoint-2000/trainer_state.json` 尚无成功 `eval_loss`：首次 step-2000
+validation 在上述接口修复前失败。当前修复已通过轻量回归测试，仍需用下一次正式
+validation 结果完成大模型端到端确认。
+
+---
+
+## 17. 阅读顺序
+
+### 第一步：理解 label 和坐标系
+
+```text
+scripts/data/convert_mobilemanibench_to_gear.py::build_plan_labels
+scripts/data/convert_mobilemanibench_to_gear.py::build_core_state
+tests/data/test_mobilemanibench_plan_dataset.py
+```
+
+应能回答：
+
+- 为什么所有 future pose 都在 `B(t)`；
+- Base yaw 为什么用 sin/cos；
+- EEF rotation6d 采用哪两行；
+- terminal plan 为什么置零且 mask=false。
+
+### 第二步：理解 normalization 与 packing
+
+```text
+groot/vla/data/dataset/mobilemanibench_plan.py
+groot/vla/data/transform/mobile_plan.py
+groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py
+```
+
+应能回答：
+
+- G1 `[6,10]` 如何统一为 `[6,21]`；
+- 哪些 slice 做 q01/q99；
+- `[6,4]+[6,21]` 如何变成 `[12,21]`；
+- video grid 和 64 维 state 从哪里来。
+
+### 第三步：理解双路 DiT
+
+```text
+groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
+groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
+tests/model/test_mobile_plan_phase2.py
+```
+
+应能回答：
+
+- 两路在哪里独立、在哪里交互；
+- physical-time embedding 与 Wan RoPE 的区别；
+- action/video/state attention 可见性；
+- 为什么没有 future clean target leakage。
+
+### 第四步：理解 flow loss 和训练
+
+```text
+groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
+groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+groot/vla/experiment/base.py
+```
+
+应能回答：
+
+- shared timestep 如何构造；
+- mask 如何进入分路 loss；
+- dynamics/action loss 如何相加；
+- LoRA 与双路 projector 哪些参数可训练；
+- validation 和 checkpoint 为什么按当前顺序执行。
+
+### 第五步：理解部署评估
+
+```text
+scripts/eval/evaluate_mobilemanibench_plan.py
+scripts/eval/analyze_mobilemanibench_plan_predictions.py
+```
+
+应能回答：
+
+- 为什么推理只能提供当前 observation；
+- prediction 如何反归一化；
+- ADE/FDE、orientation 和 relative EEF 指标如何汇总；
+- 当前 Wan2.2 evaluator 还缺哪一步兼容修复。
+
+---
+
+## 18. 最容易混淆的结论
+
+1. `[12,21]` 是存储/接口矩形，不表示 Base 是 21 维。
+2. Base 和 Manipulator 有独立投影，但共享 Wan blocks，并能完整交互。
+3. `plan_time_offsets` 是物理 future 时间，不是普通 ordinal。
+4. 33 帧训练视频包含 dynamics target；部署推理不能输入未来 32 帧。
+5. 6 维真实 state pad 到 64 维是 projector/checkpoint 兼容，不是新增状态语义。
+6. Base plan tokens 是待去噪目标，不是独立 coarse base-prior tokens。
+7. validation loss 已接入，但不是完整 trajectory metric。
+8. trajectory evaluator 已实现，不代表当前 Wan2.2 checkpoint 已跑通。
+9. `save_lora_only=true` 不会消除 ZeRO optimizer checkpoint 的大容量。
+10. VGGT 已在仓库独立路径实现，但不属于本文件的纯 WAM Phase 0–2 输入。

@@ -28,6 +28,16 @@ import os
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 
 
+def _training_block_hidden_states(
+    block_output: tuple[torch.Tensor, torch.Tensor | None],
+) -> torch.Tensor:
+    """Return training hidden states while enforcing the no-cache contract."""
+    hidden_states, updated_kv_cache = block_output
+    if updated_kv_cache is not None:
+        raise RuntimeError("Training blocks must not return an updated KV cache")
+    return hidden_states
+
+
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
         super().__init__()
@@ -2127,9 +2137,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
-                outputs, updated_kv_cache = module(*inputs, **kwargs)
-                assert updated_kv_cache is None
-                return outputs
+                return _training_block_hidden_states(module(*inputs, **kwargs))
             return custom_forward
 
         for block in self.blocks:
@@ -2140,7 +2148,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                # Blocks always return ``(hidden_states, updated_kv_cache)``.
+                # Validation runs under no_grad and therefore reaches this
+                # branch even when gradient checkpointing is configured.
+                x = _training_block_hidden_states(block(x, **kwargs))
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]

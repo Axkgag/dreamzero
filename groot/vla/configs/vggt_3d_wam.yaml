@@ -1,0 +1,109 @@
+defaults:
+  - _self_
+  - model: vggt_3d_wam/encoder_decoder
+  - data: dreamzero/mobilemanibench_vggt
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+mobilemanibench_data_root: ???
+vggt_checkpoint_path: /mnt/yihao/codes/ReconDrive/checkpoints/model.pt
+# Optional V1/V2 DreamZero checkpoint used only for name-and-shape-compatible
+# trainable parameter initialization. Null/empty means skip completely.
+init_checkpoint: null
+init_random: false
+output_dir: ???
+
+image_height: 160
+image_width: 320
+pointmap_height: 80
+pointmap_width: 160
+num_frames: 33
+latent_frames: 9
+video_delta_indices: [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+  11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+  21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+  31, 32
+]
+validation_fraction: 0.1
+sample_stride: 1
+validation_sample_stride: 4
+
+seed: 42
+do_eval: true
+max_eval_samples: 256
+report_to: wandb
+wandb_project: dreamzero-vggt
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
+dataloader_num_workers: 2
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+# Randomly initialized tokenizer/decoder/geometry modules need a materially
+# larger LR than pretrained VGGT aggregation LoRA.
+learning_rate: 5.0e-5
+backbone_learning_rate: 2.0e-5
+weight_decay: 1.0e-2
+warmup_ratio: 0.02
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.2
+logging_steps: 1
+max_steps: 5000
+save_steps: 500
+eval_steps: 500
+save_total_limit: 5
+bf16: true
+tf32: true
+deepspeed: ""
+
+visualization:
+  enabled: true
+  train_interval: 1000
+  val_interval: 5000
+  val_max_samples: 4
+  max_time_steps: 4
+  max_views: 2
+  scatter_max_points: 4096
+  confidence_threshold: 0.01
+  log_to_wandb: false
+  fail_on_error: false
+
+training_args:
+  _target_: transformers.TrainingArguments
+  output_dir: ${output_dir}
+  run_name: vggt-3d-wam
+  remove_unused_columns: false
+  prediction_loss_only: true
+  deepspeed: ${deepspeed}
+  bf16: ${bf16}
+  tf32: ${tf32}
+  per_device_train_batch_size: ${per_device_train_batch_size}
+  per_device_eval_batch_size: ${per_device_eval_batch_size}
+  gradient_accumulation_steps: ${gradient_accumulation_steps}
+  dataloader_num_workers: ${dataloader_num_workers}
+  dataloader_pin_memory: ${dataloader_pin_memory}
+  dataloader_persistent_workers: ${dataloader_persistent_workers}
+  optim: adamw_torch
+  learning_rate: ${learning_rate}
+  weight_decay: ${weight_decay}
+  warmup_ratio: ${warmup_ratio}
+  lr_scheduler_type: ${lr_scheduler_type}
+  lr_scheduler_kwargs: ${lr_scheduler_kwargs}
+  logging_steps: ${logging_steps}
+  max_steps: ${max_steps}
+  save_strategy: steps
+  save_steps: ${save_steps}
+  eval_strategy: steps
+  eval_steps: ${eval_steps}
+  save_total_limit: ${save_total_limit}
+  report_to: ${report_to}
+  seed: ${seed}
+  do_eval: ${do_eval}
+  ddp_find_unused_parameters: false
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

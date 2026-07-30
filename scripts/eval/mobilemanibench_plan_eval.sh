@@ -14,15 +14,15 @@ export NO_ALBUMENTATIONS_UPDATE=1
 
 cd "$REPO_ROOT"
 
-DEFAULT_RUN_DIR="$REPO_ROOT/work_dirs/mobilemanibench_dual_plan_g1_20260723_220248"
-DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_smoke_v2/g1"
+DEFAULT_RUN_DIR="$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline"
+DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1"
 
 RUN_DIR=${RUN_DIR:-"$DEFAULT_RUN_DIR"}
 DATA_ROOT=${DATA_ROOT:-"$DEFAULT_DATA_ROOT"}
-SPLIT=${SPLIT:-train}
+SPLIT=${SPLIT:-val}
 NUM_GPUS=${NUM_GPUS:-2}
 EVAL_GPUS=${EVAL_GPUS:-"0,1"}
-MAX_SAMPLES=${MAX_SAMPLES:-0}
+MAX_SAMPLES=${MAX_SAMPLES:-1024}
 SAMPLE_STRIDE=${SAMPLE_STRIDE:-1}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-16}
 SEED=${SEED:-1140}

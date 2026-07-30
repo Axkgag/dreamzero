@@ -16,6 +16,7 @@
 # This file is modified from https://github.com/haotian-liu/LLaVA/
 
 from abc import ABC
+from collections.abc import Mapping
 import contextlib
 import json
 import logging
@@ -43,6 +44,7 @@ from transformers.trainer import (
     get_parameter_names,
     is_sagemaker_mp_enabled,
 )
+from transformers.trainer_utils import SaveStrategy
 
 import groot.vla.common.utils as U
 from groot.vla.data.dataset.lerobot_sharded import ShardedLeRobotMixtureDataset
@@ -432,6 +434,74 @@ class BaseTrainer(transformers.Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def _maybe_log_save_evaluate(
+        self,
+        tr_loss,
+        grad_norm,
+        model,
+        trial,
+        epoch,
+        ignore_keys_for_eval,
+        start_time,
+        learning_rate=None,
+    ):
+        """Persist a step checkpoint before running validation at that step.
+
+        Upstream Trainer evaluates before saving. For expensive VLA training,
+        an evaluation failure would otherwise discard every update since the
+        previous checkpoint. BEST strategy is excluded because its save
+        decision necessarily depends on the new validation metric.
+        """
+        save_before_evaluate = (
+            self.control.should_save
+            and self.control.should_evaluate
+            and self.args.save_strategy != SaveStrategy.BEST
+        )
+        if save_before_evaluate:
+            self._save_checkpoint(model, trial)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
+            # Prevent the upstream implementation from saving the same step a
+            # second time after evaluation.
+            self.control.should_save = False
+        return super()._maybe_log_save_evaluate(
+            tr_loss,
+            grad_norm,
+            model,
+            trial,
+            epoch,
+            ignore_keys_for_eval,
+            start_time,
+            learning_rate,
+        )
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        """Evaluate DreamZero's positional batch-dict model interface.
+
+        Hugging Face's default no-label path expands a mapping as
+        ``model(**inputs)``. DreamZero VLA models instead accept the complete
+        transformed batch as one positional argument: ``model(inputs)``.
+        Training-time validation currently reports loss only, so deliberately
+        avoid gathering large video/action tensors across ranks.
+        """
+        del prediction_loss_only, ignore_keys
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                outputs = model(inputs)
+                if isinstance(outputs, Mapping):
+                    loss = outputs["loss"]
+                else:
+                    loss = outputs[0]
+        return loss.mean().detach(), None, None
+
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -745,6 +815,8 @@ class BaseExperiment(ABC):
         return train_dataset
 
     def create_val_dataset(self, cfg, model):
+        if bool(cfg.get("do_eval", False)) and cfg.get("val_dataset") is not None:
+            return instantiate(cfg.val_dataset)
         return None
 
     def create_data_collator(self, cfg, model):

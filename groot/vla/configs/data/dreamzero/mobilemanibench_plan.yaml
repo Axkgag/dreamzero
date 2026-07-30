@@ -13,6 +13,8 @@ base_action_dim: 4
 max_manipulator_action_dim: 21
 control_fps: 30.0
 max_chunk_size: 5
+mobilemanibench_split_manifest: ${mobilemanibench_data_root}/meta/plan_splits.json
+max_eval_samples: 1024
 
 # The plan itself is already materialized in each current row. Observation
 # video still spans the 33-frame dynamics window.
@@ -40,6 +42,30 @@ train_dataset:
   load_videos: true
   video_backend: decord
   max_manipulator_dim: ${max_manipulator_action_dim}
+  split: train
+  split_manifest_path: ${mobilemanibench_split_manifest}
+  plan_transform:
+    _target_: groot.vla.data.transform.ComposedModalityTransform
+    transforms:
+      - _target_: groot.vla.data.transform.MobilePlanTransform
+        stats_path: ${mobilemanibench_data_root}/meta/plan_stats.json
+      - ${model_specific_transform}
+
+val_dataset:
+  _target_: groot.vla.data.dataset.MobileManiBenchPlanDataset
+  dataset_path: ${mobilemanibench_data_root}
+  video_delta_indices: [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32
+  ]
+  load_videos: true
+  video_backend: decord
+  max_manipulator_dim: ${max_manipulator_action_dim}
+  split: val
+  split_manifest_path: ${mobilemanibench_split_manifest}
+  max_samples: ${max_eval_samples}
   plan_transform:
     _target_: groot.vla.data.transform.ComposedModalityTransform
     transforms:

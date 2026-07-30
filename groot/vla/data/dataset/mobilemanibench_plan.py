@@ -48,6 +48,9 @@ class MobileManiBenchPlanDataset(Dataset):
         video_backend: str = "decord",
         max_manipulator_dim: int = 21,
         plan_transform: Any | None = None,
+        split: str = "all",
+        split_manifest_path: str | Path | None = None,
+        max_samples: int | None = None,
     ) -> None:
         self.dataset_path = Path(dataset_path)
         self.max_manipulator_dim = int(max_manipulator_dim)
@@ -61,6 +64,19 @@ class MobileManiBenchPlanDataset(Dataset):
         self.control_fps = float(self.extensions["time"]["control_fps"])
         self.hand_dim = len(self.robot_schema["hand_joint_indices"])
         self.manipulator_dim = 9 + self.hand_dim
+        if split not in {"train", "val", "all"}:
+            raise ValueError(f"Unknown split: {split}")
+        episode_indices = None
+        if split != "all":
+            manifest_path = (
+                Path(split_manifest_path)
+                if split_manifest_path is not None
+                else self.dataset_path / "meta/plan_splits.json"
+            )
+            split_manifest = _read_json(manifest_path)
+            if split not in split_manifest["splits"]:
+                raise ValueError(f"Split {split!r} is missing from {manifest_path}")
+            episode_indices = split_manifest["splits"][split]["episode_indices"]
 
         if tuple(plan_meta["base_shape"]) != (self.plan_horizon, 4):
             raise ValueError(f"Unexpected base plan shape: {plan_meta['base_shape']}")
@@ -102,7 +118,20 @@ class MobileManiBenchPlanDataset(Dataset):
             use_global_metadata=False,
             video_backend=video_backend,
             discard_bad_trajectories=True,
+            episode_indices=episode_indices,
         )
+        if max_samples is not None:
+            max_samples = int(max_samples)
+            if max_samples <= 0:
+                raise ValueError("max_samples must be positive when provided")
+            all_steps = self.observation_dataset._all_steps
+            if len(all_steps) > max_samples:
+                selected = np.linspace(
+                    0, len(all_steps) - 1, num=max_samples, dtype=np.int64
+                )
+                self.observation_dataset._all_steps = [
+                    all_steps[int(index)] for index in selected
+                ]
         # BaseExperiment persists this field beside checkpoints. Keep the same
         # mapping interface as LeRobot mixture datasets even though this adapter
         # represents exactly one embodiment root.

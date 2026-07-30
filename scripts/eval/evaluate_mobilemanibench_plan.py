@@ -56,7 +56,8 @@ def parse_args() -> argparse.Namespace:
         default="train",
         help=(
             "Episode split to evaluate. Resolution order is "
-            "meta/split_manifest.jsonl, source room split, then meta/info.json."
+            "meta/plan_splits.json, meta/split_manifest.jsonl, source room "
+            "split, then meta/info.json."
         ),
     )
     parser.add_argument("--output-dir", type=Path)
@@ -113,6 +114,17 @@ def split_from_manifest(dataset_root: Path, split: str) -> set[int] | None:
     }
 
 
+def split_from_plan_manifest(dataset_root: Path, split: str) -> set[int] | None:
+    path = dataset_root / "meta/plan_splits.json"
+    if not path.is_file():
+        return None
+    manifest = read_json(path)
+    split_meta = manifest.get("splits", {}).get(split)
+    if split_meta is None:
+        return None
+    return {int(value) for value in split_meta["episode_indices"]}
+
+
 def split_from_source_rooms(dataset_root: Path, split: str) -> set[int] | None:
     rows = read_jsonl(dataset_root / "meta/source_episodes.jsonl")
     matches: set[int] = set()
@@ -155,6 +167,7 @@ def split_from_info(dataset_root: Path, split: str) -> set[int] | None:
 
 def resolve_episode_split(dataset_root: Path, split: str) -> tuple[set[int], str]:
     resolvers = (
+        ("meta/plan_splits.json", split_from_plan_manifest),
         ("meta/split_manifest.jsonl", split_from_manifest),
         ("meta/source_episodes.jsonl:scene.room_infos.split", split_from_source_rooms),
         ("meta/info.json:splits", split_from_info),
@@ -166,6 +179,11 @@ def resolve_episode_split(dataset_root: Path, split: str) -> tuple[set[int], str
                 raise ValueError(f"Split {split!r} exists in {source} but contains no episodes")
             return selected, source
     available: dict[str, Any] = {}
+    plan_manifest_path = dataset_root / "meta/plan_splits.json"
+    if plan_manifest_path.is_file():
+        available["plan_splits"] = sorted(
+            read_json(plan_manifest_path).get("splits", {})
+        )
     manifest = read_jsonl(dataset_root / "meta/split_manifest.jsonl")
     if manifest:
         available["split_manifest"] = sorted({str(row.get("split")) for row in manifest})
@@ -277,6 +295,16 @@ def load_weights_into_model(
         )
 
 
+def resolve_optional_checkpoint(value: Any) -> Path | None:
+    """Resolve an optional Hydra checkpoint field without turning null into "None"."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    return Path(text).expanduser()
+
+
 def load_model(
     checkpoint: Path,
     device: torch.device,
@@ -289,16 +317,27 @@ def load_model(
     cfg = OmegaConf.load(config_path)
     model = instantiate(cfg.model)
 
-    base_checkpoint = Path(str(cfg.pretrained_model_path))
-    # The source DreamZero checkpoint contains its legacy step-action
-    # encoder/decoder. Those keys are intentionally absent from the dual-plan
-    # architecture; shared Wan weights still load by name.
-    load_weights_into_model(
-        model,
-        base_checkpoint,
-        "pretrained base",
-        allow_unexpected=True,
-    )
+    # Legacy DreamZero runs may reference an additional Hugging Face-format
+    # base checkpoint. Wan2.2 component-based runs intentionally set this to
+    # null: instantiate(cfg.model) already loads the DiT/VAE/text/image
+    # components from the paths saved under cfg.model.config.
+    base_checkpoint = resolve_optional_checkpoint(cfg.get("pretrained_model_path"))
+    if base_checkpoint is not None:
+        # The source DreamZero checkpoint contains its legacy step-action
+        # encoder/decoder. Those keys are intentionally absent from the
+        # dual-plan architecture; shared Wan weights still load by name.
+        load_weights_into_model(
+            model,
+            base_checkpoint,
+            "pretrained base",
+            allow_unexpected=True,
+        )
+    else:
+        print(
+            "[weights] pretrained base overlay: skipped "
+            "(model components were initialized from experiment_cfg/conf.yaml)",
+            flush=True,
+        )
     action_head = model.action_head
     if (
         hasattr(action_head, "inject_lora_after_loading")

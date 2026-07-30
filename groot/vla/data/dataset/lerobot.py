@@ -135,6 +135,7 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        episode_indices: list[int] | None = None,
     ):
         """
         Initialize the dataset.
@@ -180,6 +181,11 @@ class LeRobotSingleDataset(Dataset):
             # Default: apply to all action keys except those containing 'gripper'
             self.relative_action_keys = None  # Will be set after modality_configs is available
         self._relative_action_keys_input = relative_action_keys  # Store original input
+        self._episode_indices = (
+            None
+            if episode_indices is None
+            else {int(value) for value in episode_indices}
+        )
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
         self.tag = EmbodimentTag(embodiment_tag)
@@ -977,18 +983,23 @@ class LeRobotSingleDataset(Dataset):
         step_filter_path = self.dataset_path / STEP_FILTER_FILENAME
         step_filter = {}
         if step_filter_path.exists():
+            trajectory_lengths = dict(
+                zip(self.trajectory_ids.tolist(), self.trajectory_lengths.tolist())
+            )
             with open(step_filter_path, "r") as f:
                 for line in f:
                     episode_step_filter = json.loads(line)
                     trajectory_id = episode_step_filter["episode_index"]
-                    all_indices = np.arange(self.trajectory_lengths[trajectory_id].item())
+                    if trajectory_id not in trajectory_lengths:
+                        continue
+                    all_indices = np.arange(trajectory_lengths[trajectory_id])
                     indices_to_filter = np.array(episode_step_filter["step_indices"])
                     step_filter[trajectory_id] = np.setdiff1d(all_indices, indices_to_filter)
         else:
-            for trajectory_id in self.trajectory_ids:
-                step_filter[trajectory_id] = np.arange(
-                    self.trajectory_lengths[trajectory_id].item()
-                )
+            for trajectory_id, trajectory_length in zip(
+                self.trajectory_ids, self.trajectory_lengths
+            ):
+                step_filter[int(trajectory_id)] = np.arange(int(trajectory_length))
         return step_filter
 
     def _get_metadata(self) -> DatasetMetadata:
@@ -1128,7 +1139,13 @@ class LeRobotSingleDataset(Dataset):
         trajectory_ids = []
         trajectory_lengths = []
         for episode in episode_metadata:
-            trajectory_ids.append(episode["episode_index"])
+            episode_index = int(episode["episode_index"])
+            if (
+                self._episode_indices is not None
+                and episode_index not in self._episode_indices
+            ):
+                continue
+            trajectory_ids.append(episode_index)
             trajectory_lengths.append(episode["length"])
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 

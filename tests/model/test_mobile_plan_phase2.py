@@ -13,6 +13,9 @@ from groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan import (
     DualPlanActionDecoder,
     DualPlanActionEncoder,
 )
+from groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk import (
+    _training_block_hidden_states,
+)
 
 
 class _UnitWeightScheduler:
@@ -22,6 +25,20 @@ class _UnitWeightScheduler:
 
 
 class MobilePlanPhase2Test(unittest.TestCase):
+    def test_validation_block_output_discards_empty_cache(self) -> None:
+        hidden_states = torch.randn(2, 3, 4)
+        result = _training_block_hidden_states((hidden_states, None))
+        self.assertIs(result, hidden_states)
+
+    def test_training_block_output_rejects_nonempty_cache(self) -> None:
+        hidden_states = torch.randn(2, 3, 4)
+        with self.assertRaisesRegex(
+            RuntimeError, "must not return an updated KV cache"
+        ):
+            _training_block_hidden_states(
+                (hidden_states, torch.zeros(2, 3, 4))
+            )
+
     def test_dual_projection_shapes_and_gradients(self) -> None:
         encoder = DualPlanActionEncoder(
             base_action_dim=4,

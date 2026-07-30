@@ -38,6 +38,7 @@ dependencies = [
     "flask_socketio",
     "loguru",
     "lmdb",
+    "lpips==0.1.4",
     "meshcat",
     "meshcat-shapes",
     "rerun-sdk==0.21.0",

@@ -1,513 +1,535 @@
-# 面向 Mobile Manipulation 的 VGGT-3D WAM 方案
+# VGGT-3D WAM：方案与实施路线
 
-## 1. 研究动机
+## 1. 目标
 
-WAM 已经能够联合建模未来视觉动态和机器人动作
+Mobile manipulation 中，单纯的 2D video latent 容易把底盘 ego-motion、物体运动、
+遮挡和视角变化混合为图像表观变化。本方案引入与机器人坐标系对齐的 3D tokens，使
+WAM 同时建模：
 
-但在 mobile manipulation 场景中，仅依赖 2D video tokens 容易把多种物理变化混合成图像空间中的表观运动：
+- 多视角 2D appearance 与 future video；
+- coarse robot-centric geometry；
+- coarse Base mobility prior；
+- refined Base 与 Manipulator action plans。
 
-- 底盘运动会带来明显的相机 ego-motion 和背景变化
-- 物体运动、遮挡和显露需要比局部纹理更强的空间理解
+方案分两阶段：
 
-因此计划在 WAM 中引入显式的 3D spatial tokens，使 3D tokens 具备几何可解释性，并在 WAM 中承担未来空间表征的 denoising target。第一版研究重点仍是得到高质量、适合 WAM 的 2D video tokens；3D tokens 的主要职责是提供视角变化、ego-motion、遮挡和物体空间关系等粗粒度空间理解，而不是一开始就追求毫米级几何重建。
+1. 训练共享 VGGT-style backbone 的 2D/3D tokenizer；
+2. 将多视角 2D latent、3D representation 和 Base Prior 接入 causal WAM。
 
-## 2. 总体方案（两阶段）
+本文只描述方案、pipeline 和实施边界。当前 tokenizer 的逐文件实现见
+`docs/MM/MOBILEMANIBENCH_VGGT_CODE_CHANGES_BY_FILE.md`。
 
-**第一阶段：基于 VGGT 的时空 tokenizer 预训练**
+---
 
-训练一个多视角视频 encoder-decoder：
+## 2. 当前状态
 
-multi-view video + camera parameters -> VGGT encoder -> 2D video latent + dynamic 3D spatial tokens
+| 模块 | 状态 |
+|---|---|
+| VGGT-style shared backbone | 已实现 |
+| 多视角 2D video tokenizer、RGB decoder | 已实现 |
+| metric 3D tokenizer、PointMap decoder | 已实现 |
+| tokenizer loss、训练、验证和可视化 | 已实现 |
+| Base/Manipulator dual-plan WAM | 已实现 |
+| clean Base Prior tokens 与 coarse waypoint head | 方案保留，当前代码尚未显式实现 |
+| VGGT 多视角 `z_2d_video` 接入 WAM video stream | 未实现 |
+| `z_3d_video` 接入 WAM | 未实现 |
+| future 3D token/PointMap rollout | 未实现 |
 
-这一阶段的目标不只是单帧 RGB 压缩和静态 3D 聚合，而是同时学习 video compression 和 geometry-space temporal aggregation。2D 分支是主分支，负责得到适合 WAM denoising 的高质量压缩视频 latent；3D 分支是空间辅助分支，负责得到具备几何可解释性的 dynamic spatial tokens，并通过 robot-centric PointMap rendering、多视角一致性和跨时间一致性监督获得空间语义。第一版允许使用官方 VLA 同样读取的 `depth_image_*.mp4` 配合相机外参生成 coarse robot-centric PointMap pseudo label，先跑通完整 2D/3D tokenizer 与 WAM 链路。
+当前应先验证 Stage 1 表示质量，再实施 Stage 2；不能把 tokenizer 接口已实现等同于
+已经完成 WAM 集成，也不能把方案中的 Base Prior 写成当前代码已有模块。
 
-**第二阶段：3D-consistent WAM 训练**
+---
 
-在完整 WAM 中，将 2D、3D 和 action chunks 放入同一个 causal DiT 序列，训练方式沿用 DreamZero 的 causal chunk 设计
+## 3. 总体 pipeline
 
 ```text
-[clean history 2D tokens] + [noisy 2D chunk tokens]
-[clean history 3D tokens] + [noisy 3D chunk tokens]
-[noisy base action chunk tokens]
-[noisy manipulator action chunk tokens]
-[state / action-state tokens]
+Stage 1: VGGT 2D/3D tokenizer
+--------------------------------
+head/wrist RGB + K + T_B0_camera
+  -> frozen DINOv2 + LoRA VGGT-style aggregator
+  -> shared multi-view patch features
+       ├─ 2D temporal VAE -> multi-view z_2d -> RGB reconstruction
+       └─ metric voxel encoder -> z_3d
+                                  -> PointMap/occupancy rendering
+
+Stage 2: 3D-aware WAM
+--------------------------------
+clean history multi-view z_2d
++ noisy future multi-view z_2d
++ clean history z_3d
++ clean Base Prior query tokens
++ noisy Base plan tokens
++ noisy Manipulator plan tokens
+(+ optional noisy future z_3d)
+  -> shared causal WAM
+  -> future head/wrist z_2d
+  -> coarse Base prior trajectory
+  -> refined Base plan + Manipulator plan
+  -> optional future z_3d
+  -> VGGT 2D/3D decoders
 ```
 
-action tokens 采用解耦设计：base plan 和 manipulator plan 有各自独立的 token 序列、输入投影、输出投影及 token-type embedding，但共同进入 causal DiT backbone，在满足因果约束的前提下通过 self-attention 交互。manipulator plan 内部联合表示 EEF pose 与夹爪/灵巧手构型，不再为末端执行器建立第三路 action tokens。
+设计原则：
 
-语言和图像条件也保持 DreamZero 原有风格：language 作为 cross-attention context，timestep 通过AdaLN调制注入
+- 多视角 2D tokens 负责 appearance 和 future video；
+- 3D tokens 负责 coarse metric geometry；
+- Base Prior 是 clean latent queries，负责低频 mobility intention；
+- Base/Manipulator plan tokens 是 flow matching 的 noisy generation variables；
+- 所有 stream 使用一致的时间 lattice、planning horizon 和坐标锚点；
+- MVP 先证明 3D context 与 Base Prior 有用，再增加 future 3D generation。
 
-## 3. 当前明确创新点
+---
 
-当前最明确的创新点集中在第一阶段的 2D-3D encoder：构建一个基于 VGGT 共享 backbone 的多视角时空 tokenizer，使同一组 VGGT features 同时生成 2D video latent 和几何可解释的 3D spatial tokens。
+## 4. Stage 1：已实现的 tokenizer
 
-相比把 2D encoder 和 3D encoder 做成两个独立模块，这种设计有两个优势：第一，2D video latent 和 3D spatial tokens 来自同一个 3D-aware feature space，有助于保持 2D 表观信息和 3D 几何信息的一致性；第二，3D tokens 不是普通 latent，而是通过相机内外参从多视角 image tokens 中聚合，并通过 robot-centric PointMap rendering、多视角一致性和 masked-view reconstruction 获得明确的空间语义。
+### 4.1 输入、时间与坐标
 
-因此，这一阶段的核心贡献可以概括为：
+生产协议：
 
 ```text
-VGGT-shared 2D-3D encoder:
-  multi-view video + camera parameters
-   -> shared VGGT features
-   -> compressed 2D video latent
-   -> geometry-aware 3D spatial tokens on a metric grid
-   -> coarse robot-centric PointMap / feature rendering supervision
+video              [B,33,V,3,160,320]
+camera_K           [B,33,V,3,3]
+T_B0_camera        [B,33,V,4,4]
+pseudo_pointmap_B0 [B,33,V,3,32,64]
+
+z_2d_video         [B,V,48,9,10,20]
+z_3d_video         [B,9,384,256]
 ```
 
-这一设计的目标不是简单替换一个更强的 image encoder，而是训练一个同时服务于 video compression 和 geometry-aware world modeling 的统一 2D-3D tokenizer。这里“metric grid”表示 token 与真实尺度坐标 cell 绑定；使用有损 MP4 训练的第一版只能主张 coarse geometry-aware representation，不能据此主张高精度 metric reconstruction。
+这里的 `z_2d_video` 已经经过：
 
-## 4. 第一阶段VGGT Encoder设计
+- spatial bottleneck；
+- `160x320 -> 10x20` 空间压缩；
+- causal temporal Transformer；
+- `33 -> 9` 时间压缩；
+- VAE posterior sampling。
 
-### 4.1 时序聚合的总体顺序
+它是准备送入 WAM video stream 的 latent，不是还需要另一个时空 tokenizer 的
+per-frame feature。
 
-第一阶段输入是多视角视频，而不是孤立单帧。因此 VGGT encoder 需要同时支持 2D video latent 和 dynamic 3D latent。
-
-计划采用共享 VGGT backbone 提取每个时间步、每个视角的特征：
+2D/3D branch 共用：
 
 ```text
-I_{t,v} -> h_{t,v}
+33 frames -> 9 latent steps
+frame 0 + 8 groups of 4 frames
 ```
 
-之后分成两个分支：
+每个 clip 固定使用第 0 帧底盘坐标系 B0：
 
 ```text
-2D video branch:
-  h_{t,v}
-   -> spatial bottleneck
-   -> TemporalTransformer_2D
-   -> z_2d_video
-
-3D geometry branch:
-  h_{t,v} + camera parameters + metric 3D queries
-   -> per-frame 2D-to-3D aggregation
-   -> z_{3d,t}
-   -> TemporalTransformer_3D
-   -> z_3d_video
+T_B0_camera(t)
+  = inverse(T_world_base(frame0))
+  @ T_world_camera(t)
+  @ T_camera_pose_from_optical
 ```
 
-这里的关键区别是：2D branch 的目标是压缩 video latent，不要求 token 绑定显式 3D 坐标，因此可以直接在 VGGT image-token space 上做时间聚合。VGGT 特征本身包含一定 3D-aware inductive bias，但其组织方式仍然是 2D image tokens。
+voxel grid、pseudo PointMap 和预测 PointMap 都表达在 B0。未来 WAM 样本也应以当前
+决策时刻为统一 `B_anchor`，保证 3D tokens、Base Prior waypoints、refined Base
+waypoints 和 EEF waypoints 使用同一坐标系。
 
-3D branch 的目标是得到几何可解释的 spatial tokens，因此不能先在 image space 中混合时间信息再投影到 3D。更合理的顺序是先利用相机内外参完成 per-frame 2D-to-3D 聚合，让每个 token 绑定 metric 3D cell，再在这些 3D tokens 上做时间聚合。
+### 4.2 shared backbone
 
-### 4.2 2D Video Latent 的设计选择
-
-计划采用 VGGT 代替DreamZero中的2D VAE，并且VGGT 的 2D latent会采用类似VAE的分布压缩形式，但不会强行对齐到原始 VAE latent space
-
-主要考虑是：VGGT 预训练中已经包含多视角几何和 3D-aware 表征，如果直接使用 VAE latent alignment，可能会把这部分信息压回以图像重建为主的latent，丢失原本的3D表征
-
-因此，2D latent 的设计不是单帧 RGB latent，而是面向 video chunk 的压缩表示：
+当前实现是 VGGT-style tokenizer，不是完整官方 VGGT：
 
 ```text
-multi-view video
- -> VGGT backbone
+frozen DINOv2-L/14 patch extractor
+ -> per-frame attention
+ -> same-time cross-view global attention
+ -> shared features
+```
+
+DINO 完全冻结且无 LoRA。LoRA 只用于 24 对 frame/global aggregator blocks。
+`global_temporal_window=1`，因此 backbone 负责同一时刻的多视角融合，完整时间建模
+由后续 2D/3D branch 完成。
+
+### 4.3 2D branch
+
+```text
+shared features
  -> spatial bottleneck
- -> TemporalTransformer_2D
- -> 2D video latent z_2d_video
- -> video decoder
+ -> causal temporal Transformer
+ -> learned 33->9 temporal encoder
+ -> VAE mu/logvar
+ -> z_2d_video [B,V,48,9,10,20]
+ -> learned 9->33 RGB decoder
 ```
 
-这一点需要和当前 DreamZero 的 Wan VAE 保持一致的接口理解：DreamZero 现有 VAE 是冻结的视频级 tokenizer，输入完整 video clip，输出压缩后的 latent video，再由 DiT 在 latent space 中加噪和去噪。因此，如果 VGGT 替换 2D video tokenizer，也需要承担同样的视频压缩职责，而不是只提供 per-frame image feature。
+它与 Wan VAE 对齐的是每个 view 的输入输出 channel、spatial stride 16 和
+`4k+1 <-> k+1` 时间 lattice。两者的 latent 统计分布未必相同，因此 WAM 集成时要
+统计 scale/mean/std；这不代表 `z_2d` 还需要额外时空压缩。
 
-目标接口可以写成：
+`decode_2d()` 已支持多视图 6D latent：
 
 ```text
-video:        [B, V, T, 3, H, W]
-z_2d_video:  [B, V or fused, T', C, H', W']
+[B,V,48,9,10,20]
+ -> [B,33,V,3,160,320]
 ```
 
-其中 `T'`、`H'`、`W'` 需要显式控制，使其满足 WAM 的 token budget。当前 DreamZero/Wan VAE 的参考设计是：
+所以目标 pipeline 是让 WAM 同时生成所有 view 的 future `z_2d`，再由同一个
+VGGT 2D decoder 同时解码 head/wrist future video。
+
+### 4.4 3D branch
+
+生产 metric grid：
 
 ```text
-Wan2.1: z_dim = 16, spatial stride = 8x
-Wan2.2: z_dim = 48, spatial stride = 16x
-temporal stride: first frame preserved, later frames roughly 4x compressed
+frame: B0
+XYZ range: X[0,3], Y[-2,2], Z[-0.5,2] m
+grid [Z,Y,X]: [4,12,8]
+N=384, C=256
 ```
 
-VGGT 版本不必完全复刻这些数字，但需要提供类似的时空 bottleneck。例如：
+每个 voxel query 投影到 head/wrist，在两级图像 feature 上做 query-conditioned
+deformable sampling；随后用 `3x3x3` local aggregation 交换邻域信息。逐帧融合后，
+每个固定 voxel 沿时间做 causal Transformer 和 33→9 压缩。
+
+3D decoder 恢复 full-time metric grid。PointMap decoder 对每个相机像素构造 B0 ray，
+在 `0.05..5.0 m` 采样 64 个 bins，并用 surface logits 的 softmax 期望得到 B0 XYZ。
+occupancy head 监督表面前 free-space 和表面附近 occupied；表面之后保持 unknown。
+
+### 4.5 当前训练目标
 
 ```text
-T -> T'    video-level temporal compression
-H,W -> H',W'    spatial compression
-C -> C_latent   DiT-compatible latent channels
+L_tokenizer =
+    L_RGB
+  + beta_2d * L_KL
+  + geometry_weight * (
+        L_PointMap
+      + lambda_ray * L_ray_bin
+      + lambda_occ * (L_free + L_surface)
+      + lambda_mv * L_multiview
+    )
+  + lambda_temporal * L_temporal_geometry
 ```
 
-这个 bottleneck 应该优先保证三点：视频重建质量足够、latent token 数可控、latent 统计适合 diffusion / flow matching。由于 mobile manipulation 对局部接触、小物体和末端执行器细节更敏感，第一版可以从较温和的压缩比开始，再根据 WAM 显存和动作预测效果调整。
-
-`z_2d_video` 采用类似 VAE 的分布形式：
+生产配置的 geometry weight 在 1000-step warmup 后为：
 
 ```text
-mu_2d, logvar_2d = latent_head(h_vggt)
-z_2d_video = mu_2d + sigma_2d * eps
+pointmap_weight 0.1 * quality_weight 0.25 = 0.025
 ```
 
-对应训练目标为：
+当前 temporal geometry 和 masked-view reconstruction 均未启用。pseudo range 来自
+有损 H.264，K/外参仍属 nominal calibration，因此当前 3D 表示只能定位为 coarse
+geometry，不能用于毫米级重建或强 collision/contact labels。
+
+---
+
+## 5. Stage 2：接入 WAM
+
+### 5.1 Base、Manipulator 与 Base Prior 的关系
+
+当前仓库已实现 dual-plan flow stream：
 
 ```text
-L_2d =
-    L_video_recon
-  + beta_2d KL(q(z_2d_video | video) || N(0, I))
-  + optional L_temporal_consistency
+6 noisy Base plan tokens
++ 6 noisy Manipulator plan tokens
+ -> independent projections and type embeddings
+ -> shared causal Wan DiT
+ -> independent output projections
 ```
 
-2D latent的整体设计目标不是模仿 VAE latent，而是让 VGGT 的 video latent 本身成为一个稳定、可解码、适合 diffusion / flow matching 的连续分布
+默认 plan offsets 为 `[1,4,8,12,16,24]` frames。Base token 表示
+`[x,y,sin(yaw),cos(yaw)]`；Manipulator token 联合表示 EEF pose 和 hand
+configuration。
 
-如果后续发现 `z_2d_video` 与 WAM 训练不兼容，可以切回原 DreamZero 的 VAE 作为 2D encoder；此时 3D spatial tokens 仍然由 VGGT 分支提供
+目标 WAM 还应恢复一组独立的 Base Prior tokens：
 
 ```text
-主方案:   VGGT -> z_2d_video, VGGT -> z_3d_video
-备选方案: VAE  -> z_2d_vae,  VGGT -> z_3d
+clean Base Prior query tokens
+ -> read language + state + multi-view z_2d + z_3d
+ -> coarse Base waypoint head
+ -> low-frequency mobility prior
+ -> condition noisy Base/Manipulator plan refinement
 ```
 
-### 4.3 3D Tokens 的参数化
+三类 token 的职责不同：
 
-3D tokens 设计为定义在 metric grid 上的learnable query：
+| Token | 是否加 flow noise | 作用 |
+|---|---:|---|
+| Base Prior | 否 | 预测 coarse 底座轨迹，提供低频移动意图 |
+| Base plan | 是 | 生成 refined Base waypoints |
+| Manipulator plan | 是 | 生成 EEF pose 与 hand configuration |
+
+Base Prior 不是第二个独立模型，而是同一个 WAM/DiT 中的 clean horizon-aware queries：
 
 ```text
-token_i <-> P_i = (x_i, y_i, z_i)
+base_prior_i = learnable_query_i + horizon_embedding_i
 ```
 
-3D tokens的实现可以考虑 BEV 或 sparse voxel，避免 dense voxel 带来的高计算成本。
-
-每个 token 使用空间位置初始化：
+它通过 shared attention 读取 language、state、video 和 3D scene。中间或最终 hidden
+state 经轻量 MLP 输出 B_anchor 中的 coarse Base waypoints：
 
 ```text
-F_i = MLP(pos_embed(P_i)) + learnable_feature_i
+coarse_base_prior = MLP(base_prior_hidden)
+L_base_prior = SmoothL1(coarse_base_prior, GT_base_waypoints)
 ```
 
-这样每个 token index 都对应一个真实空间 cell，这是 3D tokens 几何可解释性的基础
+最终 noisy Base/Manipulator tokens 在同一次 DiT forward 中读取 Base Prior hidden
+states并完成联合 refinement。因此该结构是端到端的“内部 coarse-to-refined
+planning”，不是先运行一个 coarse planner、再运行另一个 policy。
 
-与 2D latent 不同，3D tokens 的首要目标是保持空间语义。因此第一版不强制把 3D latent 做成 VAE-style stochastic distribution，而是优先采用：
+当前远程代码中尚未发现独立 Base Prior embedding、coarse head 或
+`L_base_prior`；它是 proposal 中应保留并接入现有 dual-plan WAM 的模块。
+
+### 5.2 推荐的两步 3D 集成
+
+#### Step A：加入 clean 3D history context
+
+先冻结 tokenizer，让 WAM 同时处理：
 
 ```text
-deterministic metric 3D tokens + LayerNorm / RMSNorm
+clean history multi-view z_2d
++ noisy future multi-view z_2d
++ clean history z_3d
++ clean Base Prior
++ noisy Base/Manipulator plans
+ -> WAM
 ```
 
-这样可以稳定 token 统计分布，同时避免过强 KL 约束损伤几何信息。如果第二阶段发现 3D token denoising 不稳定，再考虑引入 small-beta stochastic 3D latent：
+这一阶段同时预测 multi-view future video、coarse Base prior 和 refined dual plans，
+但暂不生成 future `z_3d`。它用于验证 metric 3D context 是否改善 Base Prior、
+action refinement 和 future video。
+
+#### Step B：加入 future 3D denoising
+
+只有 Step A 有稳定增益后，再增加：
+
+- 3D noise/input projection；
+- 3D token type/time embedding；
+- 3D output projection；
+- `L_3d_flow`；
+- 可选的 decoded future PointMap auxiliary loss。
+
+同一 future chunk 的多视角 2D、3D、Base plan 和 Manipulator plan tokens 应共享 flow
+timestep 与 causal block index。Base Prior 保持 clean，不作为 flow generation
+variable。
+
+### 5.3 不能直接忽略的 3D token budget
+
+raw `z_3d` 有：
 
 ```text
-mu_3d, logvar_3d = latent_head(h_3d)
-z_3d = mu_3d + sigma_3d * eps
+9 * 384 = 3456 tokens/sample
 ```
 
-### 4.4 多视角 2D-to-3D 聚合
+直接拼入 DiT self-attention 会显著增加二次注意力成本。Stage 2 必须选择：
 
-对于每个时间步 `t` 和每个 3D query point `P_i`，利用相机内参和外参投影到每个相机视角：
+- learned spatial resampler；
+- 3D cross-attention context；
+- 面向 WAM 的更粗 3D grid；
+- 局部/稀疏 3D attention。
+
+MVP 推荐 resampler 或 cross-attention，并使用 matched-compute baseline。若 future
+generation 需要从压缩 tokens 恢复 384-token geometry，还需对应 expansion decoder，
+不能只做单向 pooling。
+
+### 5.4 多视角 2D latent 接口
+
+VGGT 输出：
 
 ```text
-p_{t,i,v} = project(P_i, K_{t,v}, T_{t,v})
+z_2d_video [B,V,48,9,10,20]
 ```
 
-然后在投影位置附近采样 VGGT image features：
+其中每个 view 的 `[B,48,9,10,20]` 已与 Wan video latent 的 channel/time/space
+合同一致。正确的 WAM pipeline 不再选择 primary view，也不再做一次 33→9 或
+160×320→10×20 压缩，而是：
 
 ```text
-f_{t,i,v} = sample(h_{t,v}, p_{t,i,v})
+[B,V,48,9,10,20]
+ -> 对每个 view 使用 WAM 现有 video patch embedding
+ -> 加 view embedding / camera identity
+ -> 在 video token sequence 中保留 view 维
+ -> WAM 联合预测所有 view 的 future latent tokens
+ -> reshape 回 [B,V,48,9,10,20]
+ -> VGGT decode_2d()
+ -> [B,33,V,3,160,320]
 ```
 
-来自所有可见视角的特征再融合到共享 3D token 中：
+实现上可以先 reshape 为 `[B*V,48,9,10,20]` 复用同一套 video patch embedding，
+再恢复 B/V 并把各 view tokens 拼入同一个 WAM sequence。不能始终把 view 当作独立
+batch，否则 head/wrist 无法在 WAM 内交互；也不应简单把 V 拼入 channel，因为会破坏
+48-channel video projector 和 VGGT decoder 合同。
+
+因此“VGGT 2D latent 只在 shape 上兼容 Wan”的准确含义是：
+
+- 它已经完成时空压缩，可以直接作为 WAM video latent；
+- 每个 view 的 tensor shape 与 Wan stream 对齐；
+- 需要扩展 WAM 的 view-aware token layout；
+- 需要根据统计量做 normalization/scale adaptation；
+- 不需要再增加一个 video tokenizer。
+
+所有 view 同时预测是目标设计，而不是后续可选增强。相应 token/显存成本需要通过
+video patch 后的真实 sequence length 评估，但不应通过丢弃 wrist view 来规避。
+
+### 5.5 latent normalization 与冻结
+
+VGGT `z_2d` 的 tensor contract 与 Wan 对齐，但 latent 分布由新的 VAE 学得；
+`z_3d` 则是 deterministic 新分布。接入前应统计 train/val 的：
+
+- per-channel mean/std；
+- norm 与 outlier；
+- time/view/voxel 位置间方差；
+- train/val drift。
+
+WAM adapter 可以使用固定 normalization 或 learned affine projection。推荐训练顺序：
+
+1. 冻结完整 VGGT tokenizer；
+2. 训练 multi-view video adapter、Base Prior、3D adapter 和现有 WAM modules；
+3. 证明 WAM 使用多视角/3D 后，再考虑解冻 aggregator LoRA；
+4. DINO 始终冻结。
+
+---
+
+## 6. Stage 2 目标函数
+
+Step A：
 
 ```text
-z_{3d,t,i} = deformable_attention(query=F_i, key/value={f_{t,i,v}})
+L_WAM_A =
+    L_multiview_video_flow
+  + lambda_prior * L_base_prior
+  + lambda_base * L_base_flow
+  + lambda_manip * L_manipulator_flow
 ```
 
-这个设计使每个 3D token 只能从几何对应的图像区域聚合证据，多视角观测可以被融合到同一组 3D spatial tokens 中。
+其中 `L_base_prior` 直接监督 clean Base Prior 的 coarse waypoints；
+`L_base_flow/L_manipulator_flow` 监督最终 refined plans。三者不是重复目标：
 
-随后对每个 spatial token index 沿时间做 temporal transformer：
+- prior 学“底座大致应该去哪里”；
+- Base flow 学 refined Base trajectory；
+- Manipulator flow 在同一 mobility context 下学习 EEF/hand trajectory。
+
+Step B 增加：
 
 ```text
-{z_{3d,1,i}, ..., z_{3d,T,i}} -> TemporalTransformer_3D -> z_{3d,video,i}
+L_WAM_B =
+    L_WAM_A
+  + lambda_3d * L_3d_flow
+  + optional lambda_render * L_future_PointMap
 ```
 
-这样 temporal aggregation 发生在 geometry space 中，建模的是同一个 metric 3D cell 在时间上的变化，而不是不同帧 image patch 之间的表观变化。
+future PointMap loss 通过冻结的 3D decoder 计算，应低权重、warmup，并使用高置信
+mask。Base Prior 还可以通过预测的 base/camera motion 与 future 3D/PointMap 建立
+projection consistency，但该项应在基本 coarse prior 与 3D flow 稳定后再加入。
 
-### 4.5 Robot-Centric PointMap Decoder
+IK、collision 和复杂 feasibility loss 属于后续 action-policy 研究，不应与 MVP
+同时引入，否则难以判断增益来源。
 
-3D decoder 的主输出建议从 depth map 改为 robot-centric PointMap。Depth 对每个像素只预测到相机的距离标量，坐标定义在当前相机视角下；当训练数据来自不同相机视角时，同一个物理点的 depth 数值会随视角变化，策略或 WAM 还需要额外学习 camera-centric depth 到机器人动作坐标系的映射。
+---
 
-Robot-centric PointMap 对每个像素输出机器人基坐标系下的 3D 坐标：
+## 7. 推理
+
+### Step A
 
 ```text
-M_B(u, v) = [x_B(u, v), y_B(u, v), z_B(u, v)]
+head/wrist observation
+ -> frozen VGGT tokenizer
+ -> multi-view z_2d + history z_3d
+ -> clean Base Prior queries
+ -> WAM joint flow sampling
+ -> future head/wrist z_2d
+ -> coarse Base prior
+ -> refined Base plan + Manipulator plan
+ -> VGGT decode_2d() -> future head/wrist video
 ```
 
-同一个物理点即使出现在不同相机的不同像素位置，只要外参和时间对齐正确，它在机器人基坐标系下的坐标应保持一致。这更符合 mobile manipulation 的动作预测需求：base plan、EEF pose、future waypoint 都已经以机器人/底盘坐标系表达，3D decoder 也应优先输出同一坐标系下的几何目标。
-
-为了从 dynamic 3D tokens 解码某个时间步、某个目标视角的 PointMap，对每个像素构造对应的 camera ray：
+### Step B
 
 ```text
-P(d) = O + d * r(u, v)
+head/wrist observation
+ -> frozen VGGT tokenizer
+ -> clean history multi-view z_2d/z_3d
+ -> Base Prior guided joint 2D/3D/action sampling
+ -> future head/wrist video
+ -> coarse/refined plans
+ -> optional future PointMap
 ```
 
-沿 ray 采样多个候选深度点，并从 3D token grid 中读取特征：
+控制采用 receding horizon：每次新观测后重新建立 `B_anchor`、编码和规划，不依赖
+长期 open-loop 3D map。
+
+---
+
+## 8. 评估
+
+### 8.1 Stage 1
+
+报告：
+
+- head/wrist RGB reconstruction；
+- PointMap coordinate/Euclidean error；
+- inside-grid、ray-valid、surface/free、multiview coverage；
+- 2D/3D latent statistics；
+- 与 2D-only tokenizer 的重建和成本对比。
+
+Stage 1 成功要求：
+
+- 3D branch 不显著损伤多视角 2D reconstruction；
+- 3D 输出优于无相机几何的简单基线；
+- loss 下降不是由有效监督 coverage 变空造成。
+
+### 8.2 Stage 2
+
+核心 ablation：
 
 ```text
-P_j = O + d_j * r
-g_j = trilinear_sample(3D_tokens, P_j)
-logit_j = MLP(g_j, pos_embed(P_j), ray_dir)
+A. 原 Wan VAE + dual-plan WAM
+B. VGGT multi-view z_2d + dual-plan WAM
+C. B + Base Prior
+D. C + history z_3d context
+E. D + future z_3d denoising（可选）
 ```
 
-这些 logits 表示该 ray 上不同候选点成为可见表面的概率：
+同时报告：
 
-```text
-p_j = softmax(logit_j)
-P_B_pred(u, v) = sum_j p_j * P_{B,j}
-```
+- head/wrist future video quality 与 cross-view consistency；
+- Base Prior coarse waypoint error；
+- refined Base/Manipulator plan metrics；
+- task/rollout success；
+- future geometry（仅 E）；
+- 显存、吞吐和推理延迟。
 
-其中 `P_{B,j}` 是候选点在机器人基坐标系 `B(t)` 下的坐标。这个 decoder 仍然可以看作轻量可微渲染器。同一组 dynamic 3D tokens 表示一段时间内的场景几何，不同时间步和相机视角只需要改变 rays 和相机外参，就可以渲染对应视角下的 robot-centric PointMap video。
+还应使用：
 
-基础监督改为多视角 robot-centric PointMap prediction：
+- no-Base-Prior ablation；
+- shuffled/masked 3D context；
+- matched-capacity 非几何 context；
+- single-view 与 multi-view 对照；
 
-```text
-L_pointmap = valid_mask * Huber(P_B_pred, P_B_pseudo)
-           + lambda_ray * valid_mask * CE(ray_surface_logits, pseudo_surface_bin)
-```
+验证收益来自 Base mobility prior 和几何表示，而不是单纯新增参数或 token。
 
-第一版的 `P_B_pseudo` 可以由官方发布数据中的 `depth_image_*.mp4`、相机内参和相机到机器人基坐标系外参生成。官方生成代码使用相机 `distance_to_camera`，将 0--5 m 截断范围线性映射到 0--255 后写入视频，因此它更接近沿单位 camera ray 的 range，而不是 optical-axis z-depth：
+---
 
-```text
-D_pseudo(u, v) = 5.0 * Y(u, v) / 255
-P_C_pseudo(u, v) = O_C + D_pseudo * normalize(r_C(u, v))
-P_B_pseudo(u, v) = T_B_C @ P_C_pseudo(u, v)
-```
+## 9. 主要风险
 
-其中 `Y` 使用解码后的 luma/灰度值或三通道中位数，不能任取一个可能受颜色空间转换影响的通道。公式还要求解码器已正确还原原始 full-range 0--255；若容器/解码器采用 limited-range YUV，必须先按视频 color-range 元数据恢复或用已知灰度标定，不能直接代入。0--5 m 的 8-bit 量化步长约为 `5/255 = 1.96 cm`，还叠加 H.264 块效应、边缘振铃和颜色范围转换误差。
+- **Pseudo geometry**：H.264 range 与 nominal calibration 会引入系统性误差；
+- **B0 coverage**：前向 `X[0,3]` grid 可能无法覆盖转向、后退或长 rollout；
+- **Distribution mismatch**：VGGT 2D/3D latent 需要统计和归一化；
+- **Multi-view token cost**：同时预测 head/wrist 会增加 video sequence length；
+- **3D token cost**：raw 384-token grid 可能使注意力成本不可接受；
+- **Base Prior collapse**：prior 可能退化成普通 query，或被 refined Base tokens 忽略；
+- **Representation ignored**：WAM 可能完全忽略 3D context。
 
-因此 MP4 depth 只作为构造 `lossy_h264_pseudo_robot_centric_pointmap` 的中间量使用，并生成置信 mask：
+所有实验应同时报告 coverage、token 数、吞吐和 matched-compute baseline。
 
-- 接近 0 或 255 的像素设为 invalid/low-confidence；255 可能表示超过 5 m、无穷远或截断值，不能解释为精确 5 m 表面。
-- 深度强边缘、遮挡边界、图像边界和明显 codec block/ringing 区域降低权重。
-- K、动态外参或 camera-frame convention 未通过验证的样本，不参与依赖投影的几何损失。
-- depth-bin 宽度和 voxel 分辨率不能细于数据有效精度；第一版可从不小于约 4--5 cm 的粗粒度开始，再依据实测 MP4-vs-lossless 误差调整。
-- 不从有损深度生成硬接触、精细碰撞或毫米级表面标签。
+---
 
-PointMap target 还需要额外检查 robot-frame convention：`x/y/z` 轴方向、base link 与规划锚点 `B(t)` 的定义、外参时间戳同步和相机安装误差。若这些信息不可靠，PointMap loss 会把系统性标定误差直接注入 3D tokens，因此必须比普通 depth auxiliary loss 更严格地做 calibration QA。
+## 10. 实施顺序
 
-如果第一版需要 occupancy，只生成带不确定带的 soft/free/unknown target：ray 上表面之前可作为 free-space 弱监督，预测表面附近保留 uncertainty band，表面之后保持 unknown。不能把 H.264 深度边界直接体素化为强 occupied ground truth。
+1. 完成 Stage 1 训练，验证 head/wrist RGB、PointMap、coverage 和 latent statistics。
+2. 固化 tokenizer checkpoint 与 multi-view `encode()/decode_2d()/decode_3d()` 接口。
+3. 将全部 view 的 `z_2d` 接入 WAM video stream，验证 multi-view latent round-trip。
+4. 在现有 dual-plan WAM 中加入 clean Base Prior queries、coarse head 和
+   `L_base_prior`。
+5. 实现 Step A：加入只读 history `z_3d` context。
+6. 对比 single-view、multi-view、Base Prior 和 metric-3D ablations。
+7. 只有 Step A 有稳定增益时，实施 Step B 的 future 3D flow。
+8. 最后再考虑联合微调 LoRA、扩大 grid、精细 occupancy 或 feasibility loss。
 
-为了避免模型退化成两个独立 autoencoder，即 image tokens 只负责重建 RGB、3D tokens 只负责预测 PointMap，需要加入跨视角和跨模态约束：
+开始 Stage 2 编码前，需要明确：
 
-- `L_cross_view_pointmap`：将一个视角预测的 robot-centric PointMap 投影到另一个视角，与目标 PointMap 或高置信 pseudo PointMap 对齐；第一版只在有效视野重叠和高置信区域计算。
-- `L_masked_view`：随机去掉一个或多个输入视角，要求共享 3D tokens 仍能重建被遮掉视角的 PointMap 或 feature。
-- `L_3d_to_2d_feature`：用 `3D tokens + target camera pose` 渲染目标视角的 VGGT / DINO / VAE feature，并与对应 2D feature 对齐。
-- `L_occupancy`：第一版只使用从 MP4 构造的 soft/free/unknown 弱监督；获得无损距离后再升级为更精细的 occupied / free / unknown 监督。
-
-### 4.6 整体训练目标
-
-```text
-L_vggt =
-    L_video_recon
-  + beta_2d KL_2d
-  + lambda_1 L_pseudo_robot_centric_pointmap
-  + lambda_2 L_high_conf_cross_view_pointmap
-  + lambda_3 L_masked_view
-  + lambda_4 L_temporal_geometry_consistency
-  + optional lambda_5 L_soft_occupancy
-```
-
-第一版采用“2D 主导、3D 辅助”的优化优先级：
-
-1. 先确保 `z_2d_video` 的重建质量、时空压缩率和 latent 统计满足 WAM；2D-only tokenizer 是必须保留的对照基线。
-2. 再逐步增加 pseudo PointMap、masked-view 和 temporal geometry loss，使 3D tokens 学到粗粒度空间结构。
-3. `lambda_1/lambda_2/lambda_5` 从较小值 warm up，并监控 2D reconstruction 和下游 action 指标；如果加入 3D 监督后 2D 分支持续退化，应降低几何权重，而不是为了降低 noisy PointMap loss 牺牲主任务。
-4. 共享 VGGT backbone 时可使用 gradient norm balancing、3D adapter 或在早期对部分 shared features stop-gradient，防止有损 pseudo PointMap 的噪声梯度污染 2D video latent。
-5. MP4 生成的 pseudo PointMap 和未来 lossless / calibrated PointMap 必须使用不同的 quality tag、valid mask 和 loss weight，不能在训练中无区别混合。
-
-第一版不要求 3D tokens 达到精细表面重建精度，但不能只满足“tensor shape 正确”。其最低成功标准为：
-
-- 2D video reconstruction/denoising 不显著弱于 2D-only baseline；
-- 3D tokens 能在 held-out frame/view 上解码出优于简单常数或单目无几何基线的 coarse robot-centric PointMap；
-- 相机运动后，同一静态区域的 PointMap 在锚点坐标系中保持基本一致；
-- 在 WAM 中加入 3D tokens 后，action/video prediction 或视角变化场景的指标相较 2D-only WAM 有可测增益；
-- 通过 ablation 验证 WAM 确实使用 3D tokens，而不是完全忽略该分支。
-
-只有在获得无损 distance/segmentation 子集并完成标定 QA 后，才评估高精度 metric depth、硬 occupancy、collision/contact 等更强几何主张。
-
-## 5. 第二阶段 WAM 训练
-
-第二阶段将 DreamZero 的 causal chunk 序列扩展到 3D spatial tokens
-
-denoising targets 包括：
-
-```text
-2D video chunk tokens
-3D spatial / geometry chunk tokens
-base action chunk tokens
-manipulator action chunk tokens
-```
-
-### 5.1 解耦的 Base / Manipulator Action Tokens
-
-action plan 只有两个逻辑分支：
-
-```text
-base_plan[h]
-  = [x, y, sin(yaw), cos(yaw)]
-
-manipulator_plan[h]
-  = [eef_x, eef_y, eef_z, eef_rotation_6d,
-     hand_configuration...]
-```
-
-其中 `h` 对应一组固定的未来 waypoint offsets。两个分支都以当前规划锚点的底盘坐标系 `B(t)` 表达：
-
-```text
-T_B(t)_B(t+kh)   = inverse(T_W_B(t)) @ T_W_B(t+kh)
-T_B(t)_EEF(t+kh) = inverse(T_W_B(t)) @ T_W_EEF(t+kh)
-```
-
-base branch 输出未来底盘 pose2d waypoint；manipulator branch 在同一个 token 中联合输出未来 EEF pose 和末端执行器构型。G1 的 manipulator plan 为 `9 + 1 = 10` 维，XHand 为 `9 + 12 = 21` 维。
-
-两类 action 使用各自独立的 tokens，而不是先拼成一个 action token：
-
-```text
-base values
-  -> base input projection
-  -> base action tokens + base type embedding
-
-manipulator values
-  -> manipulator input projection
-  -> manipulator action tokens + manipulator type embedding
-
-base/manipulator tokens
-  -> shared causal DiT backbone
-  -> separate base/manipulator output projections
-```
-
-这种解耦保留了底盘导航与机械臂操作不同的维度、动态范围和控制语义，同时 shared backbone 中的 attention 仍允许两路计划互相约束。两路使用相同的 waypoint offsets 和 horizon valid mask；如果 flow matching 的噪声尺度差异明显，可以分别设置输入 normalization 或 noise preconditioning，但不应破坏其时间索引对应关系。
-
-### 5.2 Manipulator Plan 的内部 Slice 与标签语义
-
-manipulator 虽然只有一路 tokens 和一个输出 projection，但输出向量内部拆成三个语义 slice：
-
-```text
-manipulator_plan[h]
-├── eef_position[h]       # 3, m
-├── eef_rotation_6d[h]    # 6
-└── hand_configuration[h] # D, joint position
-```
-
-主 action plan 使用统一的 future realized trajectory 标签：
-
-- base waypoint 来自 future `robot_base` pose；
-- EEF pose 来自 future `robot_hand` pose；
-- hand configuration 来自同一未来时刻的实际夹爪/手指 joint position。
-
-原始 EEF delta、原始 hand command 和 IK/controller joint target 只作为 baseline、auxiliary control supervision 或 tracking-error 分析，不与主 plan 的 realized trajectory 标签混用。
-
-“Manipulator 合成一路”不等于对所有维度使用同一统计量和未加权 MSE。三个 slice 分别归一化和计算损失：
-
-```text
-L_manipulator =
-    lambda_eef_pos L_eef_position
-  + lambda_eef_rot L_eef_rotation
-  + lambda_hand    L_hand_configuration
-```
-
-- EEF position 使用 workspace-aware normalization，可使用 L1/Huber。
-- rotation-6D 解码后重新正交化，几何监督使用 SO(3) geodesic loss；不能只依赖原始 6D 欧氏误差。
-- hand configuration 按每个 joint limit 归一化；G1/XHand 使用 embodiment-specific dimension mask。
-- 所有 slice 都乘 horizon valid mask，episode 尾部越界 waypoint 不通过重复末帧制造伪监督。
-
-flow-matching/denoising loss 可以在各自 action token space 中计算；上述 slice loss 则作用在模型还原出的 clean action plan 上，为物理量提供直接监督。
-
-### 5.3 两路计划的一致性约束
-
-base 和 manipulator 使用独立 tokens 后，单独降低两路重建误差仍不能保证组合计划可执行。对于第 `h` 个未来点，模型预测：
-
-```text
-hat_T_Bt_Bk = predicted base waypoint
-hat_T_Bt_Ek = predicted EEF pose
-```
-
-将两者组合得到 EEF 相对未来底盘的预测：
-
-```text
-hat_T_Bk_Ek = inverse(hat_T_Bt_Bk) @ hat_T_Bt_Ek
-```
-
-数据真值为：
-
-```text
-T_Bk_Ek = inverse(T_W_B(t+kh)) @ T_W_EEF(t+kh)
-```
-
-加入相对 EEF 一致性损失：
-
-```text
-L_base_eef_consistency =
-    L_position(hat_T_Bk_Ek, T_Bk_Ek)
-  + lambda_rel_rot L_SO3(hat_T_Bk_Ek, T_Bk_Ek)
-```
-
-该损失直接约束“预测底盘走到该 waypoint 后，机械臂需要达到的相对 EEF 位姿”，使两个独立 action token streams 在物理上描述同一个整机计划。
-
-进一步加入可达性约束：
-
-```text
-L_plan_feasibility =
-    lambda_reach L_reachability(hat_T_Bk_Ek)
-  + lambda_limit L_joint_limit
-  + optional lambda_collision L_collision
-```
-
-- `L_reachability` 可由可微 IK、预计算 workspace SDF 或 learned reachability critic 实现。
-- `L_joint_limit` 约束 IK 解或预测 hand configuration 不越关节上下限。
-- `L_collision` 需要可信 robot geometry、未来 3D occupancy 和有效 mask；第一版可延后，不能用有损 depth 生成的伪碰撞标签作为强监督。
-- 如果 IK/碰撞检查不可微，可在训练时作为 reranking/critic 目标，或只在推理时过滤；不能为了形式完整强行反传不可靠梯度。
-
-一致性损失必须使用与 action plan 相同的 waypoint offsets、坐标 convention 和 horizon valid mask。base/EEF 的直接监督负责拟合示范轨迹，相对位姿与可达性损失负责限制两路独立预测的组合结果。
-
-训练目标可以写为：
-
-```text
-L_wam =
-    L_2d_denoise
-  + L_3d_denoise
-  + lambda_base_flow L_base_action_denoise
-  + lambda_manip_flow L_manipulator_action_denoise
-  + lambda_eef_pos L_eef_position
-  + lambda_eef_rot L_eef_rotation
-  + lambda_hand L_hand_configuration
-  + lambda_plan_consistency L_base_eef_consistency
-  + optional lambda_plan_feasibility L_plan_feasibility
-  + lambda_geo L_future_geometry
-  + lambda_proj L_video_3d_consistency
-```
-
-其中，`L_base_action_denoise` 和 `L_manipulator_action_denoise` 分别训练两路独立 action tokens；`L_3d_denoise` 用于预测未来 3D token trajectory；`L_future_geometry` 默认将预测的 future 3D tokens 解码为 robot-centric PointMap 进行监督，depth、occupancy 或 point flow 可以作为辅助几何目标；`L_video_3d_consistency` 约束预测的 future video 和 future 3D geometry 描述同一个物理未来。
-
-这个设计保持了 WAM 的主干形式：video、两路 action tokens 和 3D geometry 在同一个 causal DiT backbone 中联合生成，同时通过独立投影与组合一致性损失保留 base/manipulator 的结构差异。
-
-## 6. 推理流程
-
-推理时流程如下：
-
-```text
-current / history multi-view video observations
- -> VGGT-3D encoder
- -> clean 2D history tokens + clean 3D history tokens
- -> causal WAM denoising
- -> next base action chunk + next manipulator action chunk
-```
-
-如果需要 world rollout，模型也可以同时输出 future 2D tokens 和 future 3D tokens。future 3D tokens 可以进一步解码成 robot-centric PointMap 或其他几何预测，用于 action reranking、collision checking 或 MPC-style closed-loop control。
-
-## 7. 预期收益
-
-- 通过绑定 metric grid 的 geometry-aware 3D tokens 提升对视角变化和 ego-motion 的建模能力；第一版监督精度按 coarse pseudo robot-centric PointMap 定位。
-- 相比简单加入 current depth auxiliary loss，PointMap 让 3D tokens 直接对齐机器人动作坐标系，空间语义和生成目标更明确。
-- 共享 VGGT backbone 使 2D video latent 和 3D spatial tokens 来自同一组 3D-aware features，降低 2D/3D 分支学成互不相关表示的风险。
-- 将 DreamZero 从 `video + action` 自然扩展为 `video + action + 3D geometry`。
-- 中间表示更可解释：每个 3D token 对应一个空间 cell，并且可以被渲染回相机视角。
-- 2D latent 优先使用 VGGT-native 分布表示，保留 VGGT 的 3D-aware 表征；必要时仍可回退到原 VAE latent。
-- 为 future robot-centric PointMap、occupancy、point flow 和 projection consistency 等几何监督提供统一接口。
-
-## 8. 待确认问题
-
-- 3D tokens 应该定义在 base frame、world frame，还是 reference camera frame？
-- 第一版实现应选择 BEV、BEV-height、sparse voxel，还是 dense voxel？
-- VGGT 在第一阶段和第二阶段中分别应该 freeze、partial fine-tune 还是 full fine-tune？
-- `z_2d_video` 的 KL 权重、latent 维度和时序压缩比应该如何设置，才能兼顾视频重建质量和 WAM denoising 稳定性？
-- 3D latent 是否需要从 deterministic tokens 升级为 small-beta stochastic tokens？
-- PointMap 应该表达在当前底盘坐标系 `B(t)`、episode 初始 base frame，还是某个 world/reference frame？
-- MP4 pseudo-range depth 生成 PointMap 时，valid-mask、有效分辨率、外参 QA 和 geometry loss 权重应如何设置，才能提供空间监督但不损伤 2D 主分支？
-- causal attention mask 应如何扩展，才能让 2D、3D、action、state tokens 充分交互，同时避免未来信息泄漏？
+1. multi-view video tokens 在 causal block 中的排列和 attention mask；
+2. Base Prior token 数量及其与 6 个 plan horizons 的对应方式；
+3. 3D 使用 resampler 还是 cross-attention；
+4. 可接受的显存、吞吐和推理延迟预算。

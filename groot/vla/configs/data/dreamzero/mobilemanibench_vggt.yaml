@@ -1,0 +1,56 @@
+# @package _global_
+
+train_dataset:
+  _target_: groot.vla.data.dataset.MobileManiBenchVGGTDataset
+  dataset_path: ${mobilemanibench_data_root}
+  video_delta_indices: ${video_delta_indices}
+  image_size:
+    - ${image_height}
+    - ${image_width}
+  pointmap_size:
+    - ${pointmap_height}
+    - ${pointmap_width}
+  video_backend: decord
+  split: train
+  validation_fraction: ${validation_fraction}
+  split_seed: ${seed}
+  sample_stride: ${sample_stride}
+  max_range_m: 5.0
+  invalid_range_margin: 0.04
+  edge_threshold_m: 0.15
+  border_pixels: 1
+  recover_limited_range: false
+  # MobileManiBench camera poses use Isaac's +X-forward, +Y-left, +Z-up
+  # convention. Map OpenCV optical rays (+X right, +Y down, +Z forward)
+  # into that pose frame. Five-task cross-view QA selected this transform
+  # by a wide margin; calibration remains nominal_unverified.
+  camera_optical_transform: &camera_optical_transform
+    - [0.0, 0.0, 1.0, 0.0]
+    - [-1.0, 0.0, 0.0, 0.0]
+    - [0.0, -1.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+
+val_dataset:
+  _target_: groot.vla.data.dataset.MobileManiBenchVGGTDataset
+  dataset_path: ${mobilemanibench_data_root}
+  video_delta_indices: ${video_delta_indices}
+  image_size:
+    - ${image_height}
+    - ${image_width}
+  pointmap_size:
+    - ${pointmap_height}
+    - ${pointmap_width}
+  video_backend: decord
+  split: val
+  validation_fraction: ${validation_fraction}
+  split_seed: ${seed}
+  sample_stride: ${validation_sample_stride}
+  max_range_m: 5.0
+  invalid_range_margin: 0.04
+  edge_threshold_m: 0.15
+  border_pixels: 1
+  recover_limited_range: false
+  camera_optical_transform: *camera_optical_transform
+
+data_collator:
+  _target_: groot.vla.data.dataset.MobileManiBenchVGGTDataCollator
