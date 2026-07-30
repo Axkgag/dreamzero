@@ -1,5 +1,9 @@
 # DreamZero 用于 Mobile Manipulation 的研究记录
 
+> 本文是概念讨论记录，不是实现状态说明。当前代码边界见
+> [MM/README.md](./MM/README.md)，正式实施顺序见
+> [MM/MOBILEMANIBENCH_FINAL_RESEARCH_IMPLEMENTATION_PLAN.md](./MM/MOBILEMANIBENCH_FINAL_RESEARCH_IMPLEMENTATION_PLAN.md)。
+
 本文档用于记录围绕 DreamZero 改进到 mobile manipulation 场景的论文方向讨论。后续讨论结果可以继续追加和修订。
 
 ## 1. 背景判断

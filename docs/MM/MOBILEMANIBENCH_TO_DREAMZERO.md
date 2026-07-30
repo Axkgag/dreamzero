@@ -1,8 +1,8 @@
 # MobileManiBench 到 DreamZero / VGGT-3D-WAM 的数据转换方案
 
-> 状态：转换脚本已实现；G1/XHand 小批量转换、语义回算和 DreamZero 原生 loader smoke test 已通过  
-> 数据源：`/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_opensource`（2026-07-22 远端抽样）  
-> 参考：[DATASET_TO_GEAR_AND_TRAIN.md](./DATASET_TO_GEAR_AND_TRAIN.md)、[vggt_3d_wam_proposal.md](./vggt_3d_wam_proposal.md)、[MobileManiBench 项目页](https://dexhand.github.io/MobileManiBench_Website/)、[官方代码](https://github.com/DexHand/MobileManiBench)、[论文](https://arxiv.org/abs/2602.05233)
+> 状态：转换脚本已实现；G1 full（137,710 episodes）及 G1 five-task 子集已生成；G1/XHand smoke 的语义回算和 DreamZero 原生 loader test 已通过
+> 数据源：`/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_opensource`（2026-07-22 远端抽样）
+> 参考：[当前状态入口](./README.md)、[DATASET_TO_GEAR_AND_TRAIN.md](../DATASET_TO_GEAR_AND_TRAIN.md)、[vggt_3d_wam_proposal.md](../vggt_3d_wam_proposal.md)、[MobileManiBench 项目页](https://dexhand.github.io/MobileManiBench_Website/)、[官方代码](https://github.com/DexHand/MobileManiBench)、[论文](https://arxiv.org/abs/2602.05233)
 
 ## 1. 目标与结论
 

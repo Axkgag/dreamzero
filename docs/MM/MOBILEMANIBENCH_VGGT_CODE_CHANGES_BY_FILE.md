@@ -2,6 +2,10 @@
 
 ## 1. 文档目的与统计范围
 
+> 当前配置校对：2026-07-30
+> 本文前 9 节描述当前实现；第 10 节以后是按时间追加的开发与修复记录，旧数值仅表示
+> 当时状态。当前常量始终以第 3、7 节和实际 YAML 为准。
+
 本文用于逐文件 review MobileManiBench 多视角 VGGT encoder-decoder 实现。实现对应
 `docs/vggt_3d_wam_proposal.md` 第 4 节，代码位于 DreamZero 主仓库，不直接复制
 ReconDrive。ReconDrive `hnr_v2` 仅作为训练流程、alternating attention、LoRA 和
@@ -25,8 +29,9 @@ RGB head/wrist + depth head/wrist + camera pose + base pose
   -> causal 3D temporal codec: 33 -> 9
   -> learned 3D temporal decoder: 9 -> 33
   -> ray depth-bin + occupancy decoder -> 33-frame robot-centric PointMap video
-  -> video reconstruction + KL + PointMap + ray-bin
-     + free-space/surface occupancy + multi-view consistency losses
+  -> Charbonnier + LPIPS + SSIM + spatial/temporal visual losses
+     + KL + PointMap + ray-bin + free-space/surface occupancy
+     + multi-view/temporal/normal/depth-gradient geometry losses
   -> rank-zero train/val reconstruction and PointMap visualization
 ```
 
@@ -55,13 +60,13 @@ decoded_z_3d_video    [B, 33, N_voxel, C3]
 ```text
 video                 [B, 33, V, 3, 160, 320]
 z_2d_video            [B, V, 48, 9, 10, 20]
-z_3d_video            [B, 9, 384, 256]
-decoded 3D grid       [B, 33, 256, 4, 12, 8]
+z_3d_video            [B, 9, 768, 256]
+decoded 3D grid       [B, 33, 256, 8, 12, 8]
 reconstructed_video   [B, 33, V, 3, 160, 320]
-predicted_pointmap    [B, 33, V, 3, 32, 64]
-depth_logits          [B, 33, V, 64, 32, 64]
-occupancy_logits      [B, 33, V, 64, 32, 64]
-ray_sample_valid      [B, 33, V, 64, 32, 64]
+predicted_pointmap    [B, 33, V, 3, 80, 160]
+depth_logits          [B, 33, V, 64, 40, 80]
+occupancy_logits      [B, 33, V, 64, 40, 80]
+ray_sample_valid      [B, 33, V, 64, 40, 80]
 ```
 
 2D 和 3D latent 使用完全相同的时间 lattice：
@@ -75,33 +80,27 @@ latent[8] <- frame[29:33]
 
 ## 4. 文件总览
 
-| 状态 | 文件 | 核心职责 |
-|---|---|---|
-| M | `groot/vla/data/dataset/__init__.py` | 导出 VGGT dataset 和 collator |
-| N | `groot/vla/data/dataset/mobilemanibench_vggt.py` | RGB/depth/camera/PointMap 数据链路 |
-| N | `groot/vla/model/vggt_3d_wam/configuration.py` | 可保存的模型配置 |
-| N | `groot/vla/model/vggt_3d_wam/geometry.py` | 坐标变换、ray、投影和 metric grid |
-| N | `groot/vla/model/vggt_3d_wam/backbone.py` | alternating-attention backbone 与 LoRA |
-| N | `groot/vla/model/vggt_3d_wam/temporal_codec.py` | 2D/3D 共用的 Wan-compatible 因果时间编解码 |
-| N | `groot/vla/model/vggt_3d_wam/video_latent.py` | 2D video VAE bottleneck 与 RGB decoder |
-| N | `groot/vla/model/vggt_3d_wam/metric_tokens.py` | metric queries 与多视角聚合 |
-| N | `groot/vla/model/vggt_3d_wam/pointmap_decoder.py` | ray depth-bin PointMap decoder |
-| N | `groot/vla/model/vggt_3d_wam/model.py` | 共享模型、loss 和 checkpoint 接口 |
-| N | `groot/vla/model/vggt_3d_wam/visualization.py` | RGB/PointMap/3D scatter 训练诊断 |
-| N | `groot/vla/model/vggt_3d_wam/__init__.py` | 延迟导出模型，避免数据进程重载重依赖 |
-| N | `groot/vla/experiment/vggt_3d_wam.py` | Hydra + HF Trainer 训练入口 |
-| N | `groot/vla/configs/vggt_3d_wam.yaml` | 全局训练超参数 |
-| N | `groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml` | 模型结构与 loss 权重 |
-| N | `groot/vla/configs/data/dreamzero/mobilemanibench_vggt.yaml` | train/val dataset 配置 |
-| N | `scripts/data/qa_mobilemanibench_vggt_geometry.py` | 相机投影、B0 coverage 与双时钟 QA |
-| N | `scripts/train/mobilemanibench_vggt_training.sh` | 多卡训练和 preflight |
-| N | `scripts/eval/validate_vggt_3d_wam.py` | checkpoint 指标验证 |
-| N | `scripts/eval/mobilemanibench_vggt_validate.sh` | 验证 shell 入口 |
-| N | `tests/data/test_mobilemanibench_vggt_dataset.py` | 真实 smoke 数据协议测试 |
-| N | `tests/model/test_vggt_geometry.py` | 几何单元测试 |
-| N | `tests/model/test_vggt_3d_wam.py` | forward/backward/save-load 测试 |
-| N | `tests/model/test_vggt_3d_wam_tokenizer_contract.py` | 33↔9 合同与公共接口测试 |
-| N | `tests/model/test_vggt_visualization.py` | 可视化文件和 metadata 测试 |
+| 文件 | 核心职责 |
+|---|---|
+| `groot/vla/data/dataset/mobilemanibench_vggt.py` | RGB/depth/camera/PointMap 数据链路 |
+| `groot/vla/model/vggt_3d_wam/configuration.py` | 可保存的模型配置 |
+| `groot/vla/model/vggt_3d_wam/geometry.py` | 坐标变换、ray、投影和 metric grid |
+| `groot/vla/model/vggt_3d_wam/backbone.py` | alternating-attention backbone 与 LoRA |
+| `groot/vla/model/vggt_3d_wam/temporal_codec.py` | 2D/3D 共用的 Wan-compatible 因果时间编解码 |
+| `groot/vla/model/vggt_3d_wam/video_latent.py` | 2D video VAE bottleneck 与 RGB decoder |
+| `groot/vla/model/vggt_3d_wam/metric_tokens.py` | metric queries 与 deformable 多视角聚合 |
+| `groot/vla/model/vggt_3d_wam/pointmap_decoder.py` | ray rendering 与 learned PointMap refinement |
+| `groot/vla/model/vggt_3d_wam/losses.py` | LPIPS、SSIM 与图像质量损失 |
+| `groot/vla/model/vggt_3d_wam/model.py` | 公共 encode/decode、loss 和 checkpoint |
+| `groot/vla/model/vggt_3d_wam/visualization.py` | RGB/PointMap/3D scatter 诊断 |
+| `groot/vla/experiment/vggt_3d_wam.py` | Hydra、Trainer、JSONL、resume 与 matching init |
+| `groot/vla/configs/vggt_3d_wam.yaml` | 全局训练与可视化默认值 |
+| `groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml` | 模型结构与 loss 权重 |
+| `groot/vla/configs/data/dreamzero/mobilemanibench_vggt.yaml` | train/val dataset |
+| `scripts/data/qa_mobilemanibench_vggt_geometry.py` | 投影、coverage 与双时钟 QA |
+| `scripts/train/mobilemanibench_vggt_training.sh` | 多卡训练、preflight、matching init |
+| `scripts/eval/validate_vggt_3d_wam.py` | checkpoint 指标验证 |
+| `scripts/eval/mobilemanibench_vggt_validate.sh` | 验证 shell 入口 |
 
 ## 5. 数据与几何代码
 
@@ -114,8 +113,10 @@ latent[8] <- frame[29:33]
 ### `groot/vla/data/dataset/mobilemanibench_vggt.py`
 
 `MobileManiBenchVGGTDataset` 复用 `LeRobotSingleDataset` 的视频定位和时间戳读取，
-一次加载 head/wrist 的 RGB 与 depth clip。`_build_split_indices()` 按 episode 划分
-train/val，防止同一轨迹的相邻帧泄漏到两个 split。当前
+一次加载 head/wrist 的 RGB 与 depth clip。`_build_split_indices()` 使用 seed 对
+episode ID 做 90/10 划分，可防止同一 episode 的帧跨 split，但当前不读取
+`meta/plan_splits.json`，因此不能保证同一 source trajectory 下的 sibling episodes
+不跨 split。当前
 `video_delta_indices=[0,...,32]`，只保留 episode 内能够提供完整连续 33 帧的 anchor；
 不再用重复末帧补齐不完整 clip。
 
@@ -164,13 +165,13 @@ embed。tuple 参数统一转为 list，保证 Hugging Face JSON 序列化稳定
 本次新增/调整的关键字段为：
 
 ```text
-global_temporal_window = 1
+global_temporal_window = 4
 freeze_dino = true
 dino_image_chunk_size = 4
 backbone_gradient_checkpointing = true
 latent_spatial_stride = 16
 latent_temporal_stride = 4
-video_decoder_dim = 128
+video_decoder_dim = 256
 ```
 
 ### `groot/vla/model/vggt_3d_wam/backbone.py`
@@ -178,9 +179,14 @@ video_decoder_dim = 128
 `VGGTBackbone` 默认使用 `timm` 的 `vit_large_patch14_reg4_dinov2` 读取 checkpoint
 中的 DINOv2-L/14 前端，并恢复 VGGT camera/register special tokens。patch features
 加入动态 2D patch、time 和 view sinusoidal 位置编码后，交替执行每帧 patch attention
-和窗口化 global attention。生产配置使用 `global_temporal_window=1`，global block
-只在同一时刻融合多视角 token，避免完整 33 帧全部进入二次复杂度全局注意力；完整
-时间建模交给后续 2D/3D temporal codec。tiny 单测可切换为轻量 conv patch 前端。
+和窗口化 global attention。生产配置使用 `global_temporal_window=4`，让 aggregator
+在局部四帧窗口内融合跨视角/时间信息，避免完整 33 帧进入二次复杂度全局 attention；
+完整 clip 时间建模继续由后续 2D/3D temporal branch 完成。tiny 单测可切换为轻量
+conv patch 前端。
+
+实现中的 global windows 是 `[0:4],[4:8]...`，而 `WanTemporalEncoder` 是首帧独立、
+随后 `[1:5],[5:9]...`。所以二者宽度/stride 相同，但边界并非严格对齐；脚本中的
+“Wan-aligned source-frame chunks”应理解为宽度对齐，而不是 exact boundary contract。
 
 WAM 的 `160×320` 输入不能被 DINO patch size 14 整除。backbone 只在内部对右侧和
 下侧补零到 `168×322`，得到 `12×23` patch grid；外部输入、2D latent 和 RGB
@@ -272,15 +278,15 @@ residual query，不产生 NaN。
 输出协议保持 `[B,T,N,C]`。
 
 metric grid 固定在 clip 第1帧底盘坐标系 `B0`。基于 MobileManip 主要向前观察与操作的
-数据假设，X 范围从 `[-1.5,3.0] m` 裁为 B0 前方 `[0.0,3.0] m`。为保持原约
-`0.375 m` 的 X 分辨率，grid 从 `[Z,Y,X]=[4,12,12]` 改为 `[4,12,8]`，token 数由
-576 降为384。该裁剪不会随未来底盘朝向旋转；若 clip 内明显掉头，B0 后方内容会被
-主动丢弃，因此正式全量训练前需要统计轨迹在 B0 中的后向占比。
+数据假设，X 范围从 `[-1.5,3.0] m` 裁为 B0 前方 `[0.0,3.0] m`。当前 V2 grid 为
+`[Z,Y,X]=[8,12,8]`：X/Y 划分保持 8/12，Z 从早期 4 层提高到 8 层，总 token 数为
+768。该裁剪不会随未来底盘朝向旋转；若 clip 内明显掉头，B0 后方内容会被主动丢弃，
+因此必须结合 coverage QA 解读。
 
-由于 grid token 数和 image-to-grid encoder 参数命名/形状均已改变，旧的576-token
-checkpoint 不能恢复到本结构。训练脚本默认输出目录改为
-`work_dirs/mobilemanibench_5tasks_vggt_isaac_optical_q025`，防止自动加载采用旧
-identity optical transform 或旧 geometry 权重的 checkpoint。
+由于 grid token 数和 decoder 形状已经改变，旧的 384/576-token checkpoint 不能作为
+Trainer resume checkpoint。若需要复用旧训练结果，只能通过 `INIT_CHECKPOINT` 做
+name-and-shape-compatible matching 初始化。当前训练脚本默认输出目录为
+`work_dirs/mobilemanibench_5tasks_vggt_v2_savefix`。
 
 本次将 geometry temporal transformer 改为 causal，并在每个 voxel 上复用
 `WanTemporalEncoder`，使 3D tokens 也从 33 个 frame steps 压缩到 9 个 latent steps。
@@ -306,15 +312,25 @@ metric grid 外，PointMap 概率和坐标安全置零，不会产生 NaN。
 latent、PointMap、occupancy logits 和可视化输出。当前总 loss 为：
 
 ```text
-video_recon
+video_quality =
+    1.0 * Charbonnier
+  + 0.1 * LPIPS
+  + 0.2 * SSIM
+  + 0.1 * spatial gradient
+  + 0.1 * temporal difference
+
+total =
+  video_quality
 + beta_2d * KL
-+ warmup(pointmap_weight) * (
++ warmup(0.4) * quality_weight(0.25) * (
     PointMap Huber
     + ray_weight * depth-bin CE
     + free_space_weight * (free-space BCE + surface-occupancy BCE)
     + multiview_weight * multiview consistency
+    + temporal_weight * temporal geometry
+    + normal_weight * surface normal
+    + depth_gradient_weight * depth gradient
   )
-+ temporal_geometry_weight * temporal PointMap loss
 ```
 
 PointMap coordinate loss 和 ray-surface loss 只监督 GT pseudo PointMap 落在
@@ -371,9 +387,9 @@ visualizations/{train|val}/step_XXXXXXXX/sample_XXX/
 └── metrics.json
 ```
 
-contact sheet 按 `time × view` 展示 RGB GT、RGB reconstruction、RGB absolute error、
-PointMap GT/predicted camera range、PointMap L2 error 和 pseudo-label confidence。
-由于 decoder 现在输出 Wan-compatible `[-1,1]` RGB，可视化前会转换回 `[0,1]`。
+contact sheet 按 `time × view` 展示 RGB GT/reconstruction 和 PointMap GT/prediction。
+误差列、独立 confidence 列和图顶总 loss 已移除；confidence 仍用于 3D scatter 的
+有效点筛选。由于 decoder 输出 `[-1,1]` RGB，可视化前会转换回 `[0,1]`。
 
 `pointmap_3d_scatter_b0.png` 不是独立的点云预测：它只是把
 `predicted_pointmap_b0[..., Hq, Wq]` 中具有有效监督的像素展平为 `[N,3]` 后，在
@@ -407,6 +423,11 @@ loss / eval_loss
 learning_rate
 grad_norm
 video_recon_loss_avg
+video_lpips_loss_avg
+video_ssim_loss_avg
+video_spatial_gradient_loss_avg
+video_temporal_difference_loss_avg
+video_quality_loss_avg
 kl_2d_loss_avg
 pointmap_loss_avg
 ray_surface_loss_avg
@@ -414,6 +435,9 @@ free_space_loss_avg
 surface_occupancy_loss_avg
 multiview_consistency_loss_avg
 temporal_geometry_loss_avg
+surface_normal_loss_avg
+depth_gradient_loss_avg
+weighted_geometry_loss_avg
 ```
 
 文件采用一行一个 JSON object 的格式，与 WAM loss 日志的离线分析方式一致。断点
@@ -426,9 +450,14 @@ codec、decoder 和 geometry heads 使用主学习率。scheduler 对两类 LR �
 不会把两组重新覆盖成同一个值。日志额外记录
 `backbone_learning_rate/heads_learning_rate`。
 
-五任务原始 validation 有 24,197 个 clip。训练入口使用确定性等间隔索引将训练内
-validation 限制到 `max_eval_samples=256`，避免每 2,000 step 执行一次超长完整验证；
+按上述独立 episode split，五任务 validation 有 24,197 个可用 33-frame clips。
+训练入口使用确定性等间隔
+索引将训练内 validation 限制到 `max_eval_samples=256`，避免周期性完整验证；
 完整集评估仍由独立验证脚本按需运行。
+
+这个 validation 适合监控收敛，但不是与 WAM 完全相同的 trajectory-group held-out
+集合。正式比较 tokenizer 泛化或 downstream 收益前，应让 VGGT dataset 接受
+`split_manifest_path` 并复用 `plan_splits.json`。
 
 入口还会把解析后的 Hydra 配置写到 `resolved_config.yaml`，并生成
 `geometry_quality.json` 标注 pseudo PointMap 的质量边界。启动时自动检测
@@ -436,25 +465,28 @@ validation 限制到 `max_eval_samples=256`，避免每 2,000 step 执行一次�
 
 ### `groot/vla/configs/vggt_3d_wam.yaml`
 
-组合 model/data 配置并定义训练默认值：输入 `160×320`、PointMap `32×64`、
+组合 model/data 配置并定义 Hydra 基础默认值：输入 `160×320`、PointMap `80×160`、
 完整 33 帧偏移 `[0,...,32]`、latent 时间长度 9、batch size 1、
-`max_steps=10000`、每 2000 step 保存和验证。
+`max_steps=5000`、每 500 step 保存和验证。
 优化器为 AdamW：新建 heads 使用 `5e-5`，VGGT aggregator LoRA 使用 `2e-5`；
-前 2%（默认 200 step）warmup，随后使用带 `0.2` 最低倍率的 cosine scheduler。
-启用 BF16、TF32、pinned memory。可视化默认开启：训练每 200 step 保存一次，验证
-每 500 step 最多保存 4 个样本。数据根目录和输出目录保留为必填项，VGGT 权重默认
+前 2% warmup，随后使用带 `0.2` 最低倍率的 cosine scheduler。
+启用 BF16、TF32、pinned memory。可视化默认开启：训练每 1000 step 保存一次，验证
+每 5000 step 最多保存 4 个样本。数据根目录和输出目录保留为必填项，VGGT 权重默认
 指向用户提供的 `model.pt`。
+
+正式 shell launcher 会覆盖部分基础值：`max_steps=30000`、save/eval 每 5000 step、
+warmup ratio `0.01`。可视化间隔仍来自 YAML：train 1000、val 5000。
 
 ### `groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml`
 
 定义生产模型规模：DINOv2-L/14 register-token patch embed、24 层 1024 维 backbone，
 冻结基础权重并在 attention/MLP 上使用 rank-8 LoRA。2D latent 为 48 维；3D 分支使用
-`[4,12,8]` B0-forward metric grid、256 维 token、64 个 ray depth bins 和
-512 pixel chunk。
-PointMap/geometry 总权重为 `0.1`，在 1000 step 内 warmup；ray loss 相对权重为
+`[8,12,8]` B0-forward metric grid、256 维 token、64 个 ray depth bins 和
+128-ray chunk。ray rendering 为 `40×80`，learned refinement 输出 `80×160`。
+PointMap/geometry 总权重为 `0.4`，在 2000 step 内 warmup；ray loss 相对权重为
 `0.1`。五任务 QA 后新增 `geometry_quality_weight=0.25`，用于对仍未完成官方内参/
 深度标定的整个 geometry objective 做显式整体降权；warmup 完成后的有效 geometry
-系数为 `0.1 × 0.25 = 0.025`。新增 3D 监督默认参数为：
+系数为 `0.4 × 0.25 = 0.1`。关键 3D 监督参数为：
 
 ```text
 free_space_loss_weight = 0.1
@@ -466,10 +498,10 @@ multiview_occlusion_threshold = 0.15 m
 时空接口固定为：
 
 ```text
-global_temporal_window = 1
+global_temporal_window = 4
 latent_spatial_stride = 16
 latent_temporal_stride = 4
-video_decoder_dim = 128
+video_decoder_dim = 256
 ```
 
 ### `groot/vla/configs/data/dreamzero/mobilemanibench_vggt.yaml`
@@ -481,10 +513,12 @@ range 解码阈值和相机 optical transform；训练按 `sample_stride` 采样
 ### `scripts/train/mobilemanibench_vggt_training.sh`
 
 提供单机 `torchrun` 多卡入口，并在启动前检查 DreamZero 环境中的 `torchrun`、四个
-dataset metadata 文件和 VGGT checkpoint。`PREFLIGHT_ONLY=1` 只执行检查；
+dataset metadata 文件、LPIPS 依赖和 VGGT checkpoint。`PREFLIGHT_ONLY=1` 只执行检查；
 `INIT_RANDOM=1` 可显式跳过预训练权重。`NUM_GPUS`、`MAX_STEPS`、`SAVE_STEPS`、
 `EVAL_STEPS`、两组学习率、warmup、最低 LR 倍率、训练内验证样本数、batch size、
 梯度累积和 WandB 模式均可由环境变量覆盖。
+`INIT_CHECKPOINT` 可从旧 DreamZero tokenizer checkpoint 只加载名称和形状匹配的
+trainable 参数；空值会完全跳过。
 默认启动信息会打印 `33x160x320 -> 9x10x20 -> 33x160x320`，便于检查接口。
 同时打印 DINO 完全冻结/分块 no-grad 和 aggregator LoRA/checkpointing 状态。
 
@@ -557,20 +591,33 @@ token 的命名和 shape 适配；完整 forward/backward 的 latent、重建和
 free-space/surface loss backward、multiview 几何对应和 deformable 全不可见 fallback
 测试。
 
+其余当前回归文件：
+
+```text
+tests/model/test_vggt_quality_losses.py
+tests/model/test_vggt_v2_smoke.py
+tests/model/test_vggt_matching_checkpoint.py
+tests/experiment/test_vggt_trainer_validation.py
+```
+
+分别覆盖 V2 视觉/3D loss、768-token shape、matching-only 初始化、LPIPS
+checkpoint 保存、残缺 checkpoint 跳过，以及 save-before-eval/validation batch
+接口。
+
 ## 9. 已执行验证
 
-已完成以下检查：
+截至 2026-07-30 已完成以下代码级检查：
 
 - 所有新增 Python 文件通过 `py_compile`。
-- 几何单元测试：2/2 通过。
-- 历史版本的模型 forward/backward、checkpoint layout 与 save-load 曾 3/3 通过；
-  本次审核发现该旧测试尚未同步新的严格 `stride=4/16` 合同，当前直接执行会失败，
-  详见第 10.3 节。
+- 几何、temporal codec、tokenizer contract 和 V2 shape 回归通过。
 - 可视化单元测试：1/1 通过。
 - 真实 MobileManiBench smoke dataset：1/1 通过。
 - tiny 真实数据 HF Trainer：完成 1 个 forward、backward 和 optimizer step。
-- 保存后的 checkpoint 可由独立验证脚本加载并输出指标。
+- 保存后的 checkpoint 可由独立验证脚本加载并输出指标；LPIPS shared tensor 不再进入
+  safetensors。
 - tiny HF Trainer step 已自动生成 contact sheet、PointMap 3D scatter 和同步 loss JSON。
+- matching-only 初始化和空路径跳过通过。
+- 不完整 checkpoint 会被自动忽略，只从完整 checkpoint resume。
 - `git diff --check` 通过。
 
 针对 `/mnt/yihao/codes/ReconDrive/checkpoints/model.pt` 还执行了低影响集成测试：
@@ -583,10 +630,6 @@ free-space/surface loss backward、multiview 几何对应和 deformable 全不�
   抽查 `frame_blocks.0.attn.qkv.weight` 与源 checkpoint 逐元素完全相等。
 - `28x28` tiny forward 输出 `[1, 1, 1, 1024, 2, 2]`，全部 finite，单线程 forward
   约 0.56 秒；该进程峰值 RSS 约 3.1 GiB，未占用 GPU。
-
-当前环境未安装 `pytest`：既有 `unittest` 文件直接执行；新增的 pytest-style
-tokenizer contract 测试使用同等测试函数直接调用完成验证，安装开发依赖后仍可由
-`pytest` 正常收集。
 
 本次 Wan-compatible 改造额外验证：
 
@@ -603,11 +646,13 @@ tokenizer contract 测试使用同等测试函数直接调用完成验证，安�
 - LoRA 范围检查和 activation-checkpoint backward 通过；
 - `PREFLIGHT_ONLY=1` 训练前检查通过。
 
-验证时 8 张 GPU 正在运行 WAN2.2 baseline，因此没有抢占 GPU 执行生产规模
-33-frame VGGT forward。正式训练前仍需在 GPU 空闲后先运行 1--2 optimizer step
-显存 smoke test。
+这些结果证明接口和训练链路成立，不代表 30,000-step tokenizer 已达到目标视觉或
+几何质量；收敛判断仍需结合 held-out validation、可视化和 downstream WAM 指标。
 
 ## 10. 2026-07-27 侧边任务 3D 监督合并审核
+
+> 本节及后续按时间记录问题发现和修复过程，保留的旧 shape、权重和输出目录不是当前
+> 默认值。阅读当前实现请以第 2–7 节及最新的 `encoder_decoder.yaml` 为准。
 
 ### 10.1 审核结论
 

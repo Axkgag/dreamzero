@@ -17,7 +17,8 @@ WAM 同时建模：
 2. 将多视角 2D latent、3D representation 和 Base Prior 接入 causal WAM。
 
 本文只描述方案、pipeline 和实施边界。当前 tokenizer 的逐文件实现见
-`docs/MM/MOBILEMANIBENCH_VGGT_CODE_CHANGES_BY_FILE.md`。
+`docs/MM/MOBILEMANIBENCH_VGGT_CODE_CHANGES_BY_FILE.md`；当前能力边界见
+`docs/MM/README.md`。
 
 ---
 
@@ -37,6 +38,10 @@ WAM 同时建模：
 
 当前应先验证 Stage 1 表示质量，再实施 Stage 2；不能把 tokenizer 接口已实现等同于
 已经完成 WAM 集成，也不能把方案中的 Base Prior 写成当前代码已有模块。
+
+当前还有一个评估边界：VGGT dataset 使用 seeded episode-level 90/10 split，而 WAM
+使用 `plan_splits.json` 的 source-trajectory group split。Stage 2 前应统一 split，
+避免 sibling episodes 跨 train/validation 造成偏乐观的 tokenizer 指标。
 
 ---
 
@@ -90,10 +95,10 @@ clean history multi-view z_2d
 video              [B,33,V,3,160,320]
 camera_K           [B,33,V,3,3]
 T_B0_camera        [B,33,V,4,4]
-pseudo_pointmap_B0 [B,33,V,3,32,64]
+pseudo_pointmap_B0 [B,33,V,3,80,160]
 
 z_2d_video         [B,V,48,9,10,20]
-z_3d_video         [B,9,384,256]
+z_3d_video         [B,9,768,256]
 ```
 
 这里的 `z_2d_video` 已经经过：
@@ -134,13 +139,18 @@ waypoints 和 EEF waypoints 使用同一坐标系。
 ```text
 frozen DINOv2-L/14 patch extractor
  -> per-frame attention
- -> same-time cross-view global attention
+ -> four-frame-window cross-view/global attention
  -> shared features
 ```
 
 DINO 完全冻结且无 LoRA。LoRA 只用于 24 对 frame/global aggregator blocks。
-`global_temporal_window=1`，因此 backbone 负责同一时刻的多视角融合，完整时间建模
-由后续 2D/3D branch 完成。
+`global_temporal_window=4`，使 aggregator 获得局部四帧时间感受野；后续 2D/3D
+causal temporal Transformer 和 `33→9` codec 继续负责完整 clip 的时间建模。
+
+当前 global window 的实际边界是 `[0:4],[4:8]...`，而 temporal codec 是
+`frame0 + [1:5],[5:9]...`。因此当前只对齐 stride/窗口宽度，没有严格对齐 chunk
+boundary。Stage 2 接入 WAM 前应通过实验决定保持局部重叠语义还是改成与 codec 完全
+相同的 `frame0 + 4-frame chunks`。
 
 ### 4.3 2D branch
 
@@ -175,42 +185,50 @@ VGGT 2D decoder 同时解码 head/wrist future video。
 ```text
 frame: B0
 XYZ range: X[0,3], Y[-2,2], Z[-0.5,2] m
-grid [Z,Y,X]: [4,12,8]
-N=384, C=256
+grid [Z,Y,X]: [8,12,8]
+N=768, C=256
 ```
 
 每个 voxel query 投影到 head/wrist，在两级图像 feature 上做 query-conditioned
 deformable sampling；随后用 `3x3x3` local aggregation 交换邻域信息。逐帧融合后，
 每个固定 voxel 沿时间做 causal Transformer 和 33→9 压缩。
 
-3D decoder 恢复 full-time metric grid。PointMap decoder 对每个相机像素构造 B0 ray，
-在 `0.05..5.0 m` 采样 64 个 bins，并用 surface logits 的 softmax 期望得到 B0 XYZ。
+3D decoder 恢复 full-time metric grid。PointMap decoder 先在 `40×80` ray grid 上
+对每个相机像素构造 B0 ray，在 `0.05..5.0 m` 采样 64 个 bins，再用 learned
+refinement 输出 `80×160` PointMap。
 occupancy head 监督表面前 free-space 和表面附近 occupied；表面之后保持 unknown。
 
 ### 4.5 当前训练目标
 
 ```text
 L_tokenizer =
-    L_RGB
+    L_Charbonnier
+  + 0.1 * L_LPIPS
+  + 0.2 * L_SSIM
+  + 0.1 * L_spatial_gradient
+  + 0.1 * L_temporal_difference
   + beta_2d * L_KL
   + geometry_weight * (
         L_PointMap
       + lambda_ray * L_ray_bin
       + lambda_occ * (L_free + L_surface)
       + lambda_mv * L_multiview
+      + lambda_temporal * L_temporal_geometry
+      + lambda_normal * L_surface_normal
+      + lambda_depth_grad * L_depth_gradient
     )
-  + lambda_temporal * L_temporal_geometry
 ```
 
-生产配置的 geometry weight 在 1000-step warmup 后为：
+生产配置的 geometry weight 在 2000-step warmup 后为：
 
 ```text
-pointmap_weight 0.1 * quality_weight 0.25 = 0.025
+pointmap_weight 0.4 * quality_weight 0.25 = 0.1
 ```
 
-当前 temporal geometry 和 masked-view reconstruction 均未启用。pseudo range 来自
-有损 H.264，K/外参仍属 nominal calibration，因此当前 3D 表示只能定位为 coarse
-geometry，不能用于毫米级重建或强 collision/contact labels。
+当前 temporal geometry、surface normal、depth gradient 和 multiview 项已启用；
+`masked_view_probability=0`，所以 masked-view reconstruction 仍关闭。pseudo range
+来自有损 H.264，K/外参仍属 nominal calibration，因此当前 3D 表示只能定位为
+coarse geometry，不能用于毫米级重建或强 collision/contact labels。
 
 ---
 
@@ -309,7 +327,7 @@ variable。
 raw `z_3d` 有：
 
 ```text
-9 * 384 = 3456 tokens/sample
+9 * 768 = 6912 tokens/sample
 ```
 
 直接拼入 DiT self-attention 会显著增加二次注意力成本。Stage 2 必须选择：
@@ -320,7 +338,7 @@ raw `z_3d` 有：
 - 局部/稀疏 3D attention。
 
 MVP 推荐 resampler 或 cross-attention，并使用 matched-compute baseline。若 future
-generation 需要从压缩 tokens 恢复 384-token geometry，还需对应 expansion decoder，
+generation 需要从压缩 tokens 恢复 768-token geometry，还需对应 expansion decoder，
 不能只做单向 pooling。
 
 ### 5.4 多视角 2D latent 接口
@@ -507,7 +525,7 @@ E. D + future z_3d denoising（可选）
 - **B0 coverage**：前向 `X[0,3]` grid 可能无法覆盖转向、后退或长 rollout；
 - **Distribution mismatch**：VGGT 2D/3D latent 需要统计和归一化；
 - **Multi-view token cost**：同时预测 head/wrist 会增加 video sequence length；
-- **3D token cost**：raw 384-token grid 可能使注意力成本不可接受；
+- **3D token cost**：raw 768-token grid 可能使注意力成本不可接受；
 - **Base Prior collapse**：prior 可能退化成普通 query，或被 refined Base tokens 忽略；
 - **Representation ignored**：WAM 可能完全忽略 3D context。
 

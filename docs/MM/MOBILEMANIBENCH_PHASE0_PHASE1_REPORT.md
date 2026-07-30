@@ -1,5 +1,8 @@
 # MobileManiBench Final Research Implementation：Phase 0 / Phase 1 报告
 
+> **历史验收记录。** 本文中的“尚未实现”和 checkpoint 状态仅对应 2026-07-23。
+> 当前状态见 [README.md](./README.md)。
+
 日期：2026-07-23  
 远端仓库：`/mnt/yihao/codes/dreamzero`  
 运行环境：`/mnt/yihao/envs/dreamzero`  

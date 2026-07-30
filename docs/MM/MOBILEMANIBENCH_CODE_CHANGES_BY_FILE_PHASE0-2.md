@@ -1,5 +1,8 @@
 # MobileManiBench WAM Phase 0–2 当前实现指南
 
+> 当前配置校对：2026-07-30
+> 跨模块状态与文档导航见 [README.md](./README.md)。
+
 ## 1. 文档定位
 
 本文是当前 MobileManiBench WAM（Wan Action Model）Phase 0–2 代码的学习入口。
@@ -136,17 +139,17 @@ prior。当前代码中没有一组独立的“先预测 coarse base，再作为
 ### 3.2 尚未实现或尚未完整验证
 
 - 独立的 Base coarse prior token stream；
+- Base/EEF/rotation/hand 分 slice training loss；
 - Base/Manipulator consistency training loss；
 - 基于机器人模型的 reachability/collision loss；
 - MobileManip 闭环 task-success 仿真；
 - 纯 WAM baseline 中的 VGGT 2D/3D conditioning；
-- 当前 Wan2.2-5B 正式 checkpoint 的离线 evaluator 兼容修复；
 - validation 修复后的下一次正式大模型 eval 结果。
 
-离线 evaluator 虽然已经实现，但 `scripts/eval/evaluate_mobilemanibench_plan.py`
-当前会无条件把 `cfg.pretrained_model_path` 当作基础 checkpoint 加载。Wan2.2 正式
-配置中该值是 `null`，因此当前 evaluator 不能直接用于该 Wan2.2 checkpoint；
-Wan2.2 需要按 raw Wan component + LoRA overlay 的实际加载方式修复。
+离线 evaluator 已兼容 `pretrained_model_path: null`：Wan2.2 会先按保存的 Hydra
+配置从 raw Wan component 初始化，再加载训练 checkpoint overlay；只有旧实验确实提供
+额外 Hugging Face base checkpoint 时才执行 base overlay 加载。该修复已通过加载级
+检查，新的完整离线指标仍需实际 checkpoint 推理后记录。
 
 ---
 
@@ -1063,9 +1066,9 @@ per_horizon_metrics.csv
 predictions.npz
 ```
 
-重要限制：当前 evaluator 的模型加载流程适配带
-`pretrained_model_path` 的 DreamZero overlay。Wan2.2 正式配置将该字段设为
-`null`，所以不能把“评估代码存在”理解为“Wan2.2 checkpoint 已端到端评估通过”。
+`analyze_mobilemanibench_plan_predictions.py` 进一步计算 normalization round-trip、
+各 slice normalized/physical error、saturation、轨迹长度，并生成高低误差可视化。
+训练内 `eval_loss`、离线轨迹指标和后处理诊断是三个不同层次，不能互相替代。
 
 ---
 
@@ -1123,6 +1126,8 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 当前两者都能通过文件和配置前置检查。
 
 ### 16.3 Wan2.2 正式训练证据
+
+> 本小节保留 2026-07-29 当时的 run 快照，不代表当前脚本默认值或最新 checkpoint。
 
 当前五任务 run 已产生：
 
@@ -1228,7 +1233,7 @@ scripts/eval/analyze_mobilemanibench_plan_predictions.py
 - 为什么推理只能提供当前 observation；
 - prediction 如何反归一化；
 - ADE/FDE、orientation 和 relative EEF 指标如何汇总；
-- 当前 Wan2.2 evaluator 还缺哪一步兼容修复。
+- `pretrained_model_path=null` 时为何直接使用 raw Wan components + checkpoint overlay。
 
 ---
 
@@ -1241,6 +1246,7 @@ scripts/eval/analyze_mobilemanibench_plan_predictions.py
 5. 6 维真实 state pad 到 64 维是 projector/checkpoint 兼容，不是新增状态语义。
 6. Base plan tokens 是待去噪目标，不是独立 coarse base-prior tokens。
 7. validation loss 已接入，但不是完整 trajectory metric。
-8. trajectory evaluator 已实现，不代表当前 Wan2.2 checkpoint 已跑通。
+8. trajectory evaluator 的 Wan2.2 加载兼容已修复，但仍需用目标 checkpoint 保存正式
+   评估结果。
 9. `save_lora_only=true` 不会消除 ZeRO optimizer checkpoint 的大容量。
 10. VGGT 已在仓库独立路径实现，但不属于本文件的纯 WAM Phase 0–2 输入。

@@ -55,7 +55,7 @@ python scripts/data/convert_droid.py \
 
 ## Script reference
 
-See [`scripts/data/convert_droid.py`](scripts/data/convert_droid.py) for full usage:
+See [`scripts/data/convert_droid.py`](../scripts/data/convert_droid.py) for full usage:
 
 ```
 python scripts/data/convert_droid.py --help

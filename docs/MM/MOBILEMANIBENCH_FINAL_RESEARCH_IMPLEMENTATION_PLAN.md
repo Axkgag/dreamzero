@@ -1,10 +1,23 @@
 # MobileManiBench 最终研究方案实施修改计划
 
-> 状态：**Review Draft，仅规划，尚未按本文修改代码**  
-> 日期：2026-07-23  
-> 目标仓库：`/mnt/yihao/codes/dreamzero`  
-> 数据集：`/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_smoke_v2/{g1,xhand}`  
-> 相关文档：[vggt_3d_wam_proposal.md](./vggt_3d_wam_proposal.md)、[MOBILEMANIBENCH_TO_DREAMZERO.md](./MOBILEMANIBENCH_TO_DREAMZERO.md)
+> 状态：**滚动实施计划；Phase 0–2 与独立 VGGT tokenizer 已实现，其余阶段见状态表**
+> 初版日期：2026-07-23；Base Prior 阶段补充：2026-07-30
+> 目标仓库：`/mnt/yihao/codes/dreamzero`
+> 数据集：smoke v2 用于链路测试，G1 five-task 用于当前正式实验
+> 相关文档：[当前状态入口](./README.md)、[vggt_3d_wam_proposal.md](../vggt_3d_wam_proposal.md)、[MOBILEMANIBENCH_TO_DREAMZERO.md](./MOBILEMANIBENCH_TO_DREAMZERO.md)
+
+实现状态以代码为准：
+
+| 阶段 | 当前状态 |
+|---|---|
+| Phase 0 | 已实现 |
+| Phase 1 | 已实现 |
+| Phase 2 | 已实现；当前训练为两路 masked flow loss |
+| Phase 3 | 未实现；slice/consistency 只有计划与离线指标 |
+| Phase 4 | 未实现；Base Prior 尚无代码 |
+| Phase 5 | tokenizer 已实现并在独立训练，表示质量仍需实验确认 |
+| Phase 6 | 未实现；VGGT tokens 尚未接入 WAM |
+| Phase 7 | 离线 evaluator 已实现；控制器/仿真闭环未实现 |
 
 ## 1. 目标
 
@@ -24,23 +37,27 @@ future 24-step EEF delta + hand command
 扩展为最终研究接口：
 
 ```text
-Observation + 2D/3D tokens
+Observation + language/state + 2D/3D tokens
         ↓
-Base tokens
-└── future base waypoints
+clean Base Prior tokens
+└── coarse future base waypoints / low-frequency mobility intention
+        ↓ condition refinement
+noisy Base plan tokens
+└── refined future base waypoints
 
-Manipulator tokens
-└── future EEF pose + hand configuration
+noisy Manipulator plan tokens
+└── refined future EEF pose + hand configuration
 ```
 
 最终模型需要同时满足：
 
-1. Base 和 Manipulator 使用独立 token 序列、输入投影、输出投影和 token-type embedding。
-2. 两路 token 共同进入 DreamZero causal DiT，通过 attention 交互。
-3. Manipulator 只有一路 token，但内部按 EEF position、EEF rotation、hand configuration 三个 slice 归一化和计算 loss。
-4. 两路计划使用同一锚点坐标系 `B(t)`、同一 future offsets 和同一 horizon valid mask。
-5. 2D tokens 是主视觉表示，3D tokens 提供 coarse geometry-aware spatial understanding。
-6. 当前可运行的 `mobilemanibench_training.sh` 保留为 baseline，不被研究版修改破坏。
+1. Base 和 Manipulator 使用独立 noisy token 序列、输入投影、输出投影和 token-type embedding。
+2. 独立 clean Base Prior queries 预测 coarse waypoints，并条件化两路 noisy plan refinement。
+3. 三类 token 共同进入 DreamZero causal DiT，并通过有向 attention 防止 Base Prior 读取 future/noisy flow variables。
+4. Manipulator 只有一路 token，但内部按 EEF position、EEF rotation、hand configuration 三个 slice 归一化和计算 loss。
+5. coarse Base Prior、refined Base/Manipulator 计划使用同一锚点坐标系 `B(t)`、同一 future offsets 和同一 horizon valid mask。
+6. 2D tokens 是主视觉表示，3D tokens 提供 coarse geometry-aware spatial understanding。
+7. 当前可运行的 `mobilemanibench_training.sh` 保留为 baseline，不被研究版修改破坏。
 
 ## 2. 本计划不包含的工作
 
@@ -227,16 +244,17 @@ manipulator_loss_mask
 
 ## 5. 总体实施阶段
 
-计划分为六个阶段。每一阶段通过验收后才能开始下一阶段。
+计划分为八个阶段（Phase 0 至 Phase 7）。每一阶段通过验收后才能开始下一阶段。
 
 ```text
 Phase 0  固化 baseline 与测试基线
 Phase 1  Plan 数据读取、reshape、mask、stats
 Phase 2  双路 Base/Manipulator action tokens
 Phase 3  分 slice loss 与两路一致性约束
-Phase 4  VGGT 2D/3D tokenizer 独立训练
-Phase 5  2D/3D tokens 接入 WAM
-Phase 6  推理、控制接口与完整评估
+Phase 4  clean Base Prior tokens 与 coarse waypoint head
+Phase 5  VGGT 2D/3D tokenizer 独立训练
+Phase 6  2D/3D tokens 接入 WAM，并扩展 Base Prior condition
+Phase 7  推理、控制接口与完整评估
 ```
 
 ## 6. Phase 0：固化当前 Baseline
@@ -692,23 +710,215 @@ total_loss
 - rotation 输出经过正交化后 determinant 接近1。
 - 反归一化后的 hand 不超出合理 joint range。
 
-## 10. Phase 4：VGGT 2D/3D Tokenizer
+## 10. Phase 4：Clean Base Prior Tokens 与 Coarse Waypoint Head
 
-当前仓库没有 VGGT 实现，本阶段为新增模块。
+### 10.1 目的与定位
 
-### 10.1 建议目录
+在现有两路 noisy flow tokens 之外，加入一组不加 flow noise 的 Base Prior
+queries，为同一次 WAM/DiT forward 提供低频移动意图：
 
 ```text
-groot/vla/model/dreamzero/vggt/
-├── backbone.py
-├── tokenizer_2d.py
-├── tokenizer_3d.py
-├── geometry_adapter.py
-├── depth_decoder.py
-└── losses.py
+6 clean Base Prior tokens
+6 noisy Base plan tokens
+6 noisy Manipulator plan tokens
 ```
 
-### 10.2 输入
+三类 token 不可混为一谈：
+
+| Token | 是否加 flow noise | 监督与作用 |
+|---|---:|---|
+| Base Prior | 否 | 直接预测 coarse Base waypoints，并条件化后两路 refinement |
+| Base plan | 是 | flow matching 生成 refined Base waypoints |
+| Manipulator plan | 是 | flow matching 生成 EEF pose 与 hand configuration |
+
+Base Prior 是同一个 WAM 内部的 clean latent queries，不是额外串联的 planner，也不能
+在推理前离线预计算。最终用于控制的仍是 refined Base plan；coarse prior 作为中间
+监督、调试输出和 refinement condition。
+
+### 10.2 Token 与时间接口
+
+Base Prior 与最终计划采用相同的六个 horizon：
+
+```text
+PLAN_OFFSETS = [1, 4, 8, 12, 16, 24]
+base_prior_i = learnable_query_i
+             + horizon_embedding(PLAN_OFFSETS[i] / CONTROL_FPS)
+             + base_prior_type_embedding
+```
+
+张量约定：
+
+```text
+base_prior_tokens:       [B, 6, D]
+coarse_base_waypoints:   [B, 6, 4]
+base_prior_valid_mask:   [B, 6]
+```
+
+`coarse_base_waypoints[...,0:2]` 表示 `B_anchor` 中的 x/y，
+`[...,2:4]` 表示 `sin(yaw)/cos(yaw)`。不得用普通序号 `0..5` 代替真实时间
+offset，也不得为 Base Prior 采样 flow timestep 或添加 action noise。
+
+### 10.3 Condition 与分阶段依赖
+
+Phase 4 先使用当前 WAM 已有的 clean context：
+
+```text
+language + robot state + observed/history visual context
+ -> clean Base Prior hidden states
+```
+
+这样可以在 VGGT tokenizer 完成前独立验证 prior 结构。Phase 6 再扩展为：
+
+```text
+language + robot state
++ multi-view history z_2d
++ metric history z_3d
+ -> clean Base Prior hidden states
+```
+
+Phase 4 不允许伪造或预留全零 `z_3d` 来声称已经完成 3D conditioning。
+
+### 10.4 Attention 与防泄漏
+
+第一版使用有向信息流：
+
+```text
+clean context -> Base Prior
+clean context + Base Prior -> noisy Base/Manipulator plan tokens
+```
+
+Base Prior 不读取：
+
+- future clean Base/Manipulator targets；
+- future clean RGB、2D latent 或 3D latent；
+- 由 GT future state 计算的任何 condition；
+- noisy Base/Manipulator token hidden states。
+
+最后一项用于避免 Base Prior 从包含 `x_t` 的 flow variables 建立训练捷径。实现上可采用
+block attention mask，或先更新 clean context/Base Prior、再让 flow tokens
+cross-attend prior hidden states。必须用 attention-leakage 单测验证，而不能只依赖
+代码注释。
+
+### 10.5 Coarse Head 与 Loss
+
+Base Prior hidden states 经独立轻量 MLP 输出：
+
+```text
+coarse_base_waypoints = BasePriorHead(base_prior_hidden)
+```
+
+监督使用与 Base plan 完全相同的 GT future waypoints、horizon mask 和
+normalization：
+
+```text
+L_base_prior =
+    lambda_prior_xy  * SmoothL1(coarse_xy, gt_xy)
+  + lambda_prior_yaw * yaw_sincos_loss(coarse_yaw, gt_yaw)
+  + lambda_prior_unit * unit_circle_regularization(coarse_yaw)
+```
+
+总 action loss 增加：
+
+```text
+L_action =
+    lambda_prior * L_base_prior
+  + lambda_base_flow * L_base_flow
+  + lambda_manip_flow * L_manipulator_flow
+  + existing slice/consistency losses
+```
+
+第一版建议 `lambda_prior=0.25`（相对于 `lambda_base_flow=1.0`），并记录各分支
+gradient norm 后再调；不要一开始让 coarse loss 主导 shared DiT。Base Prior 端到端
+反传，不对 prior hidden states做 detach。
+
+### 10.6 配置、Checkpoint 与日志
+
+配置必须显式提供：
+
+```text
+use_base_prior
+num_base_prior_tokens
+base_prior_loss_weight
+base_prior_xy_loss_weight
+base_prior_yaw_loss_weight
+base_prior_condition_on_2d
+base_prior_condition_on_3d
+```
+
+Phase 4 中后两项分别对应现有 history visual context 和 `false`；Phase 6 接入 VGGT
+后再启用新 2D/3D adapters。Base Prior query、type/horizon embedding 和 coarse head
+必须进入 optimizer、checkpoint save/load 和 missing-key 白名单。
+
+日志至少增加：
+
+```text
+base_prior_loss
+base_prior_xy_loss
+base_prior_yaw_loss
+base_prior_ade_m
+base_prior_fde_m
+base_prior_yaw_error_deg
+base_prior_gradient_norm
+```
+
+### 10.7 推理行为
+
+每次 receding-horizon 推理都重新建立 clean Base Prior queries，并在同一次 DiT
+采样中条件化 noisy Base/Manipulator tokens。接口可额外返回：
+
+```python
+{
+    "base_prior": ...,       # [6,4]，诊断/可视化
+    "base_plan": ...,        # [6,4]，控制输出
+    "manipulator_plan": ..., # [6,10/21]，控制输出
+}
+```
+
+不得把 `base_prior` 直接发送给底盘控制器，除非 refined plan 无效且明确实现了安全
+fallback。
+
+### 10.8 单测、消融与验收标准
+
+必须覆盖：
+
+1. token shape、offset 对齐及 Base Prior 永不加 flow noise；
+2. invalid horizon 对 prior loss/gradient 的贡献为零；
+3. Base Prior 不能读取 future clean target 或 noisy action hidden states；
+4. prior query、coarse head 和 shared attention 参数获得非零梯度；
+5. checkpoint round-trip 后 coarse/refined 输出一致；
+6. 单样本 overfit 时 `base_prior_loss`、ADE/FDE 明显下降；
+7. 比较 `no prior / normal prior / masked or shuffled prior`。
+
+Phase 4 验收要求：
+
+- coarse prior 优于 stationary-base 和 dataset-mean waypoint 基线；
+- 加入 prior 后 refined Base/Manipulator 指标不劣于 Phase 3；
+- mask/shuffle prior 会可测量地改变 refined 输出，证明模型没有完全忽略 prior；
+- 无 future leakage，推理时只依赖可获得的 observation/context；
+- 关闭 `use_base_prior` 能无损回退到 Phase 3 checkpoint 路径。
+
+## 11. Phase 5：VGGT 2D/3D Tokenizer
+
+本阶段代码已经位于 `groot/vla/model/vggt_3d_wam/`，并有独立训练、验证、日志和
+可视化入口。当前工作重点不是再次新建 tokenizer，而是完成训练收敛、表示质量验证与
+checkpoint 选择；它尚未替换 WAM 中的 Wan VAE。
+
+### 11.1 当前目录
+
+```text
+groot/vla/model/vggt_3d_wam/
+├── backbone.py
+├── temporal_codec.py
+├── video_latent.py
+├── metric_tokens.py
+├── pointmap_decoder.py
+├── geometry.py
+├── losses.py
+├── visualization.py
+└── model.py
+```
+
+### 11.2 输入
 
 ```text
 head RGB video
@@ -720,7 +930,7 @@ depth confidence/valid mask
 segmentation/dynamic mask
 ```
 
-### 10.3 2D 分支
+### 11.3 2D 分支
 
 主方案：
 
@@ -746,7 +956,7 @@ multi-view RGB
 Wan VAE 2D latent + VGGT 3D tokens
 ```
 
-### 10.4 3D 分支
+### 11.4 3D 分支
 
 推荐第一版锚点坐标系：
 
@@ -761,15 +971,12 @@ current base frame B(t)
 - 避免世界系场景原点差异；
 - 推理时可由当前 base pose 恢复世界系。
 
-候选表示需要 Review 确认：
+当前实现已经选择固定 dense metric voxel queries：
 
 ```text
-A. BEV-height tokens
-B. sparse voxel tokens
-C. dense voxel tokens
+B0-forward X[0,3], Y[-2,2], Z[-0.5,2]
+grid [Z,Y,X] = [8,12,8] = 768 tokens
 ```
-
-第一版推荐 A 或 B，不推荐 dense voxel。
 
 流程：
 
@@ -777,12 +984,12 @@ C. dense voxel tokens
 VGGT image features
 + camera K/extrinsics
 + metric grid queries in B(t)
--> per-frame 2D-to-3D aggregation
+-> multi-level deformable 2D-to-3D aggregation
 -> TemporalTransformer_3D
 -> deterministic z_3d
 ```
 
-### 10.5 MP4 Depth 使用边界
+### 11.5 MP4 Depth 使用边界
 
 当前 depth 是 lossy H.264 pseudo-range：
 
@@ -793,7 +1000,7 @@ VGGT image features
 - 不启用强 collision/contact 标签；
 - 不声称高精度 metric reconstruction。
 
-### 10.6 Tokenizer Loss
+### 11.6 Tokenizer Loss
 
 ```text
 L_tokenizer =
@@ -805,24 +1012,30 @@ L_tokenizer =
   + lambda_cross_view * L_cross_view
 ```
 
-训练顺序：
+当前 loss 还包括 LPIPS、SSIM、RGB spatial/temporal gradient、ray surface、
+free-space/surface occupancy、multiview、temporal geometry、surface normal 和 depth
+gradient。具体权重以
+`groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml` 为准。
+
+建议实验顺序：
 
 1. 先训练/验证 2D-only。
 2. 加入低权重 depth。
 3. 加入 masked-view。
 4. 加入 temporal/cross-view consistency。
 
-### 10.7 验收标准
+### 11.7 验收标准
 
+- VGGT train/val 复用 `meta/plan_splits.json`，同一 source trajectory 不跨 split。
 - 2D-only 重建质量达到可用于 WAM 的水平。
 - 加入3D后2D指标不显著退化。
 - 3D tokens 可解码出优于常数/单目无几何基线的 coarse depth。
 - 相机移动下静态区域的3D token基本一致。
 - 打乱相机参数会显著降低3D指标，证明模型使用了几何输入。
 
-## 11. Phase 5：2D/3D Tokens 接入 WAM
+## 12. Phase 6：2D/3D Tokens 接入 WAM，并扩展 Base Prior Condition
 
-### 11.1 模型输入
+### 12.1 模型输入
 
 扩展研究版 action head 输入：
 
@@ -832,12 +1045,17 @@ noisy future 2D tokens
 clean history 3D tokens
 noisy future 3D tokens
 state tokens
+clean base prior tokens
 base plan tokens
 manipulator plan tokens
 language tokens
 ```
 
-### 11.2 Adapter
+Base Prior 在本阶段读取 multi-view history `z_2d/z_3d`；它保持 clean，且不进入
+2D/3D/action flow noise scheduler。refined Base/Manipulator tokens 则读取更新后的
+Base Prior hidden states。
+
+### 12.2 Adapter
 
 新增：
 
@@ -855,7 +1073,7 @@ time embedding
 metric-grid positional encoding
 ```
 
-### 11.3 Attention 防泄漏
+### 12.3 Attention 防泄漏
 
 必须用单测验证：
 
@@ -863,14 +1081,17 @@ metric-grid positional encoding
 - future clean 2D/3D 不可进入 condition；
 - future target 只能以加噪形式进入 denoising；
 - action tokens 可与同一预测窗口的2D/3D tokens交互；
+- Base Prior 只能读取 clean history context，不能读取 future clean/noisy flow variables；
+- noisy Base/Manipulator tokens 可以读取 Base Prior hidden states，反向信息流被 mask；
 - future `robot_base/hand/joint` 只用于 target/loss。
 
-### 11.4 联合 Loss
+### 12.4 联合 Loss
 
 ```text
 L_total =
     lambda_2d * L_2d_denoise
   + lambda_3d * L_3d_denoise
+  + lambda_prior * L_base_prior
   + lambda_base_flow * L_base_flow
   + lambda_manip_flow * L_manipulator_flow
   + lambda_eef_pos * L_eef_position
@@ -883,28 +1104,32 @@ L_total =
 
 训练时监控各分支 gradient norm。3D loss 不得通过共享 backbone 持续破坏2D主分支。
 
-### 11.5 Ablation
+### 12.5 Ablation
 
 至少训练：
 
 ```text
 A. RGB/VAE + dual plan
-B. VGGT 2D + dual plan
-C. VGGT 2D + VGGT 3D + dual plan
-D. C 去掉 consistency loss
-E. C 打乱/屏蔽3D tokens
+B. RGB/VAE + Base Prior + dual plan
+C. VGGT 2D + Base Prior + dual plan
+D. VGGT 2D + VGGT 3D + Base Prior + dual plan
+E. D 去掉/屏蔽 Base Prior
+F. D 打乱/屏蔽3D tokens
+G. D 去掉 consistency loss
 ```
 
-只有 C 相比 B 有稳定收益，才能支持“3D tokens 改善空间理解”的结论。
+只有 D 相比 C 有稳定收益，才能支持“3D tokens 改善空间理解”的结论；B 相比 A
+用于单独衡量 Base Prior 的收益，不能把二者混成一次消融。
 
-## 12. Phase 6：推理与控制接口
+## 13. Phase 7：推理与控制接口
 
-### 12.1 推理输出
+### 13.1 推理输出
 
 研究版 policy 返回：
 
 ```python
 {
+    "base_prior": ...,            # [6,4]，诊断/可视化
     "base_plan": ...,             # [6,4]
     "manipulator_plan": ...,      # [6,10/21]
     "plan_time_offsets": ...,
@@ -919,7 +1144,7 @@ E. C 打乱/屏蔽3D tokens
 4. Hand configuration 反归一化并裁剪到 joint limits。
 5. 将 `B(t)` 中的计划转换到控制器需要的坐标系。
 
-### 12.2 执行器
+### 13.2 执行器
 
 ```text
 Base plan
@@ -932,7 +1157,7 @@ Manipulator plan
 -> arm joints + gripper/hand targets
 ```
 
-### 12.3 Receding Horizon
+### 13.3 Receding Horizon
 
 建议：
 
@@ -951,7 +1176,7 @@ Manipulator plan
 - stale plan 丢弃规则；
 - invalid/unsafe plan fallback。
 
-### 12.4 推理指标
+### 13.4 推理指标
 
 Base：
 
@@ -980,9 +1205,9 @@ collision rate
 task success
 ```
 
-## 13. 文件修改清单
+## 14. 文件修改清单
 
-### 13.1 保留不动的 Baseline
+### 14.1 保留不动的 Baseline
 
 ```text
 groot/vla/configs/data/dreamzero/mobilemanibench_relative.yaml
@@ -991,40 +1216,45 @@ scripts/train/mobilemanibench_training.sh
 
 baseline 脚本只允许做独立的健壮性修复，不改成 research path。
 
-### 13.2 建议新增
+### 14.2 已实现的研究路径
 
 ```text
 groot/vla/data/dataset/mobilemanibench_plan.py
 groot/vla/data/transform/mobile_plan.py
-
 groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py
 groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
 groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
-
-groot/vla/model/dreamzero/vggt/backbone.py
-groot/vla/model/dreamzero/vggt/tokenizer_2d.py
-groot/vla/model/dreamzero/vggt/tokenizer_3d.py
-groot/vla/model/dreamzero/vggt/geometry_adapter.py
-groot/vla/model/dreamzero/vggt/depth_decoder.py
-groot/vla/model/dreamzero/vggt/losses.py
-
 groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml
 groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml
 groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml
-
 scripts/train/mobilemanibench_plan_training.sh
-scripts/inference/mobilemanibench_plan_policy.py
-
 tests/data/test_mobilemanibench_plan_dataset.py
 tests/data/test_mobilemanibench_plan_transform.py
-tests/model/test_dual_plan_shapes.py
-tests/model/test_dual_plan_masks.py
-tests/model/test_dual_plan_gradients.py
-tests/model/test_plan_attention_no_leakage.py
-tests/model/test_vggt_token_shapes.py
+tests/model/test_mobile_plan_phase2.py
+
+groot/vla/model/vggt_3d_wam/
+groot/vla/experiment/vggt_3d_wam.py
+groot/vla/configs/vggt_3d_wam.yaml
+groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml
+scripts/train/mobilemanibench_vggt_training.sh
+scripts/eval/validate_vggt_3d_wam.py
+tests/model/test_vggt_*.py
 ```
 
-### 13.3 可能需要小范围修改
+### 14.3 尚待新增或扩展
+
+```text
+Phase 3 slice/consistency training losses and tests
+groot/vla/model/dreamzero/modules/base_prior.py
+Base Prior attention/no-leakage tests
+VGGT-to-WAM adapters and joint training config
+scripts/inference/mobilemanibench_plan_policy.py
+controller/simulation evaluation
+```
+
+以上是计划项，不应在代码导读中写成已存在文件。
+
+### 14.4 可能需要小范围修改
 
 ```text
 groot/vla/model/dreamzero/base_vla.py
@@ -1036,9 +1266,9 @@ scripts/data/convert_mobilemanibench_to_gear.py
 
 原则：优先注册新类/新配置，不在现有 baseline 类中堆叠大量条件分支。
 
-## 14. 测试矩阵
+## 15. 测试矩阵
 
-### 14.1 数据测试
+### 15.1 数据测试
 
 | 测试 | G1 | XHand |
 |---|---:|---:|
@@ -1048,7 +1278,7 @@ scripts/data/convert_mobilemanibench_to_gear.py
 | round-trip normalization | 必须 | 必须 |
 | world-state plan reconstruction | 必须 | 必须 |
 
-### 14.2 模型测试
+### 15.2 模型测试
 
 | 测试 | 预期 |
 |---|---|
@@ -1058,10 +1288,14 @@ scripts/data/convert_mobilemanibench_to_gear.py
 | invalid horizon gradient | 0 |
 | Base encoder gradient | non-zero |
 | Manipulator encoder gradient | non-zero |
+| Base Prior forward | `[B,6,4]` |
+| Base Prior flow noise | 永不添加 |
+| Base Prior gradient | non-zero |
+| Base Prior attention leakage | 不可读取 future/noisy flow variables |
 | checkpoint missing keys | 仅新模块 |
 | attention leakage | 不可读取 future clean target |
 
-### 14.3 Overfit 测试
+### 15.3 Overfit 测试
 
 顺序：
 
@@ -1083,11 +1317,14 @@ eef_position_loss
 eef_rotation_loss
 hand_loss
 consistency_loss
+base_prior_loss
+base_prior_ade_m
+base_prior_fde_m
 ```
 
-## 15. 风险和缓解
+## 16. 风险和缓解
 
-### 15.1 Plan horizon 与现有 action block 不兼容
+### 16.1 Plan horizon 与现有 action block 不兼容
 
 风险：
 
@@ -1102,7 +1339,7 @@ consistency_loss
 - 不复用 `num_action_per_block=24` 的隐式假设；
 - 显式测试 token ranges 和 attention mask。
 
-### 15.2 Double-horizon sampling
+### 16.2 Double-horizon sampling
 
 风险：对已经包含完整未来计划的 row 再使用 `[0..23]` delta indices。
 
@@ -1114,7 +1351,7 @@ plan delta_indices=[0]
 
 并增加 source-index 单测。
 
-### 15.3 G1/XHand hand 维度不同
+### 16.3 G1/XHand hand 维度不同
 
 缓解：
 
@@ -1123,7 +1360,7 @@ plan delta_indices=[0]
 - 第一阶段分开训练；
 - padding loss/gradient 单测。
 
-### 15.4 两路 token 各自拟合但组合不可执行
+### 16.4 两路 token 各自拟合但组合不可执行
 
 缓解：
 
@@ -1132,7 +1369,7 @@ plan delta_indices=[0]
 - relative EEF consistency loss；
 - reachability 先做 metric/reranking，后决定是否可微。
 
-### 15.5 Rotation 表示退化
+### 16.5 Rotation 表示退化
 
 缓解：
 
@@ -1141,7 +1378,7 @@ plan delta_indices=[0]
 - SO(3) geodesic loss；
 - inference 后投影到合法旋转。
 
-### 15.6 3D 噪声破坏2D主分支
+### 16.6 3D 噪声破坏2D主分支
 
 缓解：
 
@@ -1151,7 +1388,7 @@ plan delta_indices=[0]
 - 3D adapter；
 - 必要时对 shared features 部分 stop-gradient。
 
-### 15.7 相机标定未验证
+### 16.7 相机标定未验证
 
 缓解：
 
@@ -1159,7 +1396,7 @@ plan delta_indices=[0]
 - projection/collision 强 loss 保持关闭；
 - 将 K/optical convention QA 设为启用强几何 loss 的前置门槛。
 
-### 15.8 新模块无法从原 checkpoint 加载
+### 16.8 新模块无法从原 checkpoint 加载
 
 缓解：
 
@@ -1168,7 +1405,24 @@ plan delta_indices=[0]
 - missing/unexpected key 白名单；
 - 确认新模块进入 optimizer。
 
-## 16. 回滚和兼容策略
+### 16.9 Base Prior 退化或被 Refined Plan 忽略
+
+风险：
+
+- prior 退化成只依赖 horizon 的 dataset-mean trajectory；
+- shared attention 完全忽略 prior hidden states；
+- prior 从 noisy action variables 建立训练捷径；
+- `L_base_prior` 权重过大，反而损害 refined action flow。
+
+缓解：
+
+- 与 stationary-base、dataset-mean prior 比较；
+- 做 masked/shuffled-prior sensitivity test；
+- 使用有向 attention mask 并增加 no-leakage 单测；
+- 分别记录 coarse/refined ADE/FDE 与 gradient norm；
+- `lambda_prior` 从低权重 warmup，保持 `use_base_prior=false` 回退开关。
+
+## 17. 回滚和兼容策略
 
 研究版使用独立：
 
@@ -1194,7 +1448,16 @@ data=dreamzero/mobilemanibench_plan
 
 任何阶段失败时，可以直接切回 baseline，不需要回滚数据转换结果。
 
-## 17. 实施里程碑与停止条件
+Base Prior 还必须支持：
+
+```text
+use_base_prior=false
+```
+
+关闭时 token layout、checkpoint loader 和推理输出退回 Phase 3 双路路径；旧 checkpoint
+只允许缺失 Base Prior 新增参数，不允许静默缺失已有 dual-plan 参数。
+
+## 18. 实施里程碑与停止条件
 
 ### Milestone A：Plan Data Ready
 
@@ -1212,26 +1475,34 @@ data=dreamzero/mobilemanibench_plan
 - consistency loss 下降。
 - 组合后的相对 EEF 误差低于无一致性版本。
 
-### Milestone D：VGGT 2D Tokenizer
+### Milestone D：Base Prior Ready
+
+- coarse Base prior 优于 stationary/dataset-mean 基线。
+- refined plan 不劣于无 prior 的 Phase 3。
+- masked/shuffled prior 会显著影响 refined 输出。
+- attention leakage 单测通过。
+
+### Milestone E：VGGT 2D Tokenizer
 
 - 2D-only tokenizer 达到 WAM 可用重建质量。
 
-### Milestone E：VGGT Coarse 3D
+### Milestone F：VGGT Coarse 3D
 
 - coarse depth/cross-view 指标优于简单基线。
 - 2D指标没有不可接受退化。
 
-### Milestone F：2D/3D WAM
+### Milestone G：2D/3D WAM
 
 - 2D+3D 相比2D-only在 action 或强视角变化场景有稳定收益。
+- Base Prior 能读取 z_2d/z_3d，且关闭任一 condition 的消融结果可解释。
 
 任一里程碑未通过时停止扩展，先修复当前阶段，不继续叠加下一阶段。
 
-## 18. 需要 Review 确认的设计选择
+## 19. 需要 Review 确认的设计选择
 
 请在执行前确认以下项目。
 
-### 18.1 计划锚点
+### 19.1 计划锚点
 
 推荐：
 
@@ -1243,7 +1514,7 @@ Base/Manipulator/3D metric grid 全部使用当前底盘 B(t)
 
 回复：同意
 
-### 18.2 第一版视觉路径
+### 19.2 第一版视觉路径
 
 推荐实施顺序：
 
@@ -1257,7 +1528,7 @@ Base/Manipulator/3D metric grid 全部使用当前底盘 B(t)
 
 回复：同意
 
-### 18.3 3D 表示
+### 19.3 3D 表示
 
 推荐第一版：
 
@@ -1269,7 +1540,7 @@ BEV-height 或 sparse voxel
 
 回复：BEV-height
 
-### 18.4 Flow timestep
+### 19.4 Flow timestep
 
 推荐第一版：
 
@@ -1281,7 +1552,7 @@ Base/Manipulator 共享 action diffusion timestep
 
 回复：同意
 
-### 18.5 Attention
+### 19.5 Attention
 
 推荐第一版：
 
@@ -1294,7 +1565,7 @@ Base/Manipulator 共享 action diffusion timestep
 
 回复：同意
 
-### 18.6 Hand normalization
+### 19.6 Hand normalization
 
 候选：
 
@@ -1307,7 +1578,7 @@ B. robot joint-limit normalization
 
 回复：第一版先使用A，并同步验证官方是否包含joint limits
 
-### 18.7 G1/XHand 训练方式
+### 19.7 G1/XHand 训练方式
 
 推荐：
 
@@ -1319,7 +1590,7 @@ B. robot joint-limit normalization
 
 回复：同意
 
-### 18.8 一致性约束启用顺序
+### 19.8 一致性约束启用顺序
 
 推荐：
 
@@ -1333,14 +1604,32 @@ B. robot joint-limit normalization
 
 回复：同意
 
-## 19. Review 后的执行顺序
+### 19.9 Base Prior 信息流
 
-本文 Review 通过后，下一轮执行只从 Phase 0 和 Phase 1 开始：
+推荐：
 
-1. 修复并冻结 baseline。
-2. 新增 Plan Dataset/Transform/Stats。
-3. 完成数据单测和 batch 可视化。
-4. 输出 Phase 1 修改报告。
-5. 等待确认后再进入双路模型结构修改。
+```text
+clean context -> Base Prior -> noisy Base/Manipulator refinement
+```
 
-不会在一次修改中同时实现所有 Phase，也不会在 Plan Dataset 尚未验收时直接改 DiT/VGGT。
+Base Prior 与六个 `PLAN_OFFSETS` 一一对应，不加 flow noise，不读取 future clean target
+或 noisy flow hidden states；Phase 6 再增加 history `z_2d/z_3d` condition。
+
+待确认：是否同意。
+
+回复：待确认
+
+## 20. Review 后的执行顺序
+
+Phase 0–2 和独立 VGGT tokenizer 代码已经存在。下一轮 action/WAM 主线应从尚未完成
+的 Phase 3 开始：
+
+1. 实现并验证分 slice training loss 与 relative EEF consistency loss。
+2. 固化 Phase 3 checkpoint、离线指标和无泄漏测试。
+3. 实现 Phase 4 clean Base Prior queries、coarse head 和有向 attention。
+4. 独立继续 Phase 5 tokenizer 收敛与表示质量验证，选择可用 checkpoint。
+5. 只有 Phase 4 与 Phase 5 都通过验收后，进入 Phase 6 的 VGGT-to-WAM 集成。
+6. 最后完成 Phase 7 控制接口和闭环评估。
+
+Phase 3/4 的 action 实现与 Phase 5 tokenizer 训练可以并行推进，但 Phase 6 不应绕过
+任一前置验收。

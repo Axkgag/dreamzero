@@ -1,5 +1,9 @@
 # MobileManiBench → DreamZero WAN2.2-5B 全量 Baseline 命令记录
 
+> 当前脚本默认使用五任务数据集和 10,000 steps；full G1 命令通过环境变量显式覆盖。
+> 下文保留全量转换/划分记录，同时给出当前 five-task 训练默认值。
+> 实现状态和关键张量合同见 [README.md](./README.md)。
+
 ## 1. 实验目标与固定路径
 
 本实验将 DreamZero 从原有单路 Manipulation Action 预测迁移到 Mobile
@@ -18,10 +22,10 @@ PYTHON_BIN=/mnt/yihao/envs/dreamzero/bin/python
 RAW_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_opensource
 FULL_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero/g1
 SMOKE_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_smoke_v2/g1
-RUN_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline_evalfix
+RUN_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline
 VGGT_DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1
 VGGT_CHECKPOINT=/mnt/yihao/codes/ReconDrive/checkpoints/model.pt
-VGGT_RUN_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_evalfix
+VGGT_RUN_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_v2_savefix
 ```
 
 后续命令均在远程服务器执行：
@@ -220,7 +224,7 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 Smoke 只用于确认模型加载、forward/backward、双路 loss 和 checkpoint 保存，不用于
 评价最终泛化性能。
 
-## 6. Step 5：全量训练 Preflight
+## 6. Step 5：训练 Preflight
 
 ```bash
 PREFLIGHT_ONLY=1 \
@@ -244,18 +248,17 @@ tokenizer
 训练参数基本约束
 ```
 
-## 7. Step 6：启动本次全量训练
+## 7. Step 6：启动训练
 
-本次实际训练命令：
+当前脚本默认运行五任务 baseline：
 
 ```bash
 cd /mnt/yihao/codes/dreamzero
 
-MAX_STEPS=200000 \
 bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```
 
-已从实际运行进程核对的参数：
+当前默认参数：
 
 | 参数 | 数值 |
 |---|---:|
@@ -264,35 +267,48 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 | Per-device train batch | 32 |
 | Global batch | 256 |
 | Gradient accumulation | 1 |
-| MAX_STEPS | 200000 |
-| 约等效 epoch | 2.20 |
+| MAX_STEPS | 10000 |
 | Learning rate | `1e-5` |
-| Scheduler | cosine |
+| Scheduler | `cosine_with_min_lr`，最低倍率 `0.1` |
 | Warmup ratio | `0.05` |
 | Weight decay | `1e-5` |
 | Precision | BF16 + TF32 |
 | Train architecture | LoRA |
 | `save_lora_only` | `true` |
-| Save interval | 5000 optimizer steps |
+| Save interval | 2000 optimizer steps |
 | Save total limit | 10 |
-| Online eval interval | 5000 optimizer steps |
+| Online eval interval | 2000 optimizer steps |
 | Online eval samples | 1024 |
 | Seed | 42 |
 
 训练输出：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_dual_plan_g1_wan22_5b_baseline
+/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline
 ```
 
 训练日志：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_dual_plan_g1_wan22_5b_baseline/loss_log.jsonl
+/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline/loss_log.jsonl
 ```
 
 使用相同命令重新启动时，框架会检查该 output directory 下的最新 checkpoint 并自动
 恢复，不需要额外设置 resume 开关。
+
+需要运行 full G1 时显式覆盖数据、输出目录和步数，避免与五任务 checkpoint 混用：
+
+```bash
+MOBILEMANIBENCH_DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero/g1 \
+OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_full_wan22_5b_baseline \
+MAX_STEPS=200000 \
+SAVE_STEPS=5000 \
+EVAL_STEPS=5000 \
+bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+```
+
+脚本启动摘要目前打印 `scheduler=cosine`，但真正传给 Hydra 的配置是
+`cosine_with_min_lr + min_lr_rate=0.1`；应以 resolved config 为准。
 
 ## 8. Step 7：训练期间验证
 
@@ -301,12 +317,13 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```text
 do_eval=true
 eval_strategy=steps
-eval_steps=5000
+eval_steps=2000
 max_eval_samples=1024
 ```
 
-因此每 5000 optimizer steps 会在 Validation split 的固定 1024 个 anchor 上计算
-`eval_loss`。完整 Validation split 仍保留 6911 episodes / 1236759 anchors。
+因此默认每 2000 optimizer steps 会在 five-task Validation split 的固定 1024 个
+anchor 上计算 `eval_loss`。five-task 完整 Validation 为 286 episodes / 56,376
+anchors；full G1 为 6,911 / 1,236,759。
 
 训练期间建议重点记录：
 
@@ -326,7 +343,7 @@ learning_rate
 ### 9.1 先检查 Validation split 解析
 
 ```bash
-DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero/g1 \
+DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1 \
 SPLIT=val \
 INSPECT_ONLY=1 \
 bash scripts/eval/mobilemanibench_plan_eval.sh
@@ -343,8 +360,8 @@ meta/plan_splits.json
 将 checkpoint 路径替换为实际要验证的 checkpoint：
 
 ```bash
-CHECKPOINT=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_dual_plan_g1_wan22_5b_baseline/checkpoint-50000 \
-DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero/g1 \
+CHECKPOINT=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline/checkpoint-10000 \
+DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1 \
 SPLIT=val \
 MAX_SAMPLES=1024 \
 SAMPLE_STRIDE=1 \
@@ -373,10 +390,11 @@ NUM_INFERENCE_STEPS=16
 推荐依次比较：
 
 ```text
-checkpoint-50000
-checkpoint-100000
-checkpoint-150000
-checkpoint-200000
+checkpoint-2000
+checkpoint-4000
+checkpoint-6000
+checkpoint-8000
+checkpoint-10000
 ```
 
 离线核心指标：
@@ -387,11 +405,21 @@ EEF position error
 EEF orientation error
 Hand joint error
 Base/Manipulator 相对位姿一致性
-轨迹平滑度与 normalization saturation
 ```
 
-全量 1236759 个 validation anchors 的生成式推理成本非常高，第一版 baseline 应先用
-固定 1024 样本比较 checkpoint，再根据结果扩大样本数。
+`mobilemanibench_plan_eval.sh` 不会自动计算 normalization saturation 或生成高低误差
+轨迹图。需要对生成的 `predictions.npz` 另行运行：
+
+```bash
+/mnt/yihao/envs/dreamzero/bin/python \
+  scripts/eval/analyze_mobilemanibench_plan_predictions.py \
+  --predictions <checkpoint>/mobile_plan_eval_val/predictions.npz \
+  --plan-stats /mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1/meta/plan_stats.json \
+  --output-dir <checkpoint>/mobile_plan_eval_val/analysis
+```
+
+完整 validation 的生成式推理成本很高。five-task 与 full G1 都应先用固定 1024
+样本比较 checkpoint，再根据结果扩大样本数。
 
 五任务子集的当前 validation split 实际为 56,376 个 anchors。训练脚本中的
 `MAX_EVAL_SAMPLES=1024` 会用等间隔索引选择固定 1,024 个样本，因此训练内验证是
@@ -413,11 +441,11 @@ WAN2.2-5B WAM。当前固定接口为：
 ```text
 video       [B,33,V,3,160,320]
 z_2d_video  [B,V,48,9,10,20]
-z_3d_video  [B,9,384,256]
+z_3d_video  [B,9,768,256]
 
 2D decode: 9 -> 33 RGB frames
-3D decode: 9 -> 33 B0-forward metric grids [4,12,8]
-          -> 33-frame PointMap video
+3D decode: 9 -> 33 B0-forward metric grids [8,12,8]
+          -> 33-frame 80x160 PointMap video
 ```
 
 ### 10.1 启动前检查
@@ -436,12 +464,19 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 ```text
 video_contract=33x160x320 -> 9x10x20 -> 33x160x320
 temporal_layout=frame0 + 8 chunks of 4 frames (shared by 2D/3D)
-metric_grid=B0-forward x[0,3] y[-2,2] z[-0.5,2], 4x12x8=384 tokens
+temporal_window=4 (Wan-aligned source-frame chunks)
+metric_grid=B0-forward x[0,3] y[-2,2] z[-0.5,2], 8x12x8=768 tokens
+video_losses=Charbonnier + LPIPS + SSIM + spatial-gradient + temporal-difference
+pointmap_decoder=40x80 ray rendering -> learned 80x160 refinement
 geometry_fusion=2-layer, 2-level, 8-head deformable cross-attention
 dino=frozen, no LoRA, no_grad chunks of 4 images
 aggregator=rank-8 LoRA + activation checkpointing
 Preflight checks passed; training was not started.
 ```
+
+上述 `Wan-aligned` 是启动脚本当前打印文本，只表示窗口宽度为4。实际 aggregator
+windows 为 `[0:4],[4:8]...`，temporal codec 为 `frame0+[1:5],[5:9]...`，边界并未
+严格对齐。
 
 ### 10.2 生产规模训练前的 2-step GPU smoke
 
@@ -464,7 +499,7 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 如果这一步出现 OOM，不能直接启动 8 卡 DDP；DDP 不会降低每张 GPU 上的模型和
 单样本显存，需要先调整 activation/checkpointing 或模型执行策略。
 
-### 10.3 启动 8 卡、10000-step VGGT tokenizer 训练
+### 10.3 启动 8 卡、30000-step VGGT tokenizer 训练
 
 脚本已经写入默认数据、checkpoint、batch size、训练步数和保存间隔，因此正式启动
 只需要：
@@ -496,14 +531,14 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 | 训练内 validation | 从 24197 个 held-out clips 均匀固定抽取 256 个 |
 | DINOv2 | 完全冻结、无 LoRA、4-image chunk、no-grad |
 | VGGT frame/global | 冻结原始权重 + rank-8 LoRA + activation checkpointing |
-| 3D grid | B0 前方 `[4,12,8]`，384 tokens |
+| 3D grid | B0 前方 `[8,12,8]`，768 tokens |
 | 2D-to-3D | 2-layer、2-level、8-head deformable cross-attention |
 | 2D/3D 新增模块 | 完整训练 |
 
 正式输出目录：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_evalfix
+/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_v2_savefix
 ```
 
 相同命令重启时，`groot/vla/experiment/vggt_3d_wam.py` 会自动检查该目录中的最新
@@ -512,16 +547,23 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 VGGT loss 日志持续追加在：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_evalfix/loss_log.jsonl
+/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_v2_savefix/loss_log.jsonl
 ```
 
 其中包含总 loss、通用 learning rate、`backbone_learning_rate`、
 `heads_learning_rate`、grad norm，以及 RGB、KL、PointMap、ray surface 等分支的
 10-step 滑动平均。
 
-旧的 576-token 静态采样 checkpoint 与新的 384-token deformable encoder 参数形状
-不同；旧 identity-camera 或无 quality multiplier 的 optimizer state 也不应与新监督
-混合。必须使用上述新输出目录从 VGGT backbone checkpoint 开始新训练。
+旧的 384/576-token checkpoint 与当前 768-token V2 结构参数形状不同，不能执行
+Trainer resume。若要复用其中仍匹配的 trainable 参数，使用 `INIT_CHECKPOINT`：
+
+```bash
+INIT_CHECKPOINT=/absolute/path/to/old/checkpoint-N \
+OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_v2_savefix \
+bash scripts/train/mobilemanibench_vggt_training.sh
+```
+
+matching-only 不恢复 optimizer/global step；空 `INIT_CHECKPOINT` 会完全跳过。
 
 不要在当前 WAN2.2 action baseline 占满 8 张 GPU 时同时启动 VGGT 训练。
 
@@ -550,11 +592,11 @@ bash scripts/eval/mobilemanibench_vggt_validate.sh
 3. prepare_mobilemanibench_plan_metadata.py --split train
 4. 可选：smoke 50-step
 5. PREFLIGHT_ONLY=1
-6. MAX_STEPS=200000 启动全量训练
-7. 每 5000 step 自动计算 eval_loss 并保存 checkpoint
+6. 默认启动 five-task 10000-step baseline；full G1 时显式覆盖路径和步数
+7. 默认每 2000 step 先保存 checkpoint，再计算 eval_loss
 8. 在 split=val 的固定 1024 样本上运行离线轨迹评估
 9. 比较多个 checkpoint，选择验证指标最优模型
 10. VGGT：先 preflight，再运行单卡 2-step 显存 smoke
-11. VGGT：启动 8 卡 10000-step tokenizer 训练
+11. VGGT：启动 8 卡 30000-step tokenizer 训练
 12. 使用 `mobilemanibench_vggt_validate.sh` 验证 VGGT checkpoint
 ```

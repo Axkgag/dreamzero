@@ -1,4 +1,9 @@
-# MobileManiBench 双路 Plan：现阶段代码改动逐文件说明
+# MobileManiBench 双路 Plan：早期工作树逐文件快照
+
+> **历史文档。** 本文记录 Phase 2 开发时相对当时 Git HEAD 的工作树，不再代表
+> 2026-07-30 当前仓库状态。当前实现请阅读
+> [MOBILEMANIBENCH_CODE_CHANGES_BY_FILE_PHASE0-2.md](./MOBILEMANIBENCH_CODE_CHANGES_BY_FILE_PHASE0-2.md)，
+> 总体状态见 [README.md](./README.md)。
 
 ## 1. 文档目的与统计范围
 
