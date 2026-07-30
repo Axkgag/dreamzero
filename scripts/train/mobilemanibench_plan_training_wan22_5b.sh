@@ -1,5 +1,6 @@
 #!/bin/bash
-# Full-data MobileManiBench dual-plan LoRA baseline on Wan2.2-TI2V-5B.
+# Full-data MobileManiBench plan training on Wan2.2-TI2V-5B with independently
+# selectable architecture and physical-loss profile.
 
 set -euo pipefail
 
@@ -15,9 +16,8 @@ export NO_ALBUMENTATIONS_UPDATE=1
 cd "$REPO_ROOT"
 
 DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1"
-DEFAULT_OUTPUT_DIR="$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline"
-DEFAULT_NUM_GPUS=8
-PER_DEVICE_BATCH_SIZE=32
+DEFAULT_NUM_GPUS=1
+DEFAULT_PER_DEVICE_BATCH_SIZE=32
 DEFAULT_MAX_STEPS=10000
 DEFAULT_SAVE_STEPS=2000
 DEFAULT_LOGGING_STEPS=100
@@ -26,8 +26,47 @@ DEFAULT_LEARNING_RATE="1e-5"
 DEFAULT_WARMUP_RATIO="0.05"
 DEFAULT_WEIGHT_DECAY="1e-5"
 
+# Architecture options:
+#   dual_plan   - 6 Base + 6 Manipulator noisy flow tokens (12 total).
+#   clean_prior - 6 clean Base Prior + 12 noisy flow tokens (18 internal).
+MOBILE_PLAN_ARCHITECTURE=${MOBILE_PLAN_ARCHITECTURE:-clean_prior}
+
+# Loss-profile options:
+#   flow_only            - flow objectives only; clean_prior still retains
+#                          its direct Base Prior supervision.
+#   physical_consistency - adds physical plan-component and Base/EEF
+#                          consistency objectives.
+MOBILE_PLAN_LOSS_PROFILE=${MOBILE_PLAN_LOSS_PROFILE:-physical_consistency}
+
+case "$MOBILE_PLAN_ARCHITECTURE:$MOBILE_PLAN_LOSS_PROFILE" in
+  dual_plan:flow_only)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_wan22
+    TOKEN_LAYOUT="6 Base + 6 Manipulator noisy tokens (12 total)"
+    ;;
+  dual_plan:physical_consistency)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_physical_consistency_wan22
+    TOKEN_LAYOUT="6 Base + 6 Manipulator noisy tokens (12 total)"
+    ;;
+  clean_prior:flow_only)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_clean_prior_wan22
+    TOKEN_LAYOUT="6 clean Base Prior + 12 noisy flow tokens (18 internal)"
+    ;;
+  clean_prior:physical_consistency)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_clean_prior_physical_consistency_wan22
+    TOKEN_LAYOUT="6 clean Base Prior + 12 noisy flow tokens (18 internal)"
+    ;;
+  *)
+    echo "ERROR: unsupported MobileManiBench plan configuration:" >&2
+    echo "  MOBILE_PLAN_ARCHITECTURE=$MOBILE_PLAN_ARCHITECTURE" >&2
+    echo "  MOBILE_PLAN_LOSS_PROFILE=$MOBILE_PLAN_LOSS_PROFILE" >&2
+    echo "Architecture options: dual_plan | clean_prior" >&2
+    echo "Loss-profile options: flow_only | physical_consistency" >&2
+    exit 2
+    ;;
+esac
+
 MOBILEMANIBENCH_DATA_ROOT=${MOBILEMANIBENCH_DATA_ROOT:-"$DEFAULT_DATA_ROOT"}
-OUTPUT_DIR=${OUTPUT_DIR:-"$DEFAULT_OUTPUT_DIR"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_${MOBILE_PLAN_ARCHITECTURE}_${MOBILE_PLAN_LOSS_PROFILE}"}
 WAN22_CKPT_DIR=${WAN22_CKPT_DIR:-"/mnt/yihao/codes/checkpoints/Wan2.2-TI2V-5B"}
 IMAGE_ENCODER_DIR=${IMAGE_ENCODER_DIR:-"/mnt/yihao/codes/checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"/mnt/yihao/codes/checkpoints/umt5-xxl"}
@@ -43,11 +82,17 @@ DO_EVAL=${DO_EVAL:-true}
 EVAL_STEPS=${EVAL_STEPS:-"$DEFAULT_EVAL_STEPS"}
 MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-1024}
 LEARNING_RATE=${LEARNING_RATE:-"$DEFAULT_LEARNING_RATE"}
-PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-"$DEFAULT_PER_DEVICE_BATCH_SIZE"}
 WARMUP_RATIO=${WARMUP_RATIO:-"$DEFAULT_WARMUP_RATIO"}
 WEIGHT_DECAY=${WEIGHT_DECAY:-"$DEFAULT_WEIGHT_DECAY"}
 PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
 export WANDB_MODE
+
+if [ "$DO_EVAL" = "true" ]; then
+  EVAL_STRATEGY=steps
+else
+  EVAL_STRATEGY=no
+fi
 
 if [ ! -x "$TORCHRUN_BIN" ]; then
   echo "ERROR: torchrun is missing or not executable: $TORCHRUN_BIN" >&2
@@ -101,11 +146,14 @@ if [ ! -d "$TOKENIZER_DIR" ]; then
   exit 1
 fi
 
-echo "MobileManiBench Wan2.2-5B dual-plan baseline:"
+echo "MobileManiBench Wan2.2-5B plan configuration:"
 echo "  data_root=$MOBILEMANIBENCH_DATA_ROOT"
 echo "  output_dir=$OUTPUT_DIR"
 echo "  backbone=$WAN22_CKPT_DIR"
-echo "  token_layout=6 base + 6 manipulator"
+echo "  architecture=$MOBILE_PLAN_ARCHITECTURE"
+echo "  loss_profile=$MOBILE_PLAN_LOSS_PROFILE"
+echo "  token_layout=$TOKEN_LAYOUT"
+echo "  action_head_config=$ACTION_HEAD_CONFIG"
 echo "  plan_offsets=1,4,8,12,16,24"
 echo "  num_gpus=$NUM_GPUS"
 echo "  per_device_batch_size=$PER_DEVICE_BATCH_SIZE"
@@ -139,7 +187,7 @@ fi
   action_horizon=12 \
   num_views=2 \
   model=dreamzero/vla \
-  model/dreamzero/action_head=mobile_plan_flow_matching_wan22 \
+  model/dreamzero/action_head="$ACTION_HEAD_CONFIG" \
   model/dreamzero/transform=mobile_plan_cotrain \
   num_frame_per_block=8 \
   num_action_per_block=12 \
@@ -159,7 +207,7 @@ fi
   save_total_limit="$SAVE_TOTAL_LIMIT" \
   logging_steps="$LOGGING_STEPS" \
   do_eval="$DO_EVAL" \
-  eval_strategy=steps \
+  eval_strategy="$EVAL_STRATEGY" \
   eval_steps="$EVAL_STEPS" \
   per_device_eval_batch_size=1 \
   max_eval_samples="$MAX_EVAL_SAMPLES" \
@@ -179,4 +227,5 @@ fi
   image_encoder_pretrained_path="$IMAGE_ENCODER_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
   vae_pretrained_path="$WAN22_CKPT_DIR/Wan2.2_VAE.pth" \
   tokenizer_path="$TOKENIZER_DIR" \
-  pretrained_model_path=null
+  pretrained_model_path=null \
+  "$@"

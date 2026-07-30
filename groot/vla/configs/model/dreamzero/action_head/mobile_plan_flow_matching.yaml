@@ -28,6 +28,26 @@ action_head_cfg:
     control_fps: ${control_fps}
     base_flow_loss_weight: 1.0
     manipulator_flow_loss_weight: 1.0
+    plan_stats_path: null
+    plan_component_loss_weight: 0.0
+    base_eef_consistency_loss_weight: 0.0
+    base_xy_loss_weight: 1.0
+    base_yaw_loss_weight: 1.0
+    base_yaw_unit_loss_weight: 0.01
+    eef_position_loss_weight: 1.0
+    eef_rotation_loss_weight: 1.0
+    hand_loss_weight: 1.0
+    base_eef_consistency_position_loss_weight: 1.0
+    base_eef_consistency_rotation_loss_weight: 1.0
+    physical_loss_huber_beta: 0.1
+    plan_component_loss_start_step: 0
+    plan_component_loss_ramp_steps: 0
+    base_eef_consistency_loss_start_step: 0
+    base_eef_consistency_loss_ramp_steps: 0
+    log_loss_gradient_metrics: false
+    loss_gradient_log_interval: 50
+    plan_component_target_gradient_ratio: 0.2
+    base_eef_consistency_target_gradient_ratio: 0.075
     diffusion_model_cfg:
       _target_: groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan.WanVideoDiTDualPlan
       action_dim: ${max_manipulator_action_dim}

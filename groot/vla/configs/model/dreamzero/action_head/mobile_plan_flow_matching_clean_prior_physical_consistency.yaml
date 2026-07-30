@@ -1,0 +1,23 @@
+# @package _global_
+# Clean Base Prior plus physical plan-component and consistency objectives.
+
+defaults:
+  - mobile_plan_flow_matching_clean_prior
+  - _self_
+
+action_head_cfg:
+  config:
+    # Initial safe values only. Replace with calibrated weights.
+    plan_component_loss_weight: 0.2
+    base_eef_consistency_loss_weight: 0.05
+    plan_component_loss_start_step: 200
+    plan_component_loss_ramp_steps: 500
+    base_eef_consistency_loss_start_step: 700
+    base_eef_consistency_loss_ramp_steps: 500
+    base_yaw_unit_loss_weight: 0.01
+    base_eef_consistency_position_loss_weight: 1.0
+    base_eef_consistency_rotation_loss_weight: 1.0
+    log_loss_gradient_metrics: true
+    loss_gradient_log_interval: 50
+    plan_component_target_gradient_ratio: 0.2
+    base_eef_consistency_target_gradient_ratio: 0.075

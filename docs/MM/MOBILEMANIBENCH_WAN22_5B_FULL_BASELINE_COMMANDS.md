@@ -1,7 +1,8 @@
-# MobileManiBench → DreamZero WAN2.2-5B 全量 Baseline 命令记录
+# MobileManiBench → DreamZero WAN2.2-5B 训练与验证命令
 
-> 当前脚本默认使用五任务数据集和 10,000 steps；full G1 命令通过环境变量显式覆盖。
-> 下文保留全量转换/划分记录，同时给出当前 five-task 训练默认值。
+> 当前脚本默认使用五任务数据集、10,000 steps、`clean_prior +
+> physical_consistency`；无 prior baseline 通过环境变量显式选择。
+> 下文保留全量转换/划分记录，同时给出当前 five-task 训练入口。
 > 实现状态和关键张量合同见 [README.md](./README.md)。
 
 ## 1. 实验目标与固定路径
@@ -216,6 +217,8 @@ rotation6d_max_abs_row_dot: 8.467148404633917e-08
 ```bash
 MOBILEMANIBENCH_DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_smoke_v2/g1 \
 OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_dual_plan_g1_wan22_5b_smoke_50step \
+MOBILE_PLAN_ARCHITECTURE=dual_plan \
+MOBILE_PLAN_LOSS_PROFILE=flow_only \
 MAX_STEPS=50 \
 SAVE_STEPS=50 \
 bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
@@ -226,9 +229,22 @@ Smoke 只用于确认模型加载、forward/backward、双路 loss 和 checkpoin
 
 ## 6. Step 5：训练 Preflight
 
+当前 sparse prior + physical consistency：
+
 ```bash
+MOBILE_PLAN_ARCHITECTURE=clean_prior \
+MOBILE_PLAN_LOSS_PROFILE=physical_consistency \
 PREFLIGHT_ONLY=1 \
-bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+```
+
+无 prior 双路 baseline：
+
+```bash
+MOBILE_PLAN_ARCHITECTURE=dual_plan \
+MOBILE_PLAN_LOSS_PROFILE=flow_only \
+PREFLIGHT_ONLY=1 \
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```
 
 必须以如下输出结束：
@@ -250,12 +266,28 @@ tokenizer
 
 ## 7. Step 6：启动训练
 
-当前脚本默认运行五任务 baseline：
+当前脚本默认运行五任务 sparse clean-prior + physical-consistency 训练：
 
 ```bash
 cd /mnt/yihao/codes/dreamzero
 
-bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+MOBILE_PLAN_ARCHITECTURE=clean_prior \
+MOBILE_PLAN_LOSS_PROFILE=physical_consistency \
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+```
+
+这等价于脚本当前默认选择。实际模型内部为 `3 clean prior + 12 noisy flow = 15`
+registers；clean prior 配置为 `[8,16,24]`、Base+EEF heads、future-base EEF target。
+若启动摘要仍打印旧的 `6 clean Base Prior / 18 internal` 文本，应以 resolved Hydra
+config 和模型实际 layout 为准。
+
+无 prior、flow-only baseline 必须显式选择，避免与 clean-prior checkpoint 混用：
+
+```bash
+MOBILE_PLAN_ARCHITECTURE=dual_plan \
+MOBILE_PLAN_LOSS_PROFILE=flow_only \
+OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline \
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 ```
 
 当前默认参数：
@@ -263,9 +295,9 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 | 参数 | 数值 |
 |---|---:|
 | Backbone | `Wan2.2-TI2V-5B` |
-| GPU | 8 |
+| GPU | 1（可用 `NUM_GPUS` 覆盖） |
 | Per-device train batch | 32 |
-| Global batch | 256 |
+| Global batch | `NUM_GPUS × 32`，默认 32 |
 | Gradient accumulation | 1 |
 | MAX_STEPS | 10000 |
 | Learning rate | `1e-5` |
@@ -281,16 +313,16 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 | Online eval samples | 1024 |
 | Seed | 42 |
 
-训练输出：
+当前 clean-prior 默认训练输出：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline
+/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_clean_prior_physical_consistency
 ```
 
 训练日志：
 
 ```text
-/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_baseline/loss_log.jsonl
+<OUTPUT_DIR>/loss_log.jsonl
 ```
 
 使用相同命令重新启动时，框架会检查该 output directory 下的最新 checkpoint 并自动
@@ -300,7 +332,9 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 
 ```bash
 MOBILEMANIBENCH_DATA_ROOT=/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero/g1 \
-OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_full_wan22_5b_baseline \
+OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_g1_full_wan22_5b_clean_prior_physical_consistency \
+MOBILE_PLAN_ARCHITECTURE=clean_prior \
+MOBILE_PLAN_LOSS_PROFILE=physical_consistency \
 MAX_STEPS=200000 \
 SAVE_STEPS=5000 \
 EVAL_STEPS=5000 \
@@ -309,6 +343,33 @@ bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 
 脚本启动摘要目前打印 `scheduler=cosine`，但真正传给 Hydra 的配置是
 `cosine_with_min_lr + min_lr_rate=0.1`；应以 resolved config 为准。
+
+### 7.1 配置 sparse prior 目标
+
+在
+`groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_clean_prior.yaml`
+中修改：
+
+```yaml
+prior:
+  time_offsets: [8, 16, 24]
+  predict_base: true
+  predict_eef: true
+  eef_frame: future_base
+```
+
+约束与含义：
+
+- `time_offsets` 必须是 `[1,4,8,12,16,24]` 的严格递增子集，其长度决定 prior token 数；
+- `predict_base/predict_eef` 可分别形成 Base-only、EEF-only 或 Base+EEF；
+- `eef_frame=future_base` 的 target 在训练时由 clean action 动态转换，不需要重建数据；
+- EEF prior 只预测 `xyz+rotation6d`，不预测 hand；
+- flow 输出仍是实际规划结果，prior 输出只用于 condition、辅助 loss 与诊断。
+
+同一配置文件还提供 Base、EEF、joint composition 三项 prior loss 的 weight、
+start step、ramp steps 和 gradient target ratio。当前初始总权重分别为 `0.1/0.1/0.05`。
+修改这些权重后应重新运行 preflight，并用 calibration/gradient log 检查 auxiliary
+loss 是否压过 flow 主目标。
 
 ## 8. Step 7：训练期间验证
 
@@ -333,6 +394,10 @@ dynamics_loss
 action_loss
 base_flow_loss
 manipulator_flow_loss
+base_xy_loss / base_yaw_loss
+eef_position_loss / eef_rotation_loss / hand_loss
+base_eef_consistency_loss
+base_prior_loss / eef_prior_loss / joint_prior_consistency_loss
 learning_rate
 ```
 
@@ -592,7 +657,8 @@ bash scripts/eval/mobilemanibench_vggt_validate.sh
 3. prepare_mobilemanibench_plan_metadata.py --split train
 4. 可选：smoke 50-step
 5. PREFLIGHT_ONLY=1
-6. 默认启动 five-task 10000-step baseline；full G1 时显式覆盖路径和步数
+6. 显式选择 `clean_prior/dual_plan` 与 `physical_consistency/flow_only` 后启动；
+   当前默认是 five-task 10000-step clean-prior + physical-consistency
 7. 默认每 2000 step 先保存 checkpoint，再计算 eval_loss
 8. 在 split=val 的固定 1024 样本上运行离线轨迹评估
 9. 比较多个 checkpoint，选择验证指标最优模型

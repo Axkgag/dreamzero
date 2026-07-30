@@ -70,15 +70,27 @@ class FlowMatchScheduler():
     #     sample = (1 - sigma) * original_samples + sigma * noise
     #     return sample
     
+    def sigma_from_timestep(self, timestep, *, device=None, dtype=None):
+        """Resolve scheduler timesteps to sigmas without breaking gradients elsewhere."""
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.as_tensor(timestep)
+        timestep_ids = torch.argmin(
+            (
+                self.timesteps.unsqueeze(1)
+                - timestep.detach().flatten().to(self.timesteps.device).unsqueeze(0)
+            ).abs(),
+            dim=0,
+        )
+        sigma = self.sigmas[timestep_ids].reshape(timestep.shape)
+        return sigma.to(device=device or timestep.device, dtype=dtype)
+
     def add_noise(self, original_samples, noise, timestep):
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(), dim = 0) 
-        sigma = self.sigmas[timestep_id].to(device=original_samples.device, dtype=original_samples.dtype)
+        sigma = self.sigma_from_timestep(
+            timestep, device=original_samples.device, dtype=original_samples.dtype
+        )
         while len(sigma.shape) < len(original_samples.shape):
             sigma = sigma.unsqueeze(-1)
-        sample = (1 - sigma) * original_samples + sigma * noise
-        return sample
+        return (1 - sigma) * original_samples + sigma * noise
 
     def training_target(self, sample, noise, timestep):
         target = noise - sample

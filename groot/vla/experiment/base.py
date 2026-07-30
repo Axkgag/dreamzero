@@ -412,7 +412,7 @@ class BaseTrainer(transformers.Trainer):
             outputs = model(inputs)
         ### For additional losses, track and log their moving averages
         for key, value in outputs.items():
-            if key.endswith("_loss") and key != "loss":
+            if key.endswith(("_loss", "_metric")) and key != "loss":
                 # Initialize queue if not exists
                 if key not in self.loss_queues:
                     self.loss_queues[key] = []

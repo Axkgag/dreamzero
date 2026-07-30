@@ -1,0 +1,51 @@
+# @package _global_
+# Configurable sparse clean Base/EEF Prior with directed Flow conditioning.
+
+defaults:
+  - mobile_plan_flow_matching
+  - _self_
+
+action_head_cfg:
+  _target_: groot.vla.model.dreamzero.action_head.mobile_plan_clean_prior_flow_matching.MobilePlanCleanPriorFlowMatchingActionHead
+  config:
+    _target_: groot.vla.model.dreamzero.action_head.mobile_plan_clean_prior_flow_matching.MobilePlanCleanPriorPolicyHeadConfig
+    plan_stats_path: ${mobilemanibench_data_root}/meta/plan_stats.json
+    prior_condition_mode: normal
+    prior:
+      # Must be a strictly increasing subset of plan_time_offsets. Its length
+      # determines the number of shared clean Prior tokens.
+      time_offsets: [8, 16, 24]
+      predict_base: true
+      predict_eef: true
+      eef_frame: future_base
+    base_prior_loss_weight: 0.1
+    base_prior_xy_loss_weight: 1.0
+    base_prior_yaw_loss_weight: 1.0
+    base_prior_unit_loss_weight: 0.01
+    base_prior_loss_start_step: 200
+    base_prior_loss_ramp_steps: 500
+    base_prior_target_gradient_ratio: 0.1
+    eef_prior_loss_weight: 0.1
+    eef_prior_position_loss_weight: 1.0
+    eef_prior_rotation_loss_weight: 1.0
+    eef_prior_loss_start_step: 200
+    eef_prior_loss_ramp_steps: 500
+    eef_prior_target_gradient_ratio: 0.1
+    joint_prior_consistency_loss_weight: 0.05
+    joint_prior_consistency_position_loss_weight: 1.0
+    joint_prior_consistency_rotation_loss_weight: 1.0
+    joint_prior_consistency_loss_start_step: 700
+    joint_prior_consistency_loss_ramp_steps: 500
+    joint_prior_consistency_target_gradient_ratio: 0.05
+    diffusion_model_cfg:
+      _target_: groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan_prior.WanVideoDiTDualPlanPrior
+      action_dim: ${max_manipulator_action_dim}
+      num_action_per_block: ${num_action_per_block}
+      plan_horizon: ${plan_horizon}
+      base_action_dim: ${base_action_dim}
+      manipulator_action_dim: ${max_manipulator_action_dim}
+      max_state_dim: ${max_state_dim}
+      plan_time_offsets: ${plan_time_offsets}
+      prior: ${action_head_cfg.config.prior}
+      control_fps: ${control_fps}
+      prior_condition_mode: ${action_head_cfg.config.prior_condition_mode}

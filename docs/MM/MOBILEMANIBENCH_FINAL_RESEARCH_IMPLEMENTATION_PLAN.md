@@ -1,7 +1,7 @@
 # MobileManiBench 最终研究方案实施修改计划
 
-> 状态：**滚动实施计划；Phase 0–2 与独立 VGGT tokenizer 已实现，其余阶段见状态表**
-> 初版日期：2026-07-23；Base Prior 阶段补充：2026-07-30
+> 状态：**滚动实施计划；Phase 0–4 与独立 VGGT tokenizer 已实现，当前重点是训练消融与 Phase 6 集成**
+> 初版日期：2026-07-23；当前实现校对：2026-07-30
 > 目标仓库：`/mnt/yihao/codes/dreamzero`
 > 数据集：smoke v2 用于链路测试，G1 five-task 用于当前正式实验
 > 相关文档：[当前状态入口](./README.md)、[vggt_3d_wam_proposal.md](../vggt_3d_wam_proposal.md)、[MOBILEMANIBENCH_TO_DREAMZERO.md](./MOBILEMANIBENCH_TO_DREAMZERO.md)
@@ -12,9 +12,9 @@
 |---|---|
 | Phase 0 | 已实现 |
 | Phase 1 | 已实现 |
-| Phase 2 | 已实现；当前训练为两路 masked flow loss |
-| Phase 3 | 未实现；slice/consistency 只有计划与离线指标 |
-| Phase 4 | 未实现；Base Prior 尚无代码 |
+| Phase 2 | 已实现；两路 masked flow loss 可独立运行 |
+| Phase 3 | 已实现；physical slice 与 Base–EEF relative-pose consistency 可配置 |
+| Phase 4 | 已实现；可配置 sparse clean Base/EEF Prior，默认 3 个 offsets |
 | Phase 5 | tokenizer 已实现并在独立训练，表示质量仍需实验确认 |
 | Phase 6 | 未实现；VGGT tokens 尚未接入 WAM |
 | Phase 7 | 离线 evaluator 已实现；控制器/仿真闭环未实现 |
@@ -39,8 +39,8 @@ future 24-step EEF delta + hand command
 ```text
 Observation + language/state + 2D/3D tokens
         ↓
-clean Base Prior tokens
-└── coarse future base waypoints / low-frequency mobility intention
+clean sparse Prior tokens
+└── coarse future Base/EEF waypoints / low-frequency action intention
         ↓ condition refinement
 noisy Base plan tokens
 └── refined future base waypoints
@@ -52,10 +52,10 @@ noisy Manipulator plan tokens
 最终模型需要同时满足：
 
 1. Base 和 Manipulator 使用独立 noisy token 序列、输入投影、输出投影和 token-type embedding。
-2. 独立 clean Base Prior queries 预测 coarse waypoints，并条件化两路 noisy plan refinement。
+2. 一组共享 clean Prior queries 通过解耦的 Base/EEF heads 预测 coarse waypoints，并条件化两路 noisy plan refinement。
 3. 三类 token 共同进入 DreamZero causal DiT，并通过有向 attention 防止 Base Prior 读取 future/noisy flow variables。
 4. Manipulator 只有一路 token，但内部按 EEF position、EEF rotation、hand configuration 三个 slice 归一化和计算 loss。
-5. coarse Base Prior、refined Base/Manipulator 计划使用同一锚点坐标系 `B(t)`、同一 future offsets 和同一 horizon valid mask。
+5. prior offsets 是 flow offsets 的严格递增子集；Base prior 使用 `B(t)`，EEF prior 可动态转换到 `B(t+h)`，并复用对应 horizon valid mask。
 6. 2D tokens 是主视觉表示，3D tokens 提供 coarse geometry-aware spatial understanding。
 7. 当前可运行的 `mobilemanibench_training.sh` 保留为 baseline，不被研究版修改破坏。
 
@@ -250,10 +250,10 @@ manipulator_loss_mask
 Phase 0  固化 baseline 与测试基线
 Phase 1  Plan 数据读取、reshape、mask、stats
 Phase 2  双路 Base/Manipulator action tokens
-Phase 3  分 slice loss 与两路一致性约束
-Phase 4  clean Base Prior tokens 与 coarse waypoint head
+Phase 3  physical slice loss 与 Base–EEF 一致性约束
+Phase 4  configurable sparse clean Base/EEF Prior
 Phase 5  VGGT 2D/3D tokenizer 独立训练
-Phase 6  2D/3D tokens 接入 WAM，并扩展 Base Prior condition
+Phase 6  2D/3D tokens 接入 WAM，并扩展 sparse Prior condition
 Phase 7  推理、控制接口与完整评估
 ```
 
@@ -608,7 +608,17 @@ manipulator flow matching
 - 模型可生成 `[B,6,4]` 和 `[B,6,21]`。
 - G1 padding 维不会影响 loss。
 
-## 9. Phase 3：分 Slice Loss 与两路一致性
+## 9. Phase 3：Physical Slice Loss 与两路一致性（已实现）
+
+实现位于
+`groot/vla/model/dreamzero/action_head/mobile_plan_physical_losses.py`，由
+`mobile_plan_flow_matching_physical_consistency*.yaml` 及其 clean-prior 组合配置
+启用。它保留 Base/Manipulator flow matching 主目标，并由 flow velocity 恢复 clean
+plan 后计算物理量 loss：
+
+```text
+pred_clean_action = noisy_action - sigma * predicted_velocity
+```
 
 ### 9.1 Manipulator Slice Loss
 
@@ -621,7 +631,7 @@ L_manipulator =
   + lambda_hand    * L_hand
 ```
 
-建议第一版：
+当前实现：
 
 ```text
 EEF position: Huber or L1
@@ -639,7 +649,7 @@ L_base =
   + lambda_base_yaw * L_yaw
 ```
 
-其中：
+当前实现：
 
 ```text
 L_xy: Huber/L1
@@ -658,7 +668,7 @@ hat_T_Bk_Ek
 = inverse(hat_T_Bt_Bk) @ hat_T_Bt_Ek
 ```
 
-真值：
+clean target 中的相对位姿：
 
 ```text
 T_Bk_Ek
@@ -685,9 +695,25 @@ differentiable IK loss
 
 先作为离线指标或 inference reranking。只有坐标系、相机标定和几何监督通过 QA 后再启用。
 
-### 9.5 Loss 日志
+### 9.5 权重、调度与日志
 
-必须分别记录：
+当前初始配置：
+
+```text
+plan_component_loss_weight            = 0.2
+plan_component_loss_start_step        = 200
+plan_component_loss_ramp_steps        = 500
+
+base_eef_consistency_loss_weight      = 0.05
+base_eef_consistency_loss_start_step  = 700
+base_eef_consistency_loss_ramp_steps  = 500
+```
+
+Base XY/yaw、EEF position/rotation、hand 的内部权重初始均为 `1.0`，Base yaw unit
+regularization 为 `0.01`。配置同时记录 auxiliary-to-flow gradient ratio；这些数值
+是可运行的初始值，不应在没有 calibration 与验证消融时解释为最终最优权重。
+
+训练分别记录：
 
 ```text
 base_flow_loss
@@ -702,7 +728,11 @@ dynamics_loss
 total_loss
 ```
 
-### 9.6 验收标准
+### 9.6 当前验证边界
+
+shape、mask、SO(3) 与 loss/gradient 的轻量测试已覆盖于
+`tests/model/test_mobile_plan_physical_losses.py`。完整 GPU 训练与 checkpoint 对比仍
+需验证：
 
 - 每个 slice loss 在 smoke overfit 中下降。
 - `plan_valid=false` 的位置不改变 loss。
@@ -710,192 +740,174 @@ total_loss
 - rotation 输出经过正交化后 determinant 接近1。
 - 反归一化后的 hand 不超出合理 joint range。
 
-## 10. Phase 4：Clean Base Prior Tokens 与 Coarse Waypoint Head
+## 10. Phase 4：Configurable Sparse Clean Base/EEF Prior（已实现）
 
-### 10.1 目的与定位
+### 10.1 目的与 token 布局
 
-在现有两路 noisy flow tokens 之外，加入一组不加 flow noise 的 Base Prior
-queries，为同一次 WAM/DiT forward 提供低频移动意图：
+当前实现不是把 flow 的 6 个 horizon 原样复制成另一条稠密 action stream，而是在同一
+WAM/DiT forward 中加入 `K` 个不加 flow noise 的稀疏引导 token：
 
 ```text
-6 clean Base Prior tokens
+K clean Prior tokens（默认 K=3）
 6 noisy Base plan tokens
 6 noisy Manipulator plan tokens
 ```
 
-三类 token 不可混为一谈：
+默认布局为 15 个内部 action registers。clean prior 是辅助监督和 flow condition，
+不是可独立执行的 planner；最终控制仍使用 flow 采样得到的 refined Base 与
+Manipulator plan。
 
-| Token | 是否加 flow noise | 监督与作用 |
-|---|---:|---|
-| Base Prior | 否 | 直接预测 coarse Base waypoints，并条件化后两路 refinement |
-| Base plan | 是 | flow matching 生成 refined Base waypoints |
-| Manipulator plan | 是 | flow matching 生成 EEF pose 与 hand configuration |
+### 10.2 配置与时间接口
 
-Base Prior 是同一个 WAM 内部的 clean latent queries，不是额外串联的 planner，也不能
-在推理前离线预计算。最终用于控制的仍是 refined Base plan；coarse prior 作为中间
-监督、调试输出和 refinement condition。
+配置位于
+`groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_clean_prior.yaml`：
 
-### 10.2 Token 与时间接口
-
-Base Prior 与最终计划采用相同的六个 horizon：
-
-```text
-PLAN_OFFSETS = [1, 4, 8, 12, 16, 24]
-base_prior_i = learnable_query_i
-             + horizon_embedding(PLAN_OFFSETS[i] / CONTROL_FPS)
-             + base_prior_type_embedding
+```yaml
+prior:
+  time_offsets: [8, 16, 24]
+  predict_base: true
+  predict_eef: true
+  eef_frame: future_base
 ```
 
-张量约定：
+`prior.time_offsets` 必须是 `[1,4,8,12,16,24]` 的严格递增子集，token 数由其长度自动
+确定。每个 token 使用真实 offset/time embedding，不用普通索引代替真实时间。
+
+支持的目标组合：
+
+| 配置 | 输出 |
+|---|---|
+| `predict_base=true, predict_eef=false` | Base-only prior |
+| `predict_base=false, predict_eef=true` | EEF-only prior |
+| `predict_base=true, predict_eef=true` | Base+EEF prior 与 joint composition |
+
+当前正式配置启用 Base+EEF；Base-only / EEF-only 是直接修改 YAML 即可运行的消融。
+hand 不属于 prior 目标。
+
+### 10.3 Shared tokens、解耦 heads 与输出
+
+Base 和 EEF 共用同一组 horizon-aware prior hidden tokens，让一个 coarse intent 同时
+为 mobility 与 manipulation 提供条件；输出 heads 保持解耦，避免不同物理量被迫共享
+最后一层回归：
 
 ```text
-base_prior_tokens:       [B, 6, D]
-coarse_base_waypoints:   [B, 6, 4]
-base_prior_valid_mask:   [B, 6]
+prior hidden [B,K,D]
+├── BasePriorHead -> base_prior_pred [B,K,4]
+└── EEFPriorHead  -> eef_prior_pred  [B,K,9]
 ```
 
-`coarse_base_waypoints[...,0:2]` 表示 `B_anchor` 中的 x/y，
-`[...,2:4]` 表示 `sin(yaw)/cos(yaw)`。不得用普通序号 `0..5` 代替真实时间
-offset，也不得为 Base Prior 采样 flow timestep 或添加 action noise。
+Base 为 `x,y,sin(yaw),cos(yaw)`；EEF 为 `xyz+rotation6d`，不包含 hand。内部 packed
+action 仍保持 21 维兼容接口，但 Base flow 只读取/监督前 4 维，prior auxiliary
+channels 不会成为 flow 执行动作。
 
-### 10.3 Condition 与分阶段依赖
+### 10.4 坐标系与动态 target
 
-Phase 4 先使用当前 WAM 已有的 clean context：
+Base prior 与原 Base plan 一样表达在当前锚点 `B(t)`。数据集现有 Manipulator clean
+target 表达在 `B(t)`；当 `eef_frame=future_base` 时，训练期间用 clean action 动态
+构造 target：
 
 ```text
-language + robot state + observed/history visual context
- -> clean Base Prior hidden states
+T_B(t+h)_EEF(t+h)
+  = inverse(T_B(t)_B(t+h)) @ T_B(t)_EEF(t+h)
 ```
 
-这样可以在 VGGT tokenizer 完成前独立验证 prior 结构。Phase 6 再扩展为：
+因此不需要重跑数据转换。`eef_frame` 的语义是监督坐标变换，不允许用 predicted/noisy
+Base 构造 direct EEF target，以免 target 随预测漂移。
+
+### 10.5 Attention 与防泄漏
+
+实现采用有向信息流：
 
 ```text
-language + robot state
-+ multi-view history z_2d
-+ metric history z_3d
- -> clean Base Prior hidden states
+clean context -> clean Prior
+clean context + clean Prior -> noisy Base/Manipulator flow
 ```
 
-Phase 4 不允许伪造或预留全零 `z_3d` 来声称已经完成 3D conditioning。
-
-### 10.4 Attention 与防泄漏
-
-第一版使用有向信息流：
+prior 可读取 observation、language/state 与 prior peers，但不能读取 noisy flow
+hidden states、future clean action 或 future clean observation。`prior_condition_mode`
+支持：
 
 ```text
-clean context -> Base Prior
-clean context + Base Prior -> noisy Base/Manipulator plan tokens
+normal    正常向 flow 提供 prior K/V
+masked    屏蔽 prior 对 flow 的条件作用
+shuffled  打乱 batch 内 prior condition，用于敏感性消融
 ```
 
-Base Prior 不读取：
+这些模式用于验证 flow 是否真正使用 prior，不能把 masked/shuffled 结果当成部署配置。
 
-- future clean Base/Manipulator targets；
-- future clean RGB、2D latent 或 3D latent；
-- 由 GT future state 计算的任何 condition；
-- noisy Base/Manipulator token hidden states。
+### 10.6 三类 prior loss
 
-最后一项用于避免 Base Prior 从包含 `x_t` 的 flow variables 建立训练捷径。实现上可采用
-block attention mask，或先更新 clean context/Base Prior、再让 flow tokens
-cross-attend prior hidden states。必须用 attention-leakage 单测验证，而不能只依赖
-代码注释。
-
-### 10.5 Coarse Head 与 Loss
-
-Base Prior hidden states 经独立轻量 MLP 输出：
-
-```text
-coarse_base_waypoints = BasePriorHead(base_prior_hidden)
-```
-
-监督使用与 Base plan 完全相同的 GT future waypoints、horizon mask 和
-normalization：
+Base direct loss：
 
 ```text
 L_base_prior =
-    lambda_prior_xy  * SmoothL1(coarse_xy, gt_xy)
-  + lambda_prior_yaw * yaw_sincos_loss(coarse_yaw, gt_yaw)
-  + lambda_prior_unit * unit_circle_regularization(coarse_yaw)
+    SmoothL1(base_xy)
+  + yaw_sincos_loss
+  + 0.01 * yaw_unit_circle_regularization
 ```
 
-总 action loss 增加：
+EEF direct loss：
 
 ```text
-L_action =
-    lambda_prior * L_base_prior
-  + lambda_base_flow * L_base_flow
-  + lambda_manip_flow * L_manipulator_flow
-  + existing slice/consistency losses
+L_eef_prior =
+    SmoothL1(eef_xyz in B(t+h))
+  + SO(3)_geodesic(rotation6d)
 ```
 
-第一版建议 `lambda_prior=0.25`（相对于 `lambda_base_flow=1.0`），并记录各分支
-gradient norm 后再调；不要一开始让 coarse loss 主导 shared DiT。Base Prior 端到端
-反传，不对 prior hidden states做 detach。
-
-### 10.6 配置、Checkpoint 与日志
-
-配置必须显式提供：
+joint composition loss 使用预测 Base 与预测 future-base EEF：
 
 ```text
-use_base_prior
-num_base_prior_tokens
-base_prior_loss_weight
-base_prior_xy_loss_weight
-base_prior_yaw_loss_weight
-base_prior_condition_on_2d
-base_prior_condition_on_3d
+hat_T_B(t)_EEF(t+h)
+  = hat_T_B(t)_B(t+h) @ hat_T_B(t+h)_EEF(t+h)
 ```
 
-Phase 4 中后两项分别对应现有 history visual context 和 `false`；Phase 6 接入 VGGT
-后再启用新 2D/3D adapters。Base Prior query、type/horizon embedding 和 coarse head
-必须进入 optimizer、checkpoint save/load 和 missing-key 白名单。
+再与 clean `T_B(t)_EEF(t+h)` 比较 position 与 rotation。它约束两个解耦 head 的组合
+几何一致性，不替代两项 direct supervision。
 
-日志至少增加：
+当前初始权重和调度：
 
 ```text
-base_prior_loss
-base_prior_xy_loss
-base_prior_yaw_loss
-base_prior_ade_m
-base_prior_fde_m
-base_prior_yaw_error_deg
-base_prior_gradient_norm
+base_prior_loss_weight                  = 0.1  (start 200, ramp 500)
+eef_prior_loss_weight                   = 0.1  (start 200, ramp 500)
+joint_prior_consistency_loss_weight     = 0.05 (start 700, ramp 500)
 ```
 
-### 10.7 推理行为
+若某一 head 被关闭，对应 direct loss 与 joint loss 的有效权重自动为零。训练同时记录
+各分支 loss、几何指标和 gradient ratio；正式权重应依据 calibration 输出与验证集
+消融确认，不能只按 total-loss 数值大小拍定。
 
-每次 receding-horizon 推理都重新建立 clean Base Prior queries，并在同一次 DiT
-采样中条件化 noisy Base/Manipulator tokens。接口可额外返回：
+### 10.7 推理行为与 checkpoint
+
+每次 receding-horizon 推理重新建立 clean prior queries，并在同一次 DiT 采样中
+condition noisy flow。接口可返回：
 
 ```python
 {
-    "base_prior": ...,       # [6,4]，诊断/可视化
-    "base_plan": ...,        # [6,4]，控制输出
-    "manipulator_plan": ..., # [6,10/21]，控制输出
+    "base_prior_pred": ...,  # [B,K,4]，可选诊断
+    "eef_prior_pred": ...,   # [B,K,9]，可选诊断
+    "base_plan": ...,        # [B,6,4]，flow 控制输出
+    "manipulator_plan": ..., # [B,6,10/21]，flow 控制输出
 }
 ```
 
-不得把 `base_prior` 直接发送给底盘控制器，除非 refined plan 无效且明确实现了安全
-fallback。
+prior 输出不直接发送给控制器。prior query、offset/type embedding、Base/EEF heads
+均进入 optimizer 和 checkpoint。无 prior 的结构回退使用
+`MOBILE_PLAN_ARCHITECTURE=dual_plan`；这比在 clean-prior 模型内保留空 token 更清晰，
+但两种 architecture 的新增参数不能假定 strict checkpoint-compatible。
 
-### 10.8 单测、消融与验收标准
+### 10.8 当前验证与待完成实验
 
-必须覆盖：
+`tests/model/test_mobile_plan_clean_prior.py` 已覆盖动态 token 数、offset 合法性、
+Base/EEF heads、future-base target、joint composition、mask 与 no-leakage 等轻量
+合同。配置解析、JSON serialization、physical-loss 与 dual-plan tests 也已通过。
 
-1. token shape、offset 对齐及 Base Prior 永不加 flow noise；
-2. invalid horizon 对 prior loss/gradient 的贡献为零；
-3. Base Prior 不能读取 future clean target 或 noisy action hidden states；
-4. prior query、coarse head 和 shared attention 参数获得非零梯度；
-5. checkpoint round-trip 后 coarse/refined 输出一致；
-6. 单样本 overfit 时 `base_prior_loss`、ADE/FDE 明显下降；
-7. 比较 `no prior / normal prior / masked or shuffled prior`。
+这些测试只证明实现合同成立。研究结论仍需：
 
-Phase 4 验收要求：
-
-- coarse prior 优于 stationary-base 和 dataset-mean waypoint 基线；
-- 加入 prior 后 refined Base/Manipulator 指标不劣于 Phase 3；
-- mask/shuffle prior 会可测量地改变 refined 输出，证明模型没有完全忽略 prior；
-- 无 future leakage，推理时只依赖可获得的 observation/context；
-- 关闭 `use_base_prior` 能无损回退到 Phase 3 checkpoint 路径。
+1. 比较 `dual_plan`、Base-only、EEF-only、Base+EEF；
+2. 比较 `normal/masked/shuffled` prior condition；
+3. 保持相同训练预算与离线评估样本，报告 coarse prior 和 refined flow 指标；
+4. 检查 prior 是否优于 stationary/dataset-mean baseline；
+5. 校准三类 prior loss 与 Phase 3 physical loss 的 gradient ratio。
 
 ## 11. Phase 5：VGGT 2D/3D Tokenizer
 
@@ -1223,14 +1235,24 @@ groot/vla/data/dataset/mobilemanibench_plan.py
 groot/vla/data/transform/mobile_plan.py
 groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py
 groot/vla/model/dreamzero/action_head/mobile_plan_flow_matching.py
+groot/vla/model/dreamzero/action_head/mobile_plan_physical_losses.py
+groot/vla/model/dreamzero/action_head/mobile_plan_clean_prior_flow_matching.py
 groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan.py
+groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan_prior.py
 groot/vla/configs/data/dreamzero/mobilemanibench_plan.yaml
 groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching.yaml
+groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_physical_consistency*.yaml
+groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_clean_prior*.yaml
 groot/vla/configs/model/dreamzero/transform/mobile_plan_cotrain.yaml
 scripts/train/mobilemanibench_plan_training.sh
+scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+scripts/train/calibrate_mobile_plan_loss_weights.py
 tests/data/test_mobilemanibench_plan_dataset.py
 tests/data/test_mobilemanibench_plan_transform.py
 tests/model/test_mobile_plan_phase2.py
+tests/model/test_mobile_plan_dual_plan.py
+tests/model/test_mobile_plan_physical_losses.py
+tests/model/test_mobile_plan_clean_prior.py
 
 groot/vla/model/vggt_3d_wam/
 groot/vla/experiment/vggt_3d_wam.py
@@ -1244,9 +1266,6 @@ tests/model/test_vggt_*.py
 ### 14.3 尚待新增或扩展
 
 ```text
-Phase 3 slice/consistency training losses and tests
-groot/vla/model/dreamzero/modules/base_prior.py
-Base Prior attention/no-leakage tests
 VGGT-to-WAM adapters and joint training config
 scripts/inference/mobilemanibench_plan_policy.py
 controller/simulation evaluation
@@ -1288,10 +1307,13 @@ scripts/data/convert_mobilemanibench_to_gear.py
 | invalid horizon gradient | 0 |
 | Base encoder gradient | non-zero |
 | Manipulator encoder gradient | non-zero |
-| Base Prior forward | `[B,6,4]` |
-| Base Prior flow noise | 永不添加 |
-| Base Prior gradient | non-zero |
-| Base Prior attention leakage | 不可读取 future/noisy flow variables |
+| Prior hidden | `[B,K,D]`，默认 `K=3` |
+| Base Prior forward | `[B,K,4]`，启用 Base head 时 |
+| EEF Prior forward | `[B,K,9]`，启用 EEF head 时 |
+| Prior flow noise | 永不添加 |
+| Base/EEF Prior gradient | 对启用的 head 为 non-zero |
+| future-base EEF target | 由 clean Base/EEF action 动态构造 |
+| Prior attention leakage | 不可读取 future/noisy flow variables |
 | checkpoint missing keys | 仅新模块 |
 | attention leakage | 不可读取 future clean target |
 
@@ -1318,6 +1340,8 @@ eef_rotation_loss
 hand_loss
 consistency_loss
 base_prior_loss
+eef_prior_loss
+joint_prior_consistency_loss
 base_prior_ade_m
 base_prior_fde_m
 ```
@@ -1405,22 +1429,24 @@ plan delta_indices=[0]
 - missing/unexpected key 白名单；
 - 确认新模块进入 optimizer。
 
-### 16.9 Base Prior 退化或被 Refined Plan 忽略
+### 16.9 Clean Prior 退化、冲突或被 Refined Plan 忽略
 
 风险：
 
-- prior 退化成只依赖 horizon 的 dataset-mean trajectory；
+- Base/EEF prior 退化成只依赖 horizon 的 dataset-mean trajectory；
 - shared attention 完全忽略 prior hidden states；
 - prior 从 noisy action variables 建立训练捷径；
-- `L_base_prior` 权重过大，反而损害 refined action flow。
+- Base、EEF、joint composition 或 Phase 3 auxiliary loss 的权重过大，反而损害
+  refined action flow。
 
 缓解：
 
 - 与 stationary-base、dataset-mean prior 比较；
 - 做 masked/shuffled-prior sensitivity test；
 - 使用有向 attention mask 并增加 no-leakage 单测；
-- 分别记录 coarse/refined ADE/FDE 与 gradient norm；
-- `lambda_prior` 从低权重 warmup，保持 `use_base_prior=false` 回退开关。
+- 分别记录 coarse/refined 指标与各分支 gradient ratio；
+- 使用分阶段 warmup/ramp，并通过 calibration 调整三类 prior 权重；
+- 分别运行 Base-only、EEF-only、Base+EEF，区分 head 冲突与 attention condition 收益。
 
 ## 17. 回滚和兼容策略
 
@@ -1448,14 +1474,18 @@ data=dreamzero/mobilemanibench_plan
 
 任何阶段失败时，可以直接切回 baseline，不需要回滚数据转换结果。
 
-Base Prior 还必须支持：
+无 prior 的结构回退由训练脚本显式选择：
 
-```text
-use_base_prior=false
+```bash
+MOBILE_PLAN_ARCHITECTURE=dual_plan
 ```
 
-关闭时 token layout、checkpoint loader 和推理输出退回 Phase 3 双路路径；旧 checkpoint
-只允许缺失 Base Prior 新增参数，不允许静默缺失已有 dual-plan 参数。
+clean-prior 内部的条件消融使用 `prior_condition_mode=masked/shuffled`，但这不会删除
+prior token 或 direct loss。Base-only / EEF-only 由 `prior.predict_base` 和
+`prior.predict_eef` 控制。旧 dual-plan checkpoint 加载 clean-prior architecture 时
+只允许缺失新增 prior 参数，不允许静默缺失已有 dual-plan 参数；不同 `K`、不同 heads
+或旧 6-token prior checkpoint 不能默认视为 strict-compatible，必须检查
+missing/unexpected/shape-mismatch 报告。
 
 ## 18. 实施里程碑与停止条件
 
@@ -1475,7 +1505,10 @@ use_base_prior=false
 - consistency loss 下降。
 - 组合后的相对 EEF 误差低于无一致性版本。
 
-### Milestone D：Base Prior Ready
+### Milestone D：Sparse Clean Prior Ready
+
+代码、配置、no-leakage 与几何 target 的轻量验收已完成；以下为尚需训练结果确认的
+研究验收：
 
 - coarse Base prior 优于 stationary/dataset-mean 基线。
 - refined plan 不劣于无 prior 的 Phase 3。
@@ -1604,32 +1637,38 @@ B. robot joint-limit normalization
 
 回复：同意
 
-### 19.9 Base Prior 信息流
+### 19.9 Sparse Clean Prior 信息流
 
 推荐：
 
 ```text
-clean context -> Base Prior -> noisy Base/Manipulator refinement
+clean context -> K clean Prior tokens -> noisy Base/Manipulator refinement
 ```
 
-Base Prior 与六个 `PLAN_OFFSETS` 一一对应，不加 flow noise，不读取 future clean target
-或 noisy flow hidden states；Phase 6 再增加 history `z_2d/z_3d` condition。
+`K=len(prior.time_offsets)`，当前为 `[8,16,24]` 三个 sparse waypoints，而不是与六个
+flow offsets 一一对应。Base/EEF 共用 prior hidden tokens、使用解耦 heads；EEF
+future-base target 从 clean action 动态构造。prior 不加 flow noise，不读取 future
+clean target 或 noisy flow hidden states；Phase 6 再增加 history `z_2d/z_3d`
+condition。
 
-待确认：是否同意。
+当前实现：已按此接口完成。
 
-回复：待确认
+配置可通过 `predict_base/predict_eef/eef_frame` 进行目标消融。
 
 ## 20. Review 后的执行顺序
 
-Phase 0–2 和独立 VGGT tokenizer 代码已经存在。下一轮 action/WAM 主线应从尚未完成
-的 Phase 3 开始：
+Phase 0–4 和独立 VGGT tokenizer 代码已经存在。当前执行顺序为：
 
-1. 实现并验证分 slice training loss 与 relative EEF consistency loss。
-2. 固化 Phase 3 checkpoint、离线指标和无泄漏测试。
-3. 实现 Phase 4 clean Base Prior queries、coarse head 和有向 attention。
+1. 完成正在运行的 clean-prior + physical-consistency 训练，确认 loss、gradient
+   diagnostics、checkpoint save/resume 与在线验证稳定。
+2. 在相同预算下运行 `dual_plan`、Base-only、EEF-only、Base+EEF，以及
+   `normal/masked/shuffled` prior 消融。
+3. 用固定 validation 样本和相同 flow sampling 参数比较 coarse prior 与 refined
+   Base/Manipulator 指标，校准 Phase 3 与三类 prior loss 权重。
 4. 独立继续 Phase 5 tokenizer 收敛与表示质量验证，选择可用 checkpoint。
-5. 只有 Phase 4 与 Phase 5 都通过验收后，进入 Phase 6 的 VGGT-to-WAM 集成。
+5. 只有 sparse prior 与 tokenizer 都通过经验验收后，进入 Phase 6 的 VGGT-to-WAM
+   集成；复用现有 prior，不重复实现另一套 coarse planner。
 6. 最后完成 Phase 7 控制接口和闭环评估。
 
-Phase 3/4 的 action 实现与 Phase 5 tokenizer 训练可以并行推进，但 Phase 6 不应绕过
-任一前置验收。
+Phase 3/4 的训练消融与 Phase 5 tokenizer 验证可以并行推进，但 Phase 6 不应绕过任一
+前置经验验收。

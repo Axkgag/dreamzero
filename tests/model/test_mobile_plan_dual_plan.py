@@ -24,7 +24,7 @@ class _UnitWeightScheduler:
         return torch.ones_like(timestep, dtype=torch.float32)
 
 
-class MobilePlanPhase2Test(unittest.TestCase):
+class MobilePlanDualPlanTest(unittest.TestCase):
     def test_validation_block_output_discards_empty_cache(self) -> None:
         hidden_states = torch.randn(2, 3, 4)
         result = _training_block_hidden_states((hidden_states, None))

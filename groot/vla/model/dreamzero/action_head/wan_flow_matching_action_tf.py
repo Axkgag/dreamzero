@@ -652,6 +652,9 @@ class WANPolicyHead(ActionHead):
         action_mask: torch.Tensor,
         has_real_action: torch.Tensor,
         timestep_action: torch.Tensor,
+        noisy_actions: torch.Tensor | None = None,
+        clean_actions: torch.Tensor | None = None,
+        action_model_aux: dict | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute the legacy single-stream masked flow-matching objective."""
         action_loss_per_sample = torch.nn.functional.mse_loss(
@@ -873,6 +876,9 @@ class WANPolicyHead(ActionHead):
                     action_mask=action_mask,
                     has_real_action=has_real_action,
                     timestep_action=timestep_action,
+                    noisy_actions=noisy_actions,
+                    clean_actions=actions,
+                    action_model_aux=None,
                 )
                 weighted_action_loss = action_losses["action_loss"]
                 loss = weighted_dynamics_loss + weighted_action_loss
@@ -986,10 +992,17 @@ class WANPolicyHead(ActionHead):
             obs_noise_pred = obs_noise_pred.clone()
             if action_noise_pred is not None:
                 action_noise_pred = action_noise_pred.clone()
+                self.capture_action_model_aux(index, action_noise_pred)
             else:
                 action_noise_pred = torch.tensor(0.0, device=obs_noise_pred.device) # dummy action noise prediction
             predictions.append((obs_noise_pred, action_noise_pred))
         return self._exchange_predictions(predictions)
+
+    def capture_action_model_aux(
+        self, context_index: int, action_model_prediction: torch.Tensor
+    ) -> None:
+        """Inference hook for direct, non-flow outputs packed by research heads."""
+        del context_index, action_model_prediction
 
     def _exchange_predictions(
         self,

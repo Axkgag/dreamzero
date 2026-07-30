@@ -1,7 +1,7 @@
 # MobileManiBench / VGGT 文档入口与当前实现状态
 
 > 校对日期：2026-07-30
-> 代码基准：`092f247`，并包含当前工作树中的文档与验证器修复
+> 代码基准：远程当前工作树（包含可配置 sparse clean prior 与 physical-consistency 实现）
 > 远程仓库：`/mnt/yihao/codes/dreamzero`
 
 本页是 MobileManiBench 相关文档的状态入口。代码、配置和脚本是实现事实的最终来源；
@@ -18,19 +18,20 @@ proposal 与 implementation plan 描述目标，历史报告只说明当时的�
 | 五任务平衡子集 | 已实现 | `create_mobilemanibench_task_subset.py` |
 | 双路 Base/Manipulator flow tokens | 已实现 | `mobile_plan_flow_matching.py`、`wan_video_dit_dual_plan.py` |
 | 分支 flow loss | 已实现 | `base_flow_loss`、`manipulator_flow_loss` |
-| Phase 3 slice training loss | **未实现** | 仍只有计划文档 |
-| Base/Manipulator consistency training loss | **未实现** | 离线相对位姿指标已实现，但不反传 |
+| Phase 3 physical slice training loss | 已实现 | `mobile_plan_physical_losses.py` |
+| Base/EEF relative-pose consistency training loss | 已实现 | physical-consistency action-head configs |
 | Wan2.2-5B 训练内 `eval_loss` | 已实现 | `BaseTrainer`、`mobilemanibench_plan_training_wan22_5b.sh` |
 | Wan2.2 checkpoint 离线轨迹 evaluator | 已修复 | `evaluate_mobilemanibench_plan.py` |
 | VGGT 2D/3D tokenizer | 已实现 | `groot/vla/model/vggt_3d_wam/` |
 | VGGT 独立训练、日志、验证、可视化 | 已实现 | `vggt_3d_wam.py`、对应 train/eval shell |
-| clean Base Prior tokens / coarse head | **未实现** | Phase 4 计划 |
+| configurable sparse clean Base/EEF Prior | 已实现 | `mobile_plan_clean_prior_flow_matching.py`、`wan_video_dit_dual_plan_prior.py` |
 | VGGT `z_2d/z_3d` 接入 WAM | **未实现** | Phase 6 计划 |
 | future 3D flow、控制器与仿真成功率 | **未实现** | 后续研究阶段 |
 
 “已实现”表示代码接口和相应轻量测试存在，不自动等价于全量训练已经收敛或任务成功率
-已经验证。Wan2.2 evaluator 的 `pretrained_model_path=null` 加载逻辑已经修复，但新的
-完整离线评估结果仍应由实际 checkpoint 运行后记录。
+已经验证。Wan2.2 evaluator 的 `pretrained_model_path=null` 加载逻辑已经修复。
+Phase 3/4 的轻量单测与训练启动链路已经通过，但 prior 是否改善最终轨迹指标，仍必须
+用相同 checkpoint 预算、相同验证样本和相同采样参数做消融后判断。
 
 ## 2. 当前关键合同
 
@@ -47,8 +48,64 @@ token 0..5   = Base，只有前4维有效
 token 6..11  = Manipulator，按 embodiment mask 有效
 ```
 
-两路标签均表示同一 `B_anchor` 坐标系中的 future realized state。当前训练只计算两路
-masked flow MSE；slice loss 与两路 consistency 目前仅存在于计划和离线指标中。
+两路标签均表示同一 `B_anchor=B(t)` 坐标系中的 future realized state。训练目标可由
+`MOBILE_PLAN_LOSS_PROFILE` 选择：
+
+- `flow_only`：Base/Manipulator masked flow matching；
+- `physical_consistency`：在 flow loss 之外，从预测 velocity 恢复 clean plan，增加
+  Base XY/yaw、EEF position/SO(3)、hand slice loss，以及 Base–EEF relative-pose
+  consistency。
+
+physical loss 只作用于有效 horizon 和有效 embodiment 维；collision、contact 与
+differentiable IK 仍未进入训练目标。
+
+### Sparse clean prior
+
+当前 `clean_prior` architecture 在 12 个 noisy flow tokens 之前加入 `K` 个不加 flow
+noise 的 clean prior tokens。`K` 由 `prior.time_offsets` 的长度决定，当前配置为：
+
+```yaml
+prior:
+  time_offsets: [8, 16, 24]
+  predict_base: true
+  predict_eef: true
+  eef_frame: future_base
+```
+
+因此当前内部布局是 `3 clean prior + 6 Base flow + 6 Manipulator flow = 15` tokens，
+而不是为六个 flow horizon 各复制一个 prior。`time_offsets` 必须是
+`PLAN_OFFSETS` 的严格递增子集。若要做 Base-only 消融，将 `predict_eef` 设为
+`false`；token 数不变，EEF 与 joint prior loss 自动不参与。
+
+一组共享的 prior hidden tokens 使用相互解耦的 Base head 与 EEF head：
+
+```text
+Base prior [B,K,4] = x, y, sin(yaw), cos(yaw)
+EEF prior  [B,K,9] = xyz + rotation6d（不预测 hand）
+```
+
+Base prior 表达在 `B(t)`；当 `eef_frame=future_base` 时，EEF prior 表达在
+`B(t+h)`。该 EEF target 在训练时由现有 clean Base/EEF action 动态构造：
+
+```text
+T_B(t+h)_EEF(t+h)
+  = inverse(T_B(t)_B(t+h)) @ T_B(t)_EEF(t+h)
+```
+
+不需要重新转换数据集。联合 composition loss 再把预测的 Base 与 future-base EEF
+组合回 `B(t)`，与 clean EEF target 比较。当前 direct loss 权重为 Base `0.1`、
+EEF `0.1`，joint composition 为 `0.05`，并分别 warm up/ramp；这些是初始安全值，
+正式实验前应结合 gradient diagnostics 校准。
+
+信息流为单向：
+
+```text
+clean context -> clean prior -> noisy Base/Manipulator flow
+```
+
+prior 不能读取 noisy flow hidden states。最终控制输出仍只使用 flow 采样得到的
+refined Base/Manipulator plan；`base_prior_pred` 和 `eef_prior_pred` 仅作为辅助监督、
+诊断与可视化输出。
 
 ### VGGT tokenizer
 
@@ -142,8 +199,15 @@ sibling episodes 可能跨 split。VGGT validation 可用于训练监控，但�
 ## 5. 常用入口
 
 ```bash
-# 五任务 Wan2.2-5B 双路 baseline
-bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+# 当前默认：3-token Base+EEF prior + physical consistency
+MOBILE_PLAN_ARCHITECTURE=clean_prior \
+MOBILE_PLAN_LOSS_PROFILE=physical_consistency \
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
+
+# 无 prior 的双路 flow baseline
+MOBILE_PLAN_ARCHITECTURE=dual_plan \
+MOBILE_PLAN_LOSS_PROFILE=flow_only \
+  bash scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 
 # 双路 checkpoint 离线轨迹评估
 bash scripts/eval/mobilemanibench_plan_eval.sh
@@ -156,5 +220,7 @@ CHECKPOINT=/absolute/path/to/checkpoint-N \
   bash scripts/eval/mobilemanibench_vggt_validate.sh
 ```
 
-需要覆盖默认值时使用脚本已经公开的环境变量；不要复制整段 Hydra 参数重新维护第二套
-启动命令。
+prior 的 offsets、预测目标、坐标系和三个 loss 权重在
+`groot/vla/configs/model/dreamzero/action_head/mobile_plan_flow_matching_clean_prior.yaml`
+中配置；architecture/loss profile、数据路径、输出目录和训练规模优先使用脚本公开的
+环境变量覆盖，不要复制整段 Hydra 参数维护第二套启动命令。

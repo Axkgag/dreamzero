@@ -1,5 +1,6 @@
 #!/bin/bash
-# Phase-2 MobileManiBench dual Base/Manipulator plan training.
+# MobileManiBench plan training with independently selectable architecture
+# and physical-loss profile.
 
 set -euo pipefail
 
@@ -32,9 +33,48 @@ DEFAULT_PER_DEVICE_BATCH_SIZE=1
 DEFAULT_WARMUP_RATIO="0.05"
 DEFAULT_WEIGHT_DECAY="1e-5"
 
+# Architecture options:
+#   dual_plan   - 6 Base + 6 Manipulator noisy flow tokens (12 total).
+#   clean_prior - 6 clean Base Prior + 12 noisy flow tokens (18 internal).
+MOBILE_PLAN_ARCHITECTURE=${MOBILE_PLAN_ARCHITECTURE:-clean_prior}
+
+# Loss-profile options:
+#   flow_only            - flow objectives only; clean_prior still retains
+#                          its direct Base Prior supervision.
+#   physical_consistency - adds physical plan-component and Base/EEF
+#                          consistency objectives.
+MOBILE_PLAN_LOSS_PROFILE=${MOBILE_PLAN_LOSS_PROFILE:-physical_consistency}
+
+case "$MOBILE_PLAN_ARCHITECTURE:$MOBILE_PLAN_LOSS_PROFILE" in
+  dual_plan:flow_only)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching
+    TOKEN_LAYOUT="6 Base + 6 Manipulator noisy tokens (12 total)"
+    ;;
+  dual_plan:physical_consistency)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_physical_consistency
+    TOKEN_LAYOUT="6 Base + 6 Manipulator noisy tokens (12 total)"
+    ;;
+  clean_prior:flow_only)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_clean_prior
+    TOKEN_LAYOUT="6 clean Base Prior + 12 noisy flow tokens (18 internal)"
+    ;;
+  clean_prior:physical_consistency)
+    ACTION_HEAD_CONFIG=mobile_plan_flow_matching_clean_prior_physical_consistency
+    TOKEN_LAYOUT="6 clean Base Prior + 12 noisy flow tokens (18 internal)"
+    ;;
+  *)
+    echo "ERROR: unsupported MobileManiBench plan configuration:" >&2
+    echo "  MOBILE_PLAN_ARCHITECTURE=$MOBILE_PLAN_ARCHITECTURE" >&2
+    echo "  MOBILE_PLAN_LOSS_PROFILE=$MOBILE_PLAN_LOSS_PROFILE" >&2
+    echo "Architecture options: dual_plan | clean_prior" >&2
+    echo "Loss-profile options: flow_only | physical_consistency" >&2
+    exit 2
+    ;;
+esac
+
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d_%H%M%S)"}
 MOBILEMANIBENCH_DATA_ROOT=${MOBILEMANIBENCH_DATA_ROOT:-"$DEFAULT_DATA_ROOT"}
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/work_dirs/mobilemanibench_dual_plan_g1_${RUN_ID}"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/work_dirs/mobilemanibench_${MOBILE_PLAN_ARCHITECTURE}_${MOBILE_PLAN_LOSS_PROFILE}_${RUN_ID}"}
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"/mnt/yihao/codes/checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"/mnt/yihao/codes/checkpoints/umt5-xxl"}
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-"/mnt/yihao/codes/checkpoints/DreamZero-AgiBot"}
@@ -87,10 +127,13 @@ for required_dir in "$WAN_CKPT_DIR" "$TOKENIZER_DIR" "$PRETRAINED_MODEL_PATH"; d
   fi
 done
 
-echo "MobileManiBench dual-plan configuration:"
+echo "MobileManiBench plan configuration:"
 echo "  data_root=$MOBILEMANIBENCH_DATA_ROOT"
 echo "  output_dir=$OUTPUT_DIR"
-echo "  token_layout=6 base + 6 manipulator"
+echo "  architecture=$MOBILE_PLAN_ARCHITECTURE"
+echo "  loss_profile=$MOBILE_PLAN_LOSS_PROFILE"
+echo "  token_layout=$TOKEN_LAYOUT"
+echo "  action_head_config=$ACTION_HEAD_CONFIG"
 echo "  plan_offsets=1,4,8,12,16,24"
 echo "  num_gpus=$NUM_GPUS"
 echo "  max_steps=$MAX_STEPS"
@@ -116,7 +159,7 @@ fi
   action_horizon=12 \
   num_views=2 \
   model=dreamzero/vla \
-  model/dreamzero/action_head=mobile_plan_flow_matching \
+  model/dreamzero/action_head="$ACTION_HEAD_CONFIG" \
   model/dreamzero/transform=mobile_plan_cotrain \
   num_frame_per_block=8 \
   num_action_per_block=12 \
@@ -151,4 +194,5 @@ fi
   tokenizer_path="$TOKENIZER_DIR" \
   pretrained_model_path="$PRETRAINED_MODEL_PATH" \
   ++action_head_cfg.config.skip_component_loading=true \
-  ++action_head_cfg.config.defer_lora_injection=true
+  ++action_head_cfg.config.defer_lora_injection=true \
+  "$@"

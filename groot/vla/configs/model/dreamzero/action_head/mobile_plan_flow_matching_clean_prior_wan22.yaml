@@ -1,0 +1,30 @@
+# @package _global_
+# Fixed 18-token clean Base Prior on Wan2.2-TI2V-5B.
+
+defaults:
+  - mobile_plan_flow_matching_clean_prior
+  - _self_
+
+frame_seqlen: 50
+
+action_head_cfg:
+  config:
+    target_video_height: 160
+    target_video_width: 320
+    diffusion_model_cfg:
+      model_type: "ti2v"
+      dim: 3072
+      in_dim: 48
+      concat_first_frame_latent: false
+      ffn_dim: 14336
+      out_dim: 48
+      freq_dim: 256
+      eps: 1e-6
+      num_heads: 24
+      num_layers: 30
+    vae_cfg:
+      _target_: groot.vla.model.dreamzero.modules.wan_video_vae.WanVideoVAE38
+      _convert_: object
+      z_dim: 48
+      dim: 160
+      vae_pretrained_path: ${vae_pretrained_path}

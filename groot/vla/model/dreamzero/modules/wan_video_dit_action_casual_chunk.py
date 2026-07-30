@@ -21,6 +21,7 @@ from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+import torch.utils.checkpoint
 import math
 import torch.distributed as dist
 import os
@@ -231,6 +232,24 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
+
+    def _cached_multimodal_attention(
+        self,
+        video_query,
+        video_key,
+        video_value,
+        cached_key,
+        cached_value,
+        action_query,
+        action_key,
+        action_value,
+    ):
+        """Inference hook; the legacy path keeps fully connected new tokens."""
+        return self.attn(
+            torch.cat([video_query, action_query], dim=1),
+            torch.cat([cached_key, video_key, action_key], dim=1),
+            torch.cat([cached_value, video_value, action_value], dim=1),
+        )
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
                                    action_len, state_len, num_image_blocks, 
@@ -1083,10 +1102,15 @@ class CausalWanSelfAttention(nn.Module):
             new_v = new_v[:, -self.max_attention_size:]
 
             if action_register_length is not None:
-                x = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([new_k, roped_action_key], dim=1),
-                    torch.cat([new_v, action_v], dim=1),
+                x = self._cached_multimodal_attention(
+                    roped_query,
+                    roped_key,
+                    v,
+                    updated_k,
+                    updated_v,
+                    roped_action_query,
+                    roped_action_key,
+                    action_v,
                 )
             else:
                 x = self.attn(
@@ -1786,9 +1810,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if action is not None:
             assert timestep_action is not None
             assert state_features is not None
-            stride = timestep_action.shape[1] // state_features.shape[1]
-            timestep_state = timestep_action[:, ::stride]
-            timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+            timestep_register, timestep_state = self._action_register_timesteps(
+                timestep_action, action_features, state_features
+            )
+            timestep = torch.cat(
+                [timestep, timestep_register, timestep_state], dim=1
+            )
 
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
@@ -1832,6 +1859,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x_video = self.head(x_video, e_video.unsqueeze(2))
 
         return x_video, action_noise_pred, updated_kv_caches
+
+    def _action_register_timesteps(
+        self,
+        timestep_action: torch.Tensor,
+        action_features: torch.Tensor,
+        state_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map flow timesteps onto action/state registers.
+
+        Subclasses may prepend clean registers while the legacy return value is
+        exactly the previous behavior.
+        """
+        del action_features
+        stride = timestep_action.shape[1] // state_features.shape[1]
+        return timestep_action, timestep_action[:, ::stride]
 
 
     def _forward_inference_trt(
@@ -2086,9 +2128,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if action is not None:
             assert timestep_action is not None
             assert state_features is not None
-            stride = timestep_action.shape[1] // state_features.shape[1]
-            timestep_state = timestep_action[:, ::stride]
-            timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
+            timestep_register, timestep_state = self._action_register_timesteps(
+                timestep_action, action_features, state_features
+            )
+            timestep = torch.cat(
+                [timestep, timestep_register, timestep_state], dim=1
+            )
 
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))

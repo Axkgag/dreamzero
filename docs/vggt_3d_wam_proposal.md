@@ -8,13 +8,13 @@ WAM 同时建模：
 
 - 多视角 2D appearance 与 future video；
 - coarse robot-centric geometry；
-- coarse Base mobility prior；
+- coarse sparse Base/EEF action prior；
 - refined Base 与 Manipulator action plans。
 
 方案分两阶段：
 
 1. 训练共享 VGGT-style backbone 的 2D/3D tokenizer；
-2. 将多视角 2D latent、3D representation 和 Base Prior 接入 causal WAM。
+2. 将多视角 2D latent、3D representation 接入已经具备 sparse clean prior 的 causal WAM。
 
 本文只描述方案、pipeline 和实施边界。当前 tokenizer 的逐文件实现见
 `docs/MM/MOBILEMANIBENCH_VGGT_CODE_CHANGES_BY_FILE.md`；当前能力边界见
@@ -31,13 +31,14 @@ WAM 同时建模：
 | metric 3D tokenizer、PointMap decoder | 已实现 |
 | tokenizer loss、训练、验证和可视化 | 已实现 |
 | Base/Manipulator dual-plan WAM | 已实现 |
-| clean Base Prior tokens 与 coarse waypoint head | 方案保留，当前代码尚未显式实现 |
+| configurable sparse clean Base/EEF Prior | 已实现；当前为 3 offsets、Base+EEF heads |
 | VGGT 多视角 `z_2d_video` 接入 WAM video stream | 未实现 |
 | `z_3d_video` 接入 WAM | 未实现 |
 | future 3D token/PointMap rollout | 未实现 |
 
-当前应先验证 Stage 1 表示质量，再实施 Stage 2；不能把 tokenizer 接口已实现等同于
-已经完成 WAM 集成，也不能把方案中的 Base Prior 写成当前代码已有模块。
+当前应先验证 Stage 1 表示质量和现有 prior 消融，再实施 Stage 2；不能把 tokenizer
+接口已实现等同于已经完成 WAM 集成。prior 本身已经是当前 WAM 代码的一部分，Stage 2
+要做的是让它进一步读取 VGGT multi-view `z_2d/z_3d`，不是重新实现 prior。
 
 当前还有一个评估边界：VGGT dataset 使用 seeded episode-level 90/10 split，而 WAM
 使用 `plan_splits.json` 的 source-trajectory group split。Stage 2 前应统一 split，
@@ -62,13 +63,13 @@ Stage 2: 3D-aware WAM
 clean history multi-view z_2d
 + noisy future multi-view z_2d
 + clean history z_3d
-+ clean Base Prior query tokens
++ clean sparse Base/EEF Prior query tokens
 + noisy Base plan tokens
 + noisy Manipulator plan tokens
 (+ optional noisy future z_3d)
   -> shared causal WAM
   -> future head/wrist z_2d
-  -> coarse Base prior trajectory
+  -> coarse Base/EEF prior waypoints
   -> refined Base plan + Manipulator plan
   -> optional future z_3d
   -> VGGT 2D/3D decoders
@@ -78,7 +79,7 @@ clean history multi-view z_2d
 
 - 多视角 2D tokens 负责 appearance 和 future video；
 - 3D tokens 负责 coarse metric geometry；
-- Base Prior 是 clean latent queries，负责低频 mobility intention；
+- sparse prior 是 clean latent queries，负责低频 mobility/manipulation intention；
 - Base/Manipulator plan tokens 是 flow matching 的 noisy generation variables；
 - 所有 stream 使用一致的时间 lattice、planning horizon 和坐标锚点；
 - MVP 先证明 3D context 与 Base Prior 有用，再增加 future 3D generation。
@@ -234,7 +235,7 @@ coarse geometry，不能用于毫米级重建或强 collision/contact labels。
 
 ## 5. Stage 2：接入 WAM
 
-### 5.1 Base、Manipulator 与 Base Prior 的关系
+### 5.1 Base、Manipulator 与 sparse clean prior 的关系
 
 当前仓库已实现 dual-plan flow stream：
 
@@ -250,13 +251,13 @@ coarse geometry，不能用于毫米级重建或强 collision/contact labels。
 `[x,y,sin(yaw),cos(yaw)]`；Manipulator token 联合表示 EEF pose 和 hand
 configuration。
 
-目标 WAM 还应恢复一组独立的 Base Prior tokens：
+当前 `clean_prior` architecture 已在同一 WAM 中加入可配置的 sparse clean tokens：
 
 ```text
-clean Base Prior query tokens
- -> read language + state + multi-view z_2d + z_3d
- -> coarse Base waypoint head
- -> low-frequency mobility prior
+K clean Prior query tokens（当前 K=3，offsets=[8,16,24]）
+ -> read current clean WAM context
+ -> independent Base / EEF waypoint heads
+ -> low-frequency action prior
  -> condition noisy Base/Manipulator plan refinement
 ```
 
@@ -264,30 +265,50 @@ clean Base Prior query tokens
 
 | Token | 是否加 flow noise | 作用 |
 |---|---:|---|
-| Base Prior | 否 | 预测 coarse 底座轨迹，提供低频移动意图 |
+| clean Prior | 否 | 预测 coarse Base/EEF waypoints，提供稀疏动作意图 |
 | Base plan | 是 | 生成 refined Base waypoints |
 | Manipulator plan | 是 | 生成 EEF pose 与 hand configuration |
 
-Base Prior 不是第二个独立模型，而是同一个 WAM/DiT 中的 clean horizon-aware queries：
+sparse prior 不是第二个独立模型，而是同一个 WAM/DiT 中的 clean horizon-aware
+queries。`time_offsets` 必须是 flow offsets 的严格递增子集；token 数由配置长度自动
+确定：
 
 ```text
-base_prior_i = learnable_query_i + horizon_embedding_i
+prior_i = learnable_query_i + horizon_embedding(real_time_offset_i)
 ```
 
-它通过 shared attention 读取 language、state、video 和 3D scene。中间或最终 hidden
-state 经轻量 MLP 输出 B_anchor 中的 coarse Base waypoints：
+当前一组 shared prior hidden states 经解耦 heads 输出：
 
 ```text
-coarse_base_prior = MLP(base_prior_hidden)
-L_base_prior = SmoothL1(coarse_base_prior, GT_base_waypoints)
+BasePriorHead -> [B,K,4]
+EEFPriorHead  -> [B,K,9]  # xyz + rotation6d，无 hand
 ```
 
-最终 noisy Base/Manipulator tokens 在同一次 DiT forward 中读取 Base Prior hidden
-states并完成联合 refinement。因此该结构是端到端的“内部 coarse-to-refined
-planning”，不是先运行一个 coarse planner、再运行另一个 policy。
+当前配置为：
 
-当前远程代码中尚未发现独立 Base Prior embedding、coarse head 或
-`L_base_prior`；它是 proposal 中应保留并接入现有 dual-plan WAM 的模块。
+```yaml
+prior:
+  time_offsets: [8, 16, 24]
+  predict_base: true
+  predict_eef: true
+  eef_frame: future_base
+```
+
+Base prior 表达在 `B(t)`。EEF prior 的 `B(t+h)` target 由现有 clean action 动态
+构造，不要求数据集新增字段：
+
+```text
+T_B(t+h)_EEF(t+h)
+  = inverse(T_B(t)_B(t+h)) @ T_B(t)_EEF(t+h)
+```
+
+训练包含 Base direct、EEF direct 和 Base+EEF joint composition 三项 prior loss。
+信息流为 `clean context -> prior -> noisy flow`，prior 不读取 noisy flow hidden
+states。最终 noisy Base/Manipulator tokens 在同一次 DiT forward 中读取 prior
+hidden states并完成 refinement；控制仍只采用 flow 输出。
+
+当前 prior 尚未读取 VGGT `z_2d/z_3d`。Stage 2 的任务是把这两种表示接入 clean
+context，并验证 geometry condition 对 coarse prior 和 refined flow 的增益。
 
 ### 5.2 推荐的两步 3D 集成
 
@@ -304,9 +325,9 @@ clean history multi-view z_2d
  -> WAM
 ```
 
-这一阶段同时预测 multi-view future video、coarse Base prior 和 refined dual plans，
-但暂不生成 future `z_3d`。它用于验证 metric 3D context 是否改善 Base Prior、
-action refinement 和 future video。
+这一阶段同时预测 multi-view future video、coarse Base/EEF prior 和 refined dual
+plans，但暂不生成 future `z_3d`。它用于验证 metric 3D context 是否改善 sparse
+prior、action refinement 和 future video。
 
 #### Step B：加入 future 3D denoising
 
@@ -406,15 +427,18 @@ Step A：
 ```text
 L_WAM_A =
     L_multiview_video_flow
-  + lambda_prior * L_base_prior
+  + lambda_base_prior * L_base_prior
+  + lambda_eef_prior * L_eef_prior
+  + lambda_joint_prior * L_joint_prior
   + lambda_base * L_base_flow
   + lambda_manip * L_manipulator_flow
 ```
 
-其中 `L_base_prior` 直接监督 clean Base Prior 的 coarse waypoints；
-`L_base_flow/L_manipulator_flow` 监督最终 refined plans。三者不是重复目标：
+其中三项 prior loss 直接监督 sparse coarse waypoints 及其组合几何，
+`L_base_flow/L_manipulator_flow` 监督最终 refined plans。两种层级不是两套可独立
+执行的完整 policy：
 
-- prior 学“底座大致应该去哪里”；
+- prior 学稀疏的 Base/EEF coarse intent；
 - Base flow 学 refined Base trajectory；
 - Manipulator flow 在同一 mobility context 下学习 EEF/hand trajectory。
 
@@ -444,10 +468,10 @@ IK、collision 和复杂 feasibility loss 属于后续 action-policy 研究，�
 head/wrist observation
  -> frozen VGGT tokenizer
  -> multi-view z_2d + history z_3d
- -> clean Base Prior queries
+ -> clean sparse Base/EEF Prior queries
  -> WAM joint flow sampling
  -> future head/wrist z_2d
- -> coarse Base prior
+ -> coarse Base/EEF prior
  -> refined Base plan + Manipulator plan
  -> VGGT decode_2d() -> future head/wrist video
 ```
@@ -458,7 +482,7 @@ head/wrist observation
 head/wrist observation
  -> frozen VGGT tokenizer
  -> clean history multi-view z_2d/z_3d
- -> Base Prior guided joint 2D/3D/action sampling
+ -> sparse Prior guided joint 2D/3D/action sampling
  -> future head/wrist video
  -> coarse/refined plans
  -> optional future PointMap
@@ -494,7 +518,7 @@ Stage 1 成功要求：
 ```text
 A. 原 Wan VAE + dual-plan WAM
 B. VGGT multi-view z_2d + dual-plan WAM
-C. B + Base Prior
+C. B + existing sparse Base/EEF Prior
 D. C + history z_3d context
 E. D + future z_3d denoising（可选）
 ```
@@ -502,7 +526,7 @@ E. D + future z_3d denoising（可选）
 同时报告：
 
 - head/wrist future video quality 与 cross-view consistency；
-- Base Prior coarse waypoint error；
+- Base/EEF Prior coarse waypoint error 与 joint composition error；
 - refined Base/Manipulator plan metrics；
 - task/rollout success；
 - future geometry（仅 E）；
@@ -510,7 +534,8 @@ E. D + future z_3d denoising（可选）
 
 还应使用：
 
-- no-Base-Prior ablation；
+- no-prior、Base-only、EEF-only、Base+EEF ablations；
+- normal/masked/shuffled prior-condition ablations；
 - shuffled/masked 3D context；
 - matched-capacity 非几何 context；
 - single-view 与 multi-view 对照；
@@ -526,7 +551,7 @@ E. D + future z_3d denoising（可选）
 - **Distribution mismatch**：VGGT 2D/3D latent 需要统计和归一化；
 - **Multi-view token cost**：同时预测 head/wrist 会增加 video sequence length；
 - **3D token cost**：raw 768-token grid 可能使注意力成本不可接受；
-- **Base Prior collapse**：prior 可能退化成普通 query，或被 refined Base tokens 忽略；
+- **Sparse Prior collapse**：prior 可能退化成普通 query，或被 refined flow tokens 忽略；
 - **Representation ignored**：WAM 可能完全忽略 3D context。
 
 所有实验应同时报告 coverage、token 数、吞吐和 matched-compute baseline。
@@ -538,8 +563,8 @@ E. D + future z_3d denoising（可选）
 1. 完成 Stage 1 训练，验证 head/wrist RGB、PointMap、coverage 和 latent statistics。
 2. 固化 tokenizer checkpoint 与 multi-view `encode()/decode_2d()/decode_3d()` 接口。
 3. 将全部 view 的 `z_2d` 接入 WAM video stream，验证 multi-view latent round-trip。
-4. 在现有 dual-plan WAM 中加入 clean Base Prior queries、coarse head 和
-   `L_base_prior`。
+4. 复用现有 sparse clean prior，先完成 Base-only、EEF-only、Base+EEF 及
+   normal/masked/shuffled 消融。
 5. 实现 Step A：加入只读 history `z_3d` context。
 6. 对比 single-view、multi-view、Base Prior 和 metric-3D ablations。
 7. 只有 Step A 有稳定增益时，实施 Step B 的 future 3D flow。
@@ -548,6 +573,6 @@ E. D + future z_3d denoising（可选）
 开始 Stage 2 编码前，需要明确：
 
 1. multi-view video tokens 在 causal block 中的排列和 attention mask；
-2. Base Prior token 数量及其与 6 个 plan horizons 的对应方式；
+2. 是否保持当前 `time_offsets=[8,16,24]`，或依据 prior 消融调整 sparse horizons；
 3. 3D 使用 resampler 还是 cross-attention；
 4. 可接受的显存、吞吐和推理延迟预算。

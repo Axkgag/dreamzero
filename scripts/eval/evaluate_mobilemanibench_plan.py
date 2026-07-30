@@ -45,6 +45,10 @@ torch._dynamo.config.cache_size_limit = max(
 
 from groot.vla.data.dataset import MobileManiBenchPlanDataset
 from groot.vla.data.transform import MobilePlanTransform
+from mobilemanibench_sampling import (
+    count_tasks_for_indices,
+    select_task_balanced_indices,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,25 +210,33 @@ def resolve_episode_split(dataset_root: Path, split: str) -> tuple[set[int], str
     raise ValueError(f"Unknown split {split!r}; available split metadata: {available}")
 
 
+def load_episode_tasks(dataset_root: Path) -> dict[int, str]:
+    rows = read_jsonl(dataset_root / "meta/episodes.jsonl")
+    episode_tasks: dict[int, str] = {}
+    for row in rows:
+        tasks = row.get("tasks", [])
+        if not tasks:
+            raise ValueError(
+                f"Episode {row.get('episode_index')} has no task annotation"
+            )
+        episode_tasks[int(row["episode_index"])] = str(tasks[0])
+    return episode_tasks
+
+
 def select_dataset_indices(
     dataset: MobileManiBenchPlanDataset,
     episode_ids: set[int],
+    episode_tasks: dict[int, str],
     stride: int,
     max_samples: int,
 ) -> list[int]:
-    if stride < 1:
-        raise ValueError("--sample-stride must be >= 1")
-    indices = [
-        index
-        for index, (episode_id, _) in enumerate(dataset.all_steps)
-        if int(episode_id) in episode_ids
-    ]
-    indices = indices[::stride]
-    if max_samples > 0:
-        indices = indices[:max_samples]
-    if not indices:
-        raise ValueError("No dataset anchors remain after split/stride/max-samples filtering")
-    return indices
+    return select_task_balanced_indices(
+        dataset.all_steps,
+        episode_ids,
+        episode_tasks,
+        stride=stride,
+        max_samples=max_samples,
+    )
 
 
 def iter_batches(values: list[int], batch_size: int) -> Iterable[list[int]]:
@@ -683,11 +695,16 @@ def main() -> int:
     args = parse_args()
     dataset_root = args.dataset_root.resolve()
     episode_ids, split_source = resolve_episode_split(dataset_root, args.split)
+    episode_tasks = load_episode_tasks(dataset_root)
 
     if args.inspect_only:
         # The resolved training config is not needed to verify episode routing.
         episodes = read_jsonl(dataset_root / "meta/episodes.jsonl")
         selected = [row for row in episodes if int(row["episode_index"]) in episode_ids]
+        task_episode_counts: dict[str, int] = {}
+        for row in selected:
+            task = episode_tasks[int(row["episode_index"])]
+            task_episode_counts[task] = task_episode_counts.get(task, 0) + 1
         print(
             json.dumps(
                 {
@@ -697,6 +714,7 @@ def main() -> int:
                     "episode_ids": sorted(episode_ids),
                     "num_episodes": len(selected),
                     "num_frames": sum(int(row["length"]) for row in selected),
+                    "task_episode_counts": task_episode_counts,
                 },
                 indent=2,
             )
@@ -714,11 +732,27 @@ def main() -> int:
         num_inference_steps=args.num_inference_steps,
     )
     dataset, model_transform, collator = build_dataset_and_collator(dataset_root, cfg)
+    if args.sample_stride < 1:
+        raise ValueError("--sample-stride must be >= 1")
+    split_anchor_count = sum(
+        int(episode_id) in episode_ids
+        for episode_id, _ in dataset.all_steps
+    )
+    strided_anchor_count = (
+        split_anchor_count + args.sample_stride - 1
+    ) // args.sample_stride
+    task_balancing_applied = 0 < args.max_samples < strided_anchor_count
     indices = select_dataset_indices(
         dataset,
         episode_ids=episode_ids,
+        episode_tasks=episode_tasks,
         stride=args.sample_stride,
         max_samples=args.max_samples,
+    )
+    sample_task_counts = count_tasks_for_indices(
+        dataset.all_steps,
+        indices,
+        episode_tasks,
     )
     if args.batch_size != 1:
         raise ValueError(
@@ -734,7 +768,8 @@ def main() -> int:
     if rank == 0:
         print(
             f"Evaluating {len(indices)} anchors from {len(episode_ids)} episodes "
-            f"(split={args.split!r}, source={split_source})",
+            f"(split={args.split!r}, source={split_source}, "
+            f"tasks={sample_task_counts})",
             flush=True,
         )
 
@@ -796,6 +831,12 @@ def main() -> int:
                 "split": args.split,
                 "split_source": split_source,
                 "episode_ids": sorted(episode_ids),
+                "sample_task_counts": sample_task_counts,
+                "max_samples_sampling": (
+                    "task_balanced_evenly_spaced"
+                    if task_balancing_applied
+                    else "all_selected_anchors"
+                ),
                 "sample_stride": args.sample_stride,
                 "max_samples": args.max_samples,
                 "seed": args.seed,
