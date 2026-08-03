@@ -10,6 +10,7 @@ import warnings
 
 import hydra
 from hydra.utils import instantiate
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
 from torch.utils.data import Subset
@@ -20,6 +21,28 @@ from groot.vla.model.vggt_3d_wam.checkpointing import (
     load_matching_trainable_parameters,
 )
 from groot.vla.model.vggt_3d_wam.visualization import save_vggt_visualization
+
+
+def allow_trusted_numpy_rng_state_types() -> None:
+    """Allow PyTorch to read NumPy RNG state from our own Trainer checkpoint.
+
+    Transformers restores ``rng_state*.pth`` with ``weights_only=True``.
+    Checkpoints written by NumPy 1.x contain an ndarray reconstruction helper
+    and parameterized dtype classes that PyTorch does not allow by default.
+    Restrict the allowlist to the primitive NumPy types used by RNG state
+    rather than falling back to unrestricted pickle loading.
+    """
+    from numpy.core.multiarray import _reconstruct
+
+    torch.serialization.add_safe_globals(
+        [
+            _reconstruct,
+            np.ndarray,
+            np.dtype,
+            type(np.dtype(np.uint32)),
+            type(np.dtype(np.float64)),
+        ]
+    )
 
 
 def get_last_complete_checkpoint(output_dir: str | Path) -> str | None:
@@ -464,6 +487,8 @@ def main(cfg: DictConfig) -> None:
         VGGTJSONLLossLoggerCallback(output_dir / "loss_log.jsonl")
     )
 
+    if checkpoint is not None:
+        allow_trusted_numpy_rng_state_types()
     trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_model(str(output_dir))
     trainer.save_state()

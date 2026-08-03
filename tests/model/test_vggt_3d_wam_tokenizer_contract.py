@@ -1,12 +1,14 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from groot.vla.experiment.vggt_3d_wam import (
     VGGTJSONLLossLoggerCallback,
     VGGTTrainer,
+    allow_trusted_numpy_rng_state_types,
 )
 from groot.vla.model.vggt_3d_wam.configuration import VGGT3DWAMConfig
 from groot.vla.model.vggt_3d_wam.geometry import rays_in_frame, scale_intrinsics
@@ -95,6 +97,17 @@ def test_wan_temporal_contract_and_gradients():
     assert frames.grad is not None
     assert encoder.chunk.weight.grad is not None
     assert decoder.chunk.weight.grad is not None
+
+
+def test_numpy_rng_state_loads_with_weights_only(tmp_path):
+    rng_path = tmp_path / "rng_state.pth"
+    torch.save({"numpy": np.random.get_state()}, rng_path)
+    allow_trusted_numpy_rng_state_types()
+
+    restored = torch.load(rng_path, weights_only=True)
+
+    assert restored["numpy"][0] == "MT19937"
+    assert restored["numpy"][1].dtype == np.uint32
 
 
 def test_vggt_jsonl_loss_logger_appends_rank_zero_metrics(tmp_path):
