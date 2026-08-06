@@ -28,13 +28,22 @@ class VGGT3DWAMConfig(PretrainedConfig):
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
         global_temporal_window: int = 4,
+        align_global_windows_to_codec: bool = True,
+        global_attention_causal: bool = False,
+        feature_tap_layers: tuple[int, int, int, int] = (4, 11, 17, 23),
+        feature_tap_dim: int = 128,
         backbone_gradient_checkpointing: bool = True,
         latent_dim: int = 32,
         latent_spatial_stride: int = 16,
         latent_temporal_stride: int = 4,
         video_temporal_layers: int = 2,
         video_temporal_heads: int = 4,
+        video_fusion_dim: int = 256,
+        video_query_heads: int = 8,
         video_decoder_dim: int = 128,
+        temporal_codec_num_downsample_stages: int = 2,
+        temporal_decoder_num_upsample_stages: int = 2,
+        temporal_codec_use_layer_cache: bool = True,
         video_reconstruction_loss_weight: float = 1.0,
         lpips_loss_weight: float = 0.0,
         lpips_net: str = "alex",
@@ -47,6 +56,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         geometry_temporal_layers: int = 2,
         geometry_deformable_layers: int = 2,
         geometry_deformable_levels: int = 2,
+        geometry_feature_layers: tuple[int, int] = (11, 23),
         deformable_points: int = 4,
         deformable_offset_scale: float = 2.0,
         grid_size: tuple[int, int, int] = (8, 12, 8),
@@ -73,6 +83,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         temporal_geometry_loss_weight: float = 0.0,
         surface_normal_loss_weight: float = 0.0,
         depth_gradient_loss_weight: float = 0.0,
+        mask_auxiliary_losses_to_grid: bool = True,
         masked_view_probability: float = 0.0,
         model_dtype: str = "float32",
         **kwargs,
@@ -96,13 +107,26 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
         self.global_temporal_window = global_temporal_window
+        self.align_global_windows_to_codec = align_global_windows_to_codec
+        self.global_attention_causal = global_attention_causal
+        self.feature_tap_layers = list(feature_tap_layers)
+        self.feature_tap_dim = feature_tap_dim
         self.backbone_gradient_checkpointing = backbone_gradient_checkpointing
         self.latent_dim = latent_dim
         self.latent_spatial_stride = latent_spatial_stride
         self.latent_temporal_stride = latent_temporal_stride
         self.video_temporal_layers = video_temporal_layers
         self.video_temporal_heads = video_temporal_heads
+        self.video_fusion_dim = video_fusion_dim
+        self.video_query_heads = video_query_heads
         self.video_decoder_dim = video_decoder_dim
+        self.temporal_codec_num_downsample_stages = (
+            temporal_codec_num_downsample_stages
+        )
+        self.temporal_decoder_num_upsample_stages = (
+            temporal_decoder_num_upsample_stages
+        )
+        self.temporal_codec_use_layer_cache = temporal_codec_use_layer_cache
         self.video_reconstruction_loss_weight = (
             video_reconstruction_loss_weight
         )
@@ -119,6 +143,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.geometry_temporal_layers = geometry_temporal_layers
         self.geometry_deformable_layers = geometry_deformable_layers
         self.geometry_deformable_levels = geometry_deformable_levels
+        self.geometry_feature_layers = list(geometry_feature_layers)
         self.deformable_points = deformable_points
         self.deformable_offset_scale = deformable_offset_scale
         self.grid_size = list(grid_size)
@@ -151,5 +176,6 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.temporal_geometry_loss_weight = temporal_geometry_loss_weight
         self.surface_normal_loss_weight = surface_normal_loss_weight
         self.depth_gradient_loss_weight = depth_gradient_loss_weight
+        self.mask_auxiliary_losses_to_grid = mask_auxiliary_losses_to_grid
         self.masked_view_probability = masked_view_probability
         self.model_dtype = model_dtype

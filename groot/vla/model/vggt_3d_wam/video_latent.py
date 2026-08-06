@@ -26,6 +26,104 @@ class SpatialResidualBlock(nn.Module):
         return inputs + hidden
 
 
+class FusionResidualBlock(nn.Module):
+    """Residual channel reduction used before spatial query resampling."""
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.skip = nn.Conv2d(input_channels, output_channels, 1)
+        groups = math.gcd(8, output_channels)
+        self.norm1 = nn.GroupNorm(groups, output_channels)
+        self.conv1 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, output_channels)
+        self.conv2 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = self.skip(inputs)
+        residual = self.conv1(F.silu(self.norm1(hidden)))
+        residual = self.conv2(F.silu(self.norm2(residual)))
+        return hidden + residual
+
+
+class LearnedSpatialQueryResampler(nn.Module):
+    """Cross-attend fixed 10x20 latent queries to a 12x23 feature grid."""
+
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int,
+        source_size: tuple[int, int] = (12, 23),
+        target_size: tuple[int, int] = (10, 20),
+    ) -> None:
+        super().__init__()
+        self.source_size = source_size
+        self.target_size = target_size
+        self.source_position = nn.Parameter(
+            torch.zeros(1, source_size[0] * source_size[1], channels)
+        )
+        self.query = nn.Parameter(
+            torch.zeros(1, target_size[0] * target_size[1], channels)
+        )
+        nn.init.normal_(self.source_position, std=0.02)
+        nn.init.normal_(self.query, std=0.02)
+        self.query_norm = nn.LayerNorm(channels)
+        self.source_norm = nn.LayerNorm(channels)
+        self.cross_attention = nn.MultiheadAttention(
+            channels,
+            num_heads,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, 4 * channels),
+            nn.GELU(),
+            nn.Linear(4 * channels, channels),
+        )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        target_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        batch, channels, height, width = inputs.shape
+        target_size = target_size or self.target_size
+        source_position = self.source_position.transpose(1, 2).reshape(
+            1, channels, *self.source_size
+        )
+        if (height, width) != self.source_size:
+            source_position = F.interpolate(
+                source_position,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        source = inputs.flatten(2).transpose(1, 2) + source_position.flatten(
+            2
+        ).transpose(1, 2)
+        query = self.query.transpose(1, 2).reshape(
+            1, channels, *self.target_size
+        )
+        if target_size != self.target_size:
+            query = F.interpolate(
+                query,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        query = query.flatten(2).transpose(1, 2).expand(batch, -1, -1)
+        attended, _ = self.cross_attention(
+            self.query_norm(query),
+            self.source_norm(source),
+            self.source_norm(source),
+            need_weights=False,
+        )
+        query = query + attended
+        query = query + self.ffn(self.output_norm(query))
+        return query.transpose(1, 2).reshape(
+            batch, channels, *target_size
+        )
+
+
 class TemporalResidualBlock(nn.Module):
     """Mix adjacent decoded frames without changing the latent contract."""
 
@@ -82,6 +180,8 @@ class VideoLatentBranch(nn.Module):
         temporal_stride: int,
         temporal_layers: int,
         temporal_heads: int,
+        fusion_dim: int,
+        query_heads: int,
     ) -> None:
         super().__init__()
         if temporal_stride != 4:
@@ -95,10 +195,19 @@ class VideoLatentBranch(nn.Module):
                 f"got {spatial_stride}"
             )
         self.spatial_stride = spatial_stride
-        self.spatial_bottleneck = nn.Sequential(
-            nn.Conv2d(input_dim, latent_dim, 3, padding=1),
-            nn.GroupNorm(math.gcd(8, latent_dim), latent_dim),
+        self.level_count = 4
+        self.level_fusion = FusionResidualBlock(
+            self.level_count * input_dim,
+            fusion_dim,
+        )
+        self.spatial_resampler = LearnedSpatialQueryResampler(
+            fusion_dim,
+            query_heads,
+        )
+        self.latent_projection = nn.Sequential(
+            nn.GroupNorm(math.gcd(8, fusion_dim), fusion_dim),
             nn.SiLU(),
+            nn.Conv2d(fusion_dim, latent_dim, 1),
             SpatialResidualBlock(latent_dim),
         )
         layer = nn.TransformerEncoderLayer(
@@ -110,18 +219,24 @@ class VideoLatentBranch(nn.Module):
             norm_first=True,
         )
         self.temporal_transformer = nn.TransformerEncoder(layer, temporal_layers)
-        self.temporal_encoder = WanTemporalEncoder(latent_dim)
+        self.temporal_encoder = WanTemporalEncoder(latent_dim, spatial_kernel=3)
         self.mu_head = nn.Conv3d(latent_dim, latent_dim, 1)
         self.logvar_head = nn.Conv3d(latent_dim, latent_dim, 1)
 
     def forward(
         self,
-        features: torch.Tensor,
+        features: tuple[torch.Tensor, ...] | list[torch.Tensor],
         video_size: tuple[int, int],
         *,
         sample_posterior: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, time, views, channels, height, width = features.shape
+        if len(features) != self.level_count:
+            raise ValueError(
+                f"VideoLatentBranch expects four feature levels, got {len(features)}"
+            )
+        batch, time, views, channels, height, width = features[0].shape
+        if any(level.shape != features[0].shape for level in features[1:]):
+            raise ValueError("All four VGGT feature levels must share one shape")
         video_height, video_width = video_size
         if video_height % self.spatial_stride or video_width % self.spatial_stride:
             raise ValueError(
@@ -132,10 +247,17 @@ class VideoLatentBranch(nn.Module):
             video_height // self.spatial_stride,
             video_width // self.spatial_stride,
         )
-        spatial = self.spatial_bottleneck(
-            features.reshape(batch * time * views, channels, height, width)
+        fused = torch.cat(features, dim=3)
+        spatial = self.level_fusion(
+            fused.reshape(
+                batch * time * views,
+                self.level_count * channels,
+                height,
+                width,
+            )
         )
-        spatial = F.adaptive_avg_pool2d(spatial, latent_size)
+        spatial = self.spatial_resampler(spatial, latent_size)
+        spatial = self.latent_projection(spatial)
         latent_h, latent_w = spatial.shape[-2:]
         spatial = spatial.reshape(
             batch, time, views, -1, latent_h, latent_w
@@ -187,8 +309,7 @@ class VideoDecoder(nn.Module):
             )
         hidden_dim = max(32, hidden_dim)
         self.spatial_stride = spatial_stride
-        self.temporal_decoder = WanTemporalDecoder(latent_dim)
-        self.temporal_refinement = TemporalResidualBlock(latent_dim)
+        self.temporal_decoder = WanTemporalDecoder(latent_dim, spatial_kernel=3)
         self.input_projection = nn.Conv2d(latent_dim, hidden_dim, 3, padding=1)
         decoder_channels = (
             [192, 128, 96, 64]
@@ -224,7 +345,6 @@ class VideoDecoder(nn.Module):
             latent.reshape(batch * views, channels, latent_time, height, width),
             output_time=output_time,
         )
-        temporal = self.temporal_refinement(temporal)
         decoded_time = temporal.shape[2]
         frames = temporal.permute(0, 2, 1, 3, 4).reshape(
             batch * views * decoded_time,

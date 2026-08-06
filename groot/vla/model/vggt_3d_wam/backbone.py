@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -12,6 +13,14 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class BackboneOutput:
+    """Projected frame/global side-path features ordered by tap depth."""
+
+    feature_levels: tuple[torch.Tensor, ...]
+    layer_indices: tuple[int, ...]
 
 
 def _sinusoidal_1d(
@@ -210,6 +219,9 @@ class VGGTBackbone(nn.Module):
         lora_alpha: float,
         lora_dropout: float,
         global_temporal_window: int,
+        feature_tap_layers: tuple[int, ...],
+        feature_tap_dim: int,
+        align_global_windows_to_codec: bool = True,
         freeze_dino: bool = True,
         dino_image_chunk_size: int = 4,
         gradient_checkpointing: bool = True,
@@ -227,6 +239,17 @@ class VGGTBackbone(nn.Module):
         self.global_temporal_window = int(global_temporal_window)
         if self.global_temporal_window < 1:
             raise ValueError("global_temporal_window must be positive")
+        self.align_global_windows_to_codec = bool(align_global_windows_to_codec)
+        self.feature_tap_layers = tuple(int(layer) for layer in feature_tap_layers)
+        if len(self.feature_tap_layers) != 4 or len(set(self.feature_tap_layers)) != 4:
+            raise ValueError("feature_tap_layers must contain four unique layers")
+        if any(layer < 0 for layer in self.feature_tap_layers):
+            raise ValueError("feature_tap_layers must be non-negative")
+        # Tiny smoke-test backbones reuse their final available block. The
+        # production depth=24 path maps [4,11,17,23] without modification.
+        self.tap_actual_layers = {
+            layer: min(layer, depth - 1) for layer in self.feature_tap_layers
+        }
         self.gradient_checkpointing = bool(gradient_checkpointing)
         if patch_embed_type == "conv":
             self.patch_embed = ConvPatchEmbed(patch_size, embed_dim)
@@ -305,6 +328,26 @@ class VGGTBackbone(nn.Module):
                 lora_alpha,
                 lora_dropout,
             )
+        # The main aggregator path remains 1024-dimensional. Only these
+        # branch-facing side paths concatenate frame and global evidence.
+        self.frame_tap_projections = nn.ModuleDict(
+            {
+                str(layer): nn.Sequential(
+                    nn.LayerNorm(embed_dim),
+                    nn.Linear(embed_dim, feature_tap_dim),
+                )
+                for layer in self.feature_tap_layers
+            }
+        )
+        self.global_tap_projections = nn.ModuleDict(
+            {
+                str(layer): nn.Sequential(
+                    nn.LayerNorm(embed_dim),
+                    nn.Linear(embed_dim, feature_tap_dim),
+                )
+                for layer in self.feature_tap_layers
+            }
+        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -397,8 +440,44 @@ class VGGTBackbone(nn.Module):
             )
         return patch_tokens
 
-    def forward(self, video: torch.Tensor) -> torch.Tensor:
-        """Return patch features as ``[B, T, V, C, Hp, Wp]``."""
+    def _global_windows(self, time: int) -> list[tuple[int, int]]:
+        if not self.align_global_windows_to_codec:
+            return [
+                (start, min(time, start + self.global_temporal_window))
+                for start in range(0, time, self.global_temporal_window)
+            ]
+        if self.global_temporal_window != 4 or (time - 1) % 4:
+            raise ValueError(
+                "Aligned VGGT windows require window=4 and T=4k+1; "
+                f"got window={self.global_temporal_window}, T={time}"
+            )
+        return [(0, 1)] + [
+            (start, start + 4) for start in range(1, time, 4)
+        ]
+
+    def _project_tap(
+        self,
+        tokens: torch.Tensor,
+        projection: nn.Module,
+        *,
+        batch: int,
+        time: int,
+        views: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> torch.Tensor:
+        patches = projection(tokens[..., self.patch_start_idx :, :])
+        return patches.permute(0, 1, 2, 4, 3).reshape(
+            batch,
+            time,
+            views,
+            -1,
+            patch_h,
+            patch_w,
+        )
+
+    def forward(self, video: torch.Tensor) -> BackboneOutput:
+        """Return four projected frame/global feature levels."""
         batch, time, views, channels, height, width = video.shape
         if channels != 3:
             raise ValueError(f"Expected RGB video, got {video.shape}")
@@ -474,7 +553,10 @@ class VGGTBackbone(nn.Module):
             batch * sequence, patches + self.patch_start_idx, self.embed_dim
         )
         tokens_per_frame = patches + self.patch_start_idx
-        for frame_block, global_block in zip(self.frame_blocks, self.global_blocks):
+        feature_levels: dict[int, torch.Tensor] = {}
+        for layer_index, (frame_block, global_block) in enumerate(
+            zip(self.frame_blocks, self.global_blocks)
+        ):
             if self.training and self.gradient_checkpointing:
                 tokens = checkpoint(
                     frame_block,
@@ -490,11 +572,26 @@ class VGGTBackbone(nn.Module):
                 tokens_per_frame,
                 self.embed_dim,
             )
+            logical_taps = [
+                layer
+                for layer, actual in self.tap_actual_layers.items()
+                if actual == layer_index
+            ]
+            frame_features = {
+                layer: self._project_tap(
+                    tokens_by_time,
+                    self.frame_tap_projections[str(layer)],
+                    batch=batch,
+                    time=time,
+                    views=views,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                )
+                for layer in logical_taps
+            }
             global_windows = []
-            for start in range(0, time, self.global_temporal_window):
-                window = tokens_by_time[
-                    :, start : start + self.global_temporal_window
-                ]
+            for start, end in self._global_windows(time):
+                window = tokens_by_time[:, start:end]
                 window_time = window.shape[1]
                 window = window.reshape(
                     batch,
@@ -523,9 +620,28 @@ class VGGTBackbone(nn.Module):
                 tokens_per_frame,
                 self.embed_dim,
             )
-        tokens = tokens[:, self.patch_start_idx :]
-        return (
-            tokens.transpose(1, 2)
-            .reshape(batch, time, views, self.embed_dim, patch_h, patch_w)
-            .contiguous()
+            for logical_layer, frame_feature in frame_features.items():
+                global_feature = self._project_tap(
+                    tokens.reshape(
+                        batch,
+                        time,
+                        views,
+                        tokens_per_frame,
+                        self.embed_dim,
+                    ),
+                    self.global_tap_projections[str(logical_layer)],
+                    batch=batch,
+                    time=time,
+                    views=views,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                )
+                feature_levels[logical_layer] = torch.cat(
+                    (frame_feature, global_feature), dim=3
+                ).contiguous()
+        return BackboneOutput(
+            feature_levels=tuple(
+                feature_levels[layer] for layer in self.feature_tap_layers
+            ),
+            layer_indices=self.feature_tap_layers,
         )

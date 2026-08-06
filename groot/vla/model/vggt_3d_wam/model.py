@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from .backbone import VGGTBackbone
+from .backbone import BackboneOutput, VGGTBackbone
 from .configuration import VGGT3DWAMConfig
 from .geometry import invert_transform, points_in_metric_grid, scale_intrinsics
 from .losses import (
@@ -38,6 +38,18 @@ class VGGT3DWAMModel(PreTrainedModel):
         x_range = tuple(config.grid_x_range)
         y_range = tuple(config.grid_y_range)
         z_range = tuple(config.grid_z_range)
+        if config.global_attention_causal:
+            raise ValueError(
+                "Plan A keeps bidirectional attention inside each closed chunk"
+            )
+        if (
+            config.temporal_codec_num_downsample_stages != 2
+            or config.temporal_decoder_num_upsample_stages != 2
+            or not config.temporal_codec_use_layer_cache
+        ):
+            raise ValueError(
+                "This tokenizer requires two cached temporal encode/decode stages"
+            )
         self.backbone = VGGTBackbone(
             patch_size=config.patch_size,
             patch_embed_type=config.patch_embed_type,
@@ -56,15 +68,20 @@ class VGGT3DWAMModel(PreTrainedModel):
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             global_temporal_window=config.global_temporal_window,
+            align_global_windows_to_codec=config.align_global_windows_to_codec,
+            feature_tap_layers=tuple(config.feature_tap_layers),
+            feature_tap_dim=config.feature_tap_dim,
             gradient_checkpointing=config.backbone_gradient_checkpointing,
         )
         self.video_encoder = VideoLatentBranch(
-            input_dim=config.backbone_dim,
+            input_dim=2 * config.feature_tap_dim,
             latent_dim=config.latent_dim,
             spatial_stride=config.latent_spatial_stride,
             temporal_stride=config.latent_temporal_stride,
             temporal_layers=config.video_temporal_layers,
             temporal_heads=config.video_temporal_heads,
+            fusion_dim=config.video_fusion_dim,
+            query_heads=config.video_query_heads,
         )
         self.video_decoder = VideoDecoder(
             config.latent_dim,
@@ -72,7 +89,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             config.latent_spatial_stride,
         )
         self.metric_encoder = MetricTokenEncoder(
-            input_dim=config.backbone_dim,
+            input_dim=2 * config.feature_tap_dim,
             token_dim=config.geometry_dim,
             num_heads=config.geometry_heads,
             temporal_layers=config.geometry_temporal_layers,
@@ -161,7 +178,7 @@ class VGGT3DWAMModel(PreTrainedModel):
         self,
         video: torch.Tensor,
         input_range: str = "auto",
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    ) -> tuple[BackboneOutput, torch.Tensor, bool]:
         """Extract shared VGGT features once for both tokenizer branches."""
         canonical, wan_layout = self._canonical_video(video, input_range)
         backbone_video = (canonical + 1.0) * 0.5
@@ -169,16 +186,29 @@ class VGGT3DWAMModel(PreTrainedModel):
 
     def _encode_2d_features(
         self,
-        features: torch.Tensor,
+        features: BackboneOutput,
         video_size: tuple[int, int],
         *,
         sample_posterior: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.video_encoder(
-            features,
+            features.feature_levels,
             video_size,
             sample_posterior=sample_posterior,
         )
+
+    def _geometry_features(
+        self,
+        features: BackboneOutput,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        by_layer = dict(zip(features.layer_indices, features.feature_levels))
+        requested = tuple(int(layer) for layer in self.config.geometry_feature_layers)
+        if len(requested) != 2 or any(layer not in by_layer for layer in requested):
+            raise ValueError(
+                "geometry_feature_layers must select two backbone taps; "
+                f"requested={requested}, available={features.layer_indices}"
+            )
+        return by_layer[requested[0]], by_layer[requested[1]]
 
     def encode_2d(
         self,
@@ -225,7 +255,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             elif camera_k.shape[2] != 1:
                 raise ValueError("Wan-layout video contains exactly one view")
         tokens, _, _ = self.metric_encoder(
-            features,
+            self._geometry_features(features),
             camera_k,
             base_from_camera,
             self.backbone.patch_aligned_image_size(
@@ -254,7 +284,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             sample_posterior=sample_posterior,
         )
         latent_3d, _, voxel_visible = self.metric_encoder(
-            features,
+            self._geometry_features(features),
             camera_k,
             base_from_camera,
             self.backbone.patch_aligned_image_size(
@@ -750,7 +780,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             sample_posterior=self.training,
         )
         geometry_tokens, token_grid, voxel_visible = self.metric_encoder(
-            features,
+            self._geometry_features(features),
             camera_k,
             base_from_camera,
             self.backbone.patch_aligned_image_size(tuple(video.shape[-2:])),
@@ -834,6 +864,15 @@ class VGGT3DWAMModel(PreTrainedModel):
             base_from_camera,
         )
         temporal_geometry_loss = video.new_zeros(())
+        auxiliary_valid = pointmap_valid
+        if self.config.mask_auxiliary_losses_to_grid:
+            auxiliary_inside = points_in_metric_grid(
+                target_pointmap.permute(0, 1, 2, 4, 5, 3),
+                self.config.grid_x_range,
+                self.config.grid_y_range,
+                self.config.grid_z_range,
+            )
+            auxiliary_valid = pointmap_valid * auxiliary_inside
         if (
             self.config.temporal_geometry_loss_weight > 0
             and predicted_pointmap.shape[1] > 1
@@ -841,7 +880,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             predicted_delta = predicted_pointmap[:, 1:] - predicted_pointmap[:, :-1]
             target_delta = target_pointmap[:, 1:] - target_pointmap[:, :-1]
             temporal_valid = torch.minimum(
-                pointmap_valid[:, 1:], pointmap_valid[:, :-1]
+                auxiliary_valid[:, 1:], auxiliary_valid[:, :-1]
             )
             temporal_geometry_loss = _weighted_mean(
                 F.smooth_l1_loss(
@@ -853,7 +892,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             self._surface_normal_loss(
                 predicted_pointmap,
                 target_pointmap,
-                pointmap_valid,
+                auxiliary_valid,
             )
             if self.config.surface_normal_loss_weight > 0
             else video.new_zeros(())
@@ -862,7 +901,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             self._depth_gradient_loss(
                 predicted_pointmap,
                 target_pointmap,
-                pointmap_valid,
+                auxiliary_valid,
                 base_from_camera,
             )
             if self.config.depth_gradient_loss_weight > 0
@@ -916,6 +955,8 @@ class VGGT3DWAMModel(PreTrainedModel):
             "predicted_pointmap_b0": predicted_pointmap,
             "occupancy_logits": occupancy_logits,
             "ray_sample_valid": ray_sample_valid,
+            "auxiliary_inside_grid_count": (auxiliary_valid > 0).sum(),
+            "auxiliary_inside_grid_weight": auxiliary_valid.sum(),
         }
         outputs.update(pointmap_diagnostics)
         outputs.update(multiview_diagnostics)

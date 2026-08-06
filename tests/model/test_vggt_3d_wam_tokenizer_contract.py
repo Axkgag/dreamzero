@@ -39,7 +39,7 @@ def _tiny_config() -> VGGT3DWAMConfig:
         init_random=True,
         freeze_backbone=False,
         lora_rank=0,
-        global_temporal_window=1,
+        global_temporal_window=4,
         latent_dim=8,
         latent_spatial_stride=16,
         latent_temporal_stride=4,
@@ -95,8 +95,8 @@ def test_wan_temporal_contract_and_gradients():
     assert reconstructed.shape == frames.shape
     reconstructed.square().mean().backward()
     assert frames.grad is not None
-    assert encoder.chunk.weight.grad is not None
-    assert decoder.chunk.weight.grad is not None
+    assert encoder.downsample1.conv.conv.weight.grad is not None
+    assert decoder.upsample1.expand.weight.grad is not None
 
 
 def test_numpy_rng_state_loads_with_weights_only(tmp_path):
@@ -387,7 +387,7 @@ def test_deformable_metric_encoder_gradients_and_all_invisible_fallback():
     camera_k, transforms = _camera_tensors(time=9, views=2)
 
     tokens, grid, visible = encoder(
-        features,
+        [features, features],
         camera_k,
         transforms,
         image_size=(32, 64),
@@ -459,14 +459,19 @@ def test_backbone_lora_scope_and_checkpoint_backward():
     assert trainable_backbone
     assert not any(name.startswith("patch_embed.") for name in trainable_backbone)
     assert all(
-        name.startswith(("frame_blocks.", "global_blocks."))
-        and (".down." in name or ".up." in name)
+        (
+            name.startswith(("frame_blocks.", "global_blocks."))
+            and (".down." in name or ".up." in name)
+        )
+        or name.startswith(
+            ("frame_tap_projections.", "global_tap_projections.")
+        )
         for name in trainable_backbone
     )
 
     video = torch.rand(1, 9, 1, 3, 32, 64)
     features = model.backbone(video)
-    features.square().mean().backward()
+    sum(level.square().mean() for level in features.feature_levels).backward()
 
     assert any(
         parameter.grad is not None

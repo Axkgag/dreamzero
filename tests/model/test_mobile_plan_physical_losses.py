@@ -15,6 +15,7 @@ from groot.vla.model.dreamzero.action_head.mobile_plan_physical_losses import (
     eef_current_to_future_base,
     eef_future_to_current_base,
     rotation6d_rows_to_matrix,
+    yaw_matrix,
 )
 from groot.vla.model.dreamzero.modules.flow_match_scheduler import (
     FlowMatchScheduler,
@@ -190,6 +191,8 @@ class MobilePlanPhysicalLossesTest(unittest.TestCase):
             _stats(path)
             module = MobilePlanPhysicalConsistencyLosses(path)
             target = _identity_actions()
+            target[:, 5] = 0.0
+            target[:, 11] = 0.0
             prediction = target.clone().requires_grad_(True)
             mask = torch.zeros_like(target, dtype=torch.bool)
             mask[:, :5, :4] = True
@@ -201,10 +204,20 @@ class MobilePlanPhysicalLossesTest(unittest.TestCase):
                 if name.endswith("_loss")
             )
             total.backward()
+        self.assertTrue(torch.isfinite(total))
+        self.assertTrue(torch.isfinite(prediction.grad).all())
         self.assertEqual(prediction.grad[:, 5].abs().sum().item(), 0.0)
         self.assertEqual(prediction.grad[:, 11].abs().sum().item(), 0.0)
         self.assertEqual(prediction.grad[:, :6, 4:].abs().sum().item(), 0.0)
         self.assertEqual(prediction.grad[:, 6:, 10:].abs().sum().item(), 0.0)
+
+    def test_zero_and_near_zero_yaw_have_finite_gradients(self) -> None:
+        for initial in ([0.0, 0.0], [1e-8, -1e-8]):
+            sincos = torch.tensor([initial], requires_grad=True)
+            rotation = yaw_matrix(sincos)
+            rotation[..., 0, 1].sum().backward()
+            self.assertTrue(torch.isfinite(rotation).all())
+            self.assertTrue(torch.isfinite(sincos.grad).all())
 
     def test_loss_ramp(self) -> None:
         self.assertEqual(

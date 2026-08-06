@@ -29,6 +29,10 @@ model:
     # Model one Wan-aligned four-frame chunk at a time instead of treating
     # every source frame independently.
     global_temporal_window: 4
+    align_global_windows_to_codec: true
+    global_attention_causal: false
+    feature_tap_layers: [4, 11, 17, 23]
+    feature_tap_dim: 128
     backbone_gradient_checkpointing: true
     latent_dim: 48
     # Exact Wan2.2 tokenizer tensor contract: 33x160x320 -> 9x10x20.
@@ -36,7 +40,12 @@ model:
     latent_temporal_stride: 4
     video_temporal_layers: 2
     video_temporal_heads: 8
+    video_fusion_dim: 256
+    video_query_heads: 8
     video_decoder_dim: 256
+    temporal_codec_num_downsample_stages: 2
+    temporal_decoder_num_upsample_stages: 2
+    temporal_codec_use_layer_cache: true
     video_reconstruction_loss_weight: 1.0
     lpips_loss_weight: 0.1
     lpips_net: alex
@@ -50,6 +59,7 @@ model:
     # Iterative query-conditioned multi-scale deformable image injection.
     geometry_deformable_layers: 2
     geometry_deformable_levels: 2
+    geometry_feature_layers: [11, 23]
     deformable_points: 4
     deformable_offset_scale: 2.0
     # grid_size is [z,y,x]. Double vertical resolution from 0.625 m to
@@ -70,7 +80,7 @@ model:
     pointmap_ray_chunk_size: 128
     pointmap_decoder_dim: 256
     pointmap_decoder_residual_layers: 2
-    beta_2d: 1.0e-6
+    beta_2d: 1.0e-5
     pointmap_loss_weight: 0.4
     # Five-task QA gives 91.7% B0-grid coverage and strong optical-axis
     # agreement, but K and H.264 pseudo-range remain unverified. This explicit
@@ -90,5 +100,6 @@ model:
     temporal_geometry_loss_weight: 0.1
     surface_normal_loss_weight: 0.1
     depth_gradient_loss_weight: 0.1
+    mask_auxiliary_losses_to_grid: true
     masked_view_probability: 0.0
     model_dtype: float32

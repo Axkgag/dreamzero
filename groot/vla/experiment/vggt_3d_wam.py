@@ -155,9 +155,16 @@ class VGGTTrainer(Trainer):
             if not parameter.requires_grad:
                 continue
             normalized_name = name.removeprefix("module.")
+            new_tap_projection = normalized_name.startswith(
+                (
+                    "backbone.frame_tap_projections.",
+                    "backbone.global_tap_projections.",
+                )
+            )
             family = (
                 "backbone"
                 if normalized_name.startswith("backbone.")
+                and not new_tap_projection
                 else "heads"
             )
             groups[(family, name in decay_parameters)].append(parameter)

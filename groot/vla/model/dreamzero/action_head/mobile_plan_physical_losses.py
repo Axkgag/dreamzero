@@ -49,12 +49,17 @@ def rotation_geodesic(
     return torch.atan2(sine, cosine.clamp(-1.0, 1.0))
 
 
-def yaw_matrix(sincos: torch.Tensor) -> torch.Tensor:
-    yaw = torch.atan2(sincos[..., 0], sincos[..., 1])
-    sine = torch.sin(yaw)
-    cosine = torch.cos(yaw)
+def yaw_matrix(sincos: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Build a yaw rotation without the undefined gradient of atan2(0, 0)."""
+    norm = torch.linalg.vector_norm(sincos, dim=-1, keepdim=True)
+    normalized = sincos / norm.clamp_min(eps)
+    fallback = torch.zeros_like(sincos)
+    fallback[..., 1] = 1.0
+    normalized = torch.where(norm > eps, normalized, fallback)
+    sine = normalized[..., 0]
+    cosine = normalized[..., 1]
     result = torch.zeros(
-        *yaw.shape, 3, 3, device=yaw.device, dtype=yaw.dtype
+        *sine.shape, 3, 3, device=sine.device, dtype=sine.dtype
     )
     result[..., 0, 0] = cosine
     result[..., 0, 1] = -sine
@@ -62,6 +67,26 @@ def yaw_matrix(sincos: torch.Tensor) -> torch.Tensor:
     result[..., 1, 1] = cosine
     result[..., 2, 2] = 1.0
     return result
+
+
+def _safe_base_pose_for_geometry(
+    value: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Replace masked Base poses by identity yaw before geometry operations."""
+    fallback = torch.zeros_like(value)
+    fallback[..., 3] = 1.0
+    return torch.where(valid.unsqueeze(-1), value, fallback)
+
+
+def _safe_eef_pose_for_geometry(
+    value: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Replace masked EEF poses by an identity rotation before geometry."""
+    pose = value[..., :9]
+    fallback = torch.zeros_like(pose)
+    fallback[..., 3] = 1.0
+    fallback[..., 7] = 1.0
+    return torch.where(valid.unsqueeze(-1), pose, fallback)
 
 
 def matrix_to_rotation6d_rows(value: torch.Tensor) -> torch.Tensor:
@@ -226,6 +251,14 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         sample_mask = has_real_action.bool().view(-1, 1, 1)
         base_mask = base_mask & sample_mask
         eef_mask = eef_mask & sample_mask
+        base_geometry_valid = base_mask[..., :4].all(-1)
+        eef_geometry_valid = eef_mask[..., :9].all(-1)
+        base_gt_geometry = _safe_base_pose_for_geometry(
+            base_gt, base_geometry_valid
+        )
+        manip_gt_geometry = _safe_eef_pose_for_geometry(
+            manip_gt, eef_geometry_valid
+        )
         zero = clean_target.sum() * 0.0
         base_scale = self._scale(self.base_xy_q01, self.base_xy_q99)
         eef_scale = self._scale(self.eef_xyz_q01, self.eef_xyz_q99)
@@ -274,7 +307,9 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         else:
             eef_pred = self.physical_eef_prior(eef_prediction)
             if eef_frame == "future_base":
-                eef_target = eef_current_to_future_base(base_gt, manip_gt)
+                eef_target = eef_current_to_future_base(
+                    base_gt_geometry, manip_gt_geometry
+                )
                 direct_position_mask = (
                     eef_mask[..., :3].all(-1)
                     & base_mask[..., :2].all(-1)
@@ -284,7 +319,7 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
                     & base_mask[..., 2:4].all(-1)
                 )
             else:
-                eef_target = manip_gt[..., :9]
+                eef_target = manip_gt_geometry
                 direct_position_mask = eef_mask[..., :3].all(-1)
                 direct_rotation_mask = eef_mask[..., 3:9].all(-1)
             eef_position_loss = _masked_smooth_l1(
@@ -316,6 +351,12 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             joint_position_loss = zero
             joint_rotation_loss = zero
         else:
+            base_pred_geometry = _safe_base_pose_for_geometry(
+                base_pred, base_geometry_valid
+            )
+            eef_pred_geometry = _safe_eef_pose_for_geometry(
+                eef_pred, eef_geometry_valid
+            )
             joint_position_mask = (
                 base_mask[..., :2].all(-1)
                 & eef_mask[..., :3].all(-1)
@@ -326,14 +367,16 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             )
             if eef_frame == "future_base":
                 joint_prediction = eef_future_to_current_base(
-                    base_pred, eef_pred
+                    base_pred_geometry, eef_pred_geometry
                 )
-                joint_target = manip_gt[..., :9]
+                joint_target = manip_gt_geometry
             else:
                 joint_prediction = eef_current_to_future_base(
-                    base_pred, eef_pred
+                    base_pred_geometry, eef_pred_geometry
                 )
-                joint_target = eef_current_to_future_base(base_gt, manip_gt)
+                joint_target = eef_current_to_future_base(
+                    base_gt_geometry, manip_gt_geometry
+                )
             joint_position_loss = _masked_smooth_l1(
                 joint_prediction[..., :3] / eef_scale,
                 joint_target[..., :3] / eef_scale,
@@ -378,6 +421,20 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         sample_mask = has_real_action.bool().view(-1, 1, 1)
         base_mask = base_mask & sample_mask
         manip_mask = manip_mask & sample_mask
+        base_geometry_valid = base_mask[..., :4].all(-1)
+        manip_geometry_valid = manip_mask[..., :9].all(-1)
+        base_pred_geometry = _safe_base_pose_for_geometry(
+            base_pred, base_geometry_valid
+        )
+        base_gt_geometry = _safe_base_pose_for_geometry(
+            base_gt, base_geometry_valid
+        )
+        manip_pred_geometry = _safe_eef_pose_for_geometry(
+            manip_pred, manip_geometry_valid
+        )
+        manip_gt_geometry = _safe_eef_pose_for_geometry(
+            manip_gt, manip_geometry_valid
+        )
 
         base_xy_scale = self._scale(self.base_xy_q01, self.base_xy_q99)
         eef_scale = self._scale(self.eef_xyz_q01, self.eef_xyz_q99)
@@ -407,8 +464,12 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             manip_mask[..., :3],
             self.huber_beta,
         )
-        rotation_pred = rotation6d_rows_to_matrix(manip_pred[..., 3:9])
-        rotation_gt = rotation6d_rows_to_matrix(manip_gt[..., 3:9])
+        rotation_pred = rotation6d_rows_to_matrix(
+            manip_pred_geometry[..., 3:9]
+        )
+        rotation_gt = rotation6d_rows_to_matrix(
+            manip_gt_geometry[..., 3:9]
+        )
         rotation_token_mask = manip_mask[..., 3:9].all(-1)
         rotation_angle = rotation_geodesic(rotation_pred, rotation_gt)
         eef_rotation_loss = _masked_mean(
@@ -427,19 +488,19 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         else:
             hand_loss = clean_prediction.sum() * 0.0
 
-        base_rotation_pred = yaw_matrix(base_pred[..., 2:4])
-        base_rotation_gt = yaw_matrix(base_gt[..., 2:4])
-        base_translation_pred = F.pad(base_pred[..., :2], (0, 1))
-        base_translation_gt = F.pad(base_gt[..., :2], (0, 1))
+        base_rotation_pred = yaw_matrix(base_pred_geometry[..., 2:4])
+        base_rotation_gt = yaw_matrix(base_gt_geometry[..., 2:4])
+        base_translation_pred = F.pad(base_pred_geometry[..., :2], (0, 1))
+        base_translation_gt = F.pad(base_gt_geometry[..., :2], (0, 1))
         relative_position_pred = torch.einsum(
             "...ji,...j->...i",
             base_rotation_pred,
-            manip_pred[..., :3] - base_translation_pred,
+            manip_pred_geometry[..., :3] - base_translation_pred,
         )
         relative_position_gt = torch.einsum(
             "...ji,...j->...i",
             base_rotation_gt,
-            manip_gt[..., :3] - base_translation_gt,
+            manip_gt_geometry[..., :3] - base_translation_gt,
         )
         relative_rotation_pred = (
             base_rotation_pred.transpose(-1, -2) @ rotation_pred

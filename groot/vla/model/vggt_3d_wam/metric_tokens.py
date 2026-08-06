@@ -357,6 +357,15 @@ class MetricTokenEncoder(nn.Module):
                 "VGGT 3D latents must use Wan's temporal stride 4; "
                 f"got {temporal_stride}"
             )
+        if deformable_levels != 2:
+            raise ValueError(
+                "The true-depth geometry path requires exactly two feature levels"
+            )
+        self.coarse_adapter = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, kernel_size=2, stride=2),
+            nn.GroupNorm(math.gcd(8, input_dim), input_dim),
+            nn.SiLU(),
+        )
         centers = metric_grid(x_range, y_range, z_range, grid_size)
         self.register_buffer("grid_centers", centers, persistent=True)
         self.query_features = nn.Parameter(torch.zeros(len(centers), token_dim))
@@ -390,7 +399,7 @@ class MetricTokenEncoder(nn.Module):
             temporal_layer, temporal_layers
         )
         self.output_norm = nn.LayerNorm(token_dim)
-        self.temporal_encoder = WanTemporalEncoder(token_dim)
+        self.temporal_encoder = WanTemporalEncoder(token_dim, spatial_kernel=1)
 
     def _base_queries(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         ranges = torch.tensor(
@@ -406,14 +415,23 @@ class MetricTokenEncoder(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,
+        features: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
         camera_k: torch.Tensor,
         base_from_camera: torch.Tensor,
         image_size: tuple[int, int],
         valid_image_size: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, time, views, channels, feature_h, feature_w = features.shape
-        points = self.grid_centers.to(dtype=features.dtype, device=features.device)
+        if len(features) != 2:
+            raise ValueError(
+                f"MetricTokenEncoder expects layer-11/layer-23 features, got {len(features)}"
+            )
+        fine_features, deep_features = features
+        if fine_features.shape != deep_features.shape:
+            raise ValueError("Geometry feature levels must share one input grid")
+        batch, time, views, channels, feature_h, feature_w = fine_features.shape
+        points = self.grid_centers.to(
+            dtype=fine_features.dtype, device=fine_features.device
+        )
         projected, visible = project_points(
             points,
             camera_k,
@@ -423,30 +441,29 @@ class MetricTokenEncoder(nn.Module):
         )
         valid_height, valid_width = valid_image_size or image_size
         padded_height, padded_width = image_size
-        valid_grid_max = features.new_tensor(
+        valid_grid_max = fine_features.new_tensor(
             [
                 2 * valid_width / padded_width - 1,
                 2 * valid_height / padded_height - 1,
             ]
         )
-        multi_level_features = [features]
-        pooled = features.reshape(
+        coarse = self.coarse_adapter(deep_features.reshape(
             batch * time * views, channels, feature_h, feature_w
+        ))
+        multi_level_features = [
+            fine_features,
+            coarse.reshape(
+                batch,
+                time,
+                views,
+                channels,
+                coarse.shape[-2],
+                coarse.shape[-1],
+            ),
+        ]
+        base_query = self._base_queries(
+            fine_features.dtype, fine_features.device
         )
-        for _ in range(1, self.deformable_levels):
-            if pooled.shape[-2] >= 2 and pooled.shape[-1] >= 2:
-                pooled = F.avg_pool2d(pooled, kernel_size=2, stride=2)
-            multi_level_features.append(
-                pooled.reshape(
-                    batch,
-                    time,
-                    views,
-                    channels,
-                    pooled.shape[-2],
-                    pooled.shape[-1],
-                )
-            )
-        base_query = self._base_queries(features.dtype, features.device)
         fused = base_query[None, None].expand(
             batch, time, -1, -1
         )
@@ -519,7 +536,7 @@ class MetricTokenDecoder(nn.Module):
         super().__init__()
         self.token_dim = token_dim
         self.grid_size = grid_size
-        self.temporal_decoder = WanTemporalDecoder(token_dim)
+        self.temporal_decoder = WanTemporalDecoder(token_dim, spatial_kernel=1)
         temporal_layer = nn.TransformerEncoderLayer(
             token_dim,
             num_heads,
