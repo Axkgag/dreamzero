@@ -139,3 +139,46 @@ class MobilePlanTransform(InvertibleModalityTransform):
         data["manipulator_plan"] = manipulator_plan
         return data
 
+
+class MobileBlockPlanTransform(MobilePlanTransform):
+    """Normalize a structured ``[block, waypoint, dimension]`` plan."""
+
+    num_plan_blocks: int = 4
+    plan_waypoints_per_block: int = 2
+    block_anchor_offsets: list[int] = Field(
+        default_factory=lambda: [0, 8, 16, 24]
+    )
+    plan_local_offsets: list[int] = Field(default_factory=lambda: [4, 8])
+
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        base = self._tensor(data["base_plan"])
+        manipulator = self._tensor(data["manipulator_plan"])
+        expected_base = (self.num_plan_blocks, self.plan_waypoints_per_block, 4)
+        if tuple(base.shape[-3:]) != expected_base:
+            raise ValueError(
+                f"Expected block Base plan {expected_base}, got {tuple(base.shape)}"
+            )
+        expected_manipulator_prefix = (
+            self.num_plan_blocks,
+            self.plan_waypoints_per_block,
+        )
+        if tuple(manipulator.shape[-3:-1]) != expected_manipulator_prefix:
+            raise ValueError(
+                "Unexpected block Manipulator plan shape: "
+                f"{tuple(manipulator.shape)}"
+            )
+        stats_offsets = tuple(int(v) for v in self._stats["plan_time_offsets"])
+        data_offsets = tuple(int(v) for v in data["plan_local_offsets"])
+        if data_offsets != stats_offsets:
+            raise ValueError(
+                f"Plan local offsets {data_offsets} do not match stats {stats_offsets}"
+            )
+        stats_anchors = tuple(
+            int(v) for v in self._stats.get("block_anchor_offsets", [])
+        )
+        data_anchors = tuple(int(v) for v in data["block_anchor_offsets"])
+        if data_anchors != stats_anchors:
+            raise ValueError(
+                f"Block anchors {data_anchors} do not match stats {stats_anchors}"
+            )
+        return super().apply(data)

@@ -10,6 +10,7 @@ from a deterministic uniform Bernoulli sample.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
+
+from groot.vla.data.plan_geometry import build_dynamic_block_plan_labels
+from groot.vla.utils.mobile_plan_spec import (
+    block_plan_spec_hash,
+    canonical_block_plan_spec,
+    dynamic_block_plan_stats_path,
+)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -25,6 +34,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
@@ -105,16 +115,87 @@ def prepare(
     split: str,
     split_manifest: Path | None,
     write_core_stats: bool,
+    multiblock: bool,
+    dynamic_multiblock: bool = False,
+    block_anchor_offsets: tuple[int, ...] = (0, 8, 16, 24),
+    local_waypoint_offsets: tuple[int, ...] = (4, 8),
+    stats_output_dir: Path | None = None,
+    reuse_existing: bool = False,
 ) -> dict[str, Any]:
-    output = root / "meta/plan_stats.json"
+    if multiblock and dynamic_multiblock:
+        raise ValueError("Choose either materialized or dynamic multiblock statistics")
+    label_spec: dict[str, object] | None = None
+    if dynamic_multiblock:
+        label_spec = canonical_block_plan_spec(
+            block_anchor_offsets, local_waypoint_offsets
+        )
+        default_output = dynamic_block_plan_stats_path(
+            root, block_anchor_offsets, local_waypoint_offsets
+        )
+        output = (
+            Path(stats_output_dir) / default_output.name
+            if stats_output_dir is not None
+            else default_output
+        )
+    else:
+        output = root / (
+            "meta/multiblock_plan_stats.json" if multiblock else "meta/plan_stats.json"
+        )
+    manifest_path = None
+    split_manifest_sha256 = None
+    if split != "all":
+        manifest_path = (
+            split_manifest
+            if split_manifest is not None
+            else root / "meta/plan_splits.json"
+        )
+        split_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if output.exists() and not force:
+        if reuse_existing:
+            existing = read_json(output)
+            expected_hash = (
+                block_plan_spec_hash(block_anchor_offsets, local_waypoint_offsets)
+                if dynamic_multiblock
+                else None
+            )
+            if (
+                existing.get("fit_split") == split
+                and existing.get("split_manifest_sha256")
+                == split_manifest_sha256
+                and (
+                    not dynamic_multiblock
+                    or existing.get("label_spec_hash") == expected_hash
+                )
+            ):
+                existing.setdefault("statistics_path", str(output))
+                return existing
         raise FileExistsError(f"{output} already exists; pass --force to replace it")
 
     schema = read_json(root / "meta/robot_schema.json")
     extensions = read_json(root / "meta/extensions.json")
-    plan_meta = extensions["action_plan"]
-    offsets = plan_meta["waypoint_offsets"]
+    if dynamic_multiblock:
+        assert label_spec is not None
+        plan_meta = {
+            "local_waypoint_offsets": label_spec["local_waypoint_offsets"],
+            "block_anchor_offsets": label_spec["block_anchor_offsets"],
+            "global_waypoint_offsets": label_spec["global_waypoint_offsets"],
+            "coordinate_frame": label_spec["coordinate_frame"],
+            "num_blocks": label_spec["num_blocks"],
+        }
+    else:
+        plan_meta = extensions["action_plan_block" if multiblock else "action_plan"]
+    offsets = (
+        plan_meta["local_waypoint_offsets"]
+        if multiblock or dynamic_multiblock
+        else plan_meta["waypoint_offsets"]
+    )
     horizon = len(offsets)
+    num_plan_blocks = (
+        int(plan_meta["num_blocks"])
+        if multiblock or dynamic_multiblock
+        else 1
+    )
+    slot_count = num_plan_blocks * horizon
     hand_dim = len(schema["hand_joint_indices"])
     manipulator_dim = 9 + hand_dim
 
@@ -122,11 +203,7 @@ def prepare(
     selected_episode_ids: set[int] | None = None
     selected_frames = int(info["total_frames"])
     if split != "all":
-        manifest_path = (
-            split_manifest
-            if split_manifest is not None
-            else root / "meta/plan_splits.json"
-        )
+        assert manifest_path is not None
         manifest = read_json(manifest_path)
         if split not in manifest["splits"]:
             raise ValueError(f"Split {split!r} is missing from {manifest_path}")
@@ -135,7 +212,7 @@ def prepare(
             int(value) for value in split_meta["episode_indices"]
         }
         selected_frames = int(split_meta["num_frames"])
-    total_slots_upper_bound = selected_frames * horizon
+    total_slots_upper_bound = selected_frames * slot_count
     sample_probability = min(
         1.0, quantile_sample_size / max(total_slots_upper_bound, 1)
     )
@@ -163,23 +240,64 @@ def prepare(
             if int(path.stem.rsplit("_", 1)[1]) in selected_episode_ids
         ]
     for file_index, parquet_path in enumerate(parquet_paths, start=1):
-        columns = [
-            "action.plan.base_waypoints",
-            "action.plan.manipulator",
-            "action.plan.valid",
-        ]
+        if dynamic_multiblock:
+            columns = [
+                "observation.base.world",
+                "observation.eef.world",
+                "observation.robot_joint",
+            ]
+        else:
+            prefix = "action.plan.block" if multiblock else "action.plan"
+            columns = [
+                f"{prefix}.base_waypoints",
+                f"{prefix}.manipulator",
+                f"{prefix}.valid",
+            ]
         if write_core_stats:
             columns.extend(["observation.state", "action"])
         frame = pd.read_parquet(parquet_path, columns=columns)
-        base = np.stack(frame["action.plan.base_waypoints"].to_numpy()).astype(
-            np.float64, copy=False
-        ).reshape(-1, horizon, 4)
-        manipulator = np.stack(frame["action.plan.manipulator"].to_numpy()).astype(
-            np.float64, copy=False
-        ).reshape(-1, horizon, manipulator_dim)
-        valid = np.stack(frame["action.plan.valid"].to_numpy()).astype(
-            np.bool_, copy=False
-        ).reshape(-1, horizon)
+        if dynamic_multiblock:
+            base_world = np.stack(
+                frame["observation.base.world"].to_numpy()
+            ).astype(np.float64, copy=False)
+            eef_world = np.stack(
+                frame["observation.eef.world"].to_numpy()
+            ).astype(np.float64, copy=False)
+            joint_flat = np.stack(
+                frame["observation.robot_joint"].to_numpy()
+            ).astype(np.float64, copy=False)
+            if joint_flat.shape[1] % 3:
+                raise ValueError(
+                    f"{parquet_path}: joint width {joint_flat.shape[1]} is not "
+                    "divisible by three"
+                )
+            labels = build_dynamic_block_plan_labels(
+                base_world,
+                eef_world,
+                joint_flat.reshape(len(frame), -1, 3),
+                schema["hand_joint_indices"],
+                block_anchor_offsets,
+                local_waypoint_offsets,
+            )
+            base = labels[0].reshape(-1, slot_count, 4).astype(
+                np.float64, copy=False
+            )
+            manipulator = labels[1].reshape(
+                -1, slot_count, manipulator_dim
+            ).astype(np.float64, copy=False)
+            valid = labels[2].reshape(-1, slot_count)
+        else:
+            base = np.stack(frame[f"{prefix}.base_waypoints"].to_numpy()).astype(
+                np.float64, copy=False
+            ).reshape(-1, slot_count, 4)
+            manipulator = np.stack(
+                frame[f"{prefix}.manipulator"].to_numpy()
+            ).astype(np.float64, copy=False).reshape(
+                -1, slot_count, manipulator_dim
+            )
+            valid = np.stack(frame[f"{prefix}.valid"].to_numpy()).astype(
+                np.bool_, copy=False
+            ).reshape(-1, slot_count)
         base_valid = base[valid]
         manipulator_valid = manipulator[valid]
         sample_mask = rng.random(len(base_valid)) < sample_probability
@@ -258,6 +376,7 @@ def prepare(
         "dataset_root": str(root),
         "embodiment": schema["embodiment"],
         "fit_split": split,
+        "split_manifest_sha256": split_manifest_sha256,
         "statistics_method": {
             "mean_std_min_max": "exact_streaming",
             "q01_q99": "deterministic_uniform_bernoulli_sample",
@@ -280,6 +399,10 @@ def prepare(
         },
         "plan_horizon": horizon,
         "plan_time_offsets": offsets,
+        "num_plan_blocks": num_plan_blocks,
+        "block_anchor_offsets": plan_meta.get("block_anchor_offsets", [0]),
+        "global_plan_offsets": plan_meta.get("global_waypoint_offsets", offsets),
+        "coordinate_frame": plan_meta.get("coordinate_frame", "current_base"),
         "control_fps": float(extensions["time"]["control_fps"]),
         "base_dim": 4,
         "manipulator_dim": manipulator_dim,
@@ -301,6 +424,16 @@ def prepare(
             "rotation6d_max_row_unit_norm_error": rotation6d_max_row_unit_norm_error,
             "rotation6d_max_abs_row_dot": rotation6d_max_abs_row_dot,
         },
+        "label_source": (
+            "dynamic_world_trajectory" if dynamic_multiblock else "materialized"
+        ),
+        "label_spec": label_spec,
+        "label_spec_hash": (
+            block_plan_spec_hash(block_anchor_offsets, local_waypoint_offsets)
+            if dynamic_multiblock
+            else None
+        ),
+        "statistics_path": str(output),
     }
     write_json(output, result)
     return result
@@ -319,9 +452,61 @@ def main() -> None:
         action="store_true",
         help="Also replace meta/stats.json using only the selected split.",
     )
+    parser.add_argument(
+        "--multiblock",
+        action="store_true",
+        help="Fit block-major labels and write meta/multiblock_plan_stats.json.",
+    )
+    parser.add_argument(
+        "--dynamic-multiblock",
+        action="store_true",
+        help="Derive block labels from canonical world-state columns.",
+    )
+    parser.add_argument(
+        "--block-anchor-offsets",
+        default="0,8,16,24",
+        help="Comma-separated dynamic block anchor offsets.",
+    )
+    parser.add_argument(
+        "--block-local-offsets",
+        default="4,8",
+        help="Comma-separated local offsets inside every dynamic block.",
+    )
+    parser.add_argument(
+        "--plan-config",
+        type=Path,
+        help="Read block_anchor_offsets and plan_local_offsets from a YAML config.",
+    )
+    parser.add_argument(
+        "--stats-output-dir",
+        type=Path,
+        help="Optional output directory; filename remains spec-hashed.",
+    )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Reuse an existing statistics file when split and spec match.",
+    )
     args = parser.parse_args()
     if args.quantile_sample_size <= 0:
         parser.error("--quantile-sample-size must be positive")
+
+    if args.multiblock and args.dynamic_multiblock:
+        parser.error("--multiblock and --dynamic-multiblock are mutually exclusive")
+
+    def parse_offsets(raw: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(value.strip()) for value in raw.split(",") if value.strip())
+        except ValueError as error:
+            parser.error(f"Invalid offset list {raw!r}: {error}")
+
+    block_anchor_offsets = parse_offsets(args.block_anchor_offsets)
+    local_waypoint_offsets = parse_offsets(args.block_local_offsets)
+    if args.plan_config is not None:
+        with args.plan_config.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        block_anchor_offsets = tuple(int(v) for v in config["block_anchor_offsets"])
+        local_waypoint_offsets = tuple(int(v) for v in config["plan_local_offsets"])
 
     for root in resolve_roots(args.dataset_root):
         result = prepare(
@@ -332,9 +517,15 @@ def main() -> None:
             args.split,
             args.split_manifest,
             args.write_core_stats,
+            args.multiblock,
+            args.dynamic_multiblock,
+            block_anchor_offsets,
+            local_waypoint_offsets,
+            args.stats_output_dir,
+            args.reuse_existing,
         )
         print(
-            f"Wrote {root / 'meta/plan_stats.json'}: "
+            f"Ready {result['statistics_path']}: "
             f"{result['counts']['valid_waypoints']} valid waypoints, "
             f"manipulator_dim={result['manipulator_dim']}"
         )

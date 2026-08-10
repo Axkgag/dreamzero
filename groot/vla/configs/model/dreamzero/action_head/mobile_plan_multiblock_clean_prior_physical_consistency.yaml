@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - mobile_plan_multiblock_flow_matching
+  - _self_
+
+num_action_per_block: 5
+
+action_head_cfg:
+  _target_: groot.vla.model.dreamzero.action_head.mobile_plan_multiblock_flow_matching.MobilePlanMultiBlockCleanPriorFlowMatchingActionHead
+  config:
+    _target_: groot.vla.model.dreamzero.action_head.mobile_plan_multiblock_flow_matching.MobilePlanMultiBlockCleanPriorPolicyHeadConfig
+    prior_condition_mode: normal
+    prior:
+      time_offsets: [8]
+      predict_base: true
+      predict_eef: false
+      eef_frame: future_base
+    base_prior_loss_weight: 0.1
+    base_prior_xy_loss_weight: 1.0
+    base_prior_yaw_loss_weight: 1.0
+    base_prior_unit_loss_weight: 0.01
+    base_prior_loss_start_step: 200
+    base_prior_loss_ramp_steps: 500
+    eef_prior_loss_weight: 0.1
+    eef_prior_position_loss_weight: 1.0
+    eef_prior_rotation_loss_weight: 1.0
+    eef_prior_loss_start_step: 200
+    eef_prior_loss_ramp_steps: 500
+    joint_prior_consistency_loss_weight: 0.05
+    joint_prior_consistency_position_loss_weight: 1.0
+    joint_prior_consistency_rotation_loss_weight: 1.0
+    joint_prior_consistency_loss_start_step: 700
+    joint_prior_consistency_loss_ramp_steps: 500
+    plan_component_loss_weight: 0.2
+    base_eef_consistency_loss_weight: 0.05
+    plan_component_loss_start_step: 200
+    plan_component_loss_ramp_steps: 500
+    base_eef_consistency_loss_start_step: 700
+    base_eef_consistency_loss_ramp_steps: 500
+    log_loss_gradient_metrics: true
+    loss_gradient_log_interval: 50
+    diffusion_model_cfg:
+      _target_: groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan_multiblock.WanVideoDiTMultiBlockDualPlanPrior
+      action_dim: ${max_manipulator_action_dim}
+      num_action_per_block: ${num_action_per_block}
+      plan_waypoints_per_block: ${plan_waypoints_per_block}
+      plan_local_offsets: ${plan_local_offsets}
+      base_action_dim: ${base_action_dim}
+      manipulator_action_dim: ${max_manipulator_action_dim}
+      max_state_dim: ${max_state_dim}
+      prior: ${action_head_cfg.config.prior}
+      control_fps: ${control_fps}
+      prior_condition_mode: ${action_head_cfg.config.prior_condition_mode}

@@ -349,6 +349,103 @@ def build_plan_labels(
     )
 
 
+def build_block_plan_labels(
+    robot_base: np.ndarray,
+    robot_hand: np.ndarray,
+    robot_joint: np.ndarray,
+    hand_joint_indices: Sequence[int],
+    block_anchor_offsets: Sequence[int] = (0, 8, 16, 24),
+    local_waypoint_offsets: Sequence[int] = (4, 8),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build block-anchor-relative plans and one raw EEF state per block."""
+    anchors = np.asarray(block_anchor_offsets, dtype=np.int64)
+    local = np.asarray(local_waypoint_offsets, dtype=np.int64)
+    if anchors.ndim != 1 or local.ndim != 1 or not len(anchors) or not len(local):
+        raise ValueError("Block anchors and local waypoint offsets must be non-empty")
+    if np.any(anchors < 0) or np.any(local <= 0):
+        raise ValueError("Block anchors must be non-negative and local offsets positive")
+    if len(np.unique(anchors)) != len(anchors) or len(np.unique(local)) != len(local):
+        raise ValueError("Block anchors and local offsets must be unique")
+    length = robot_base.shape[0]
+    num_blocks = len(anchors)
+    waypoints_per_block = len(local)
+    row = np.arange(length, dtype=np.int64)[:, None]
+    anchor_indices = row + anchors[None, :]
+    anchor_valid = anchor_indices < length
+    safe_anchors = np.minimum(anchor_indices, length - 1)
+    target_indices = anchor_indices[:, :, None] + local[None, None, :]
+    valid = anchor_valid[:, :, None] & (target_indices < length)
+    safe_targets = np.minimum(target_indices, length - 1)
+
+    anchor_position = robot_base[safe_anchors, :3]
+    anchor_rotation = euler_rpy_to_matrix(robot_base[safe_anchors, 3:6])
+    future_base_position = robot_base[safe_targets, :3]
+    future_base_rotation = euler_rpy_to_matrix(robot_base[safe_targets, 3:6])
+    base_relative_position = np.einsum(
+        "tbji,tbwj->tbwi",
+        anchor_rotation,
+        future_base_position - anchor_position[:, :, None, :],
+    )
+    base_relative_rotation = np.einsum(
+        "tbji,tbwjk->tbwik", anchor_rotation, future_base_rotation
+    )
+    base_yaw = np.arctan2(
+        base_relative_rotation[..., 1, 0], base_relative_rotation[..., 0, 0]
+    )
+    base_plan = np.stack(
+        [
+            base_relative_position[..., 0],
+            base_relative_position[..., 1],
+            np.sin(base_yaw),
+            np.cos(base_yaw),
+        ],
+        axis=-1,
+    )
+
+    future_eef_position = robot_hand[safe_targets, :3]
+    future_eef_rotation = euler_rpy_to_matrix(robot_hand[safe_targets, 3:6])
+    eef_relative_position = np.einsum(
+        "tbji,tbwj->tbwi",
+        anchor_rotation,
+        future_eef_position - anchor_position[:, :, None, :],
+    )
+    eef_relative_rotation = np.einsum(
+        "tbji,tbwjk->tbwik", anchor_rotation, future_eef_rotation
+    )
+    eef_rotation_6d = eef_relative_rotation[..., :2, :].reshape(
+        length, num_blocks, waypoints_per_block, 6
+    )
+    joint_position = robot_joint[..., 0]
+    hand_configuration = joint_position[safe_targets][
+        ..., list(hand_joint_indices)
+    ]
+    manipulator_plan = np.concatenate(
+        [eef_relative_position, eef_rotation_6d, hand_configuration], axis=-1
+    )
+
+    anchor_eef_position = robot_hand[safe_anchors, :3]
+    anchor_eef_rpy = robot_hand[safe_anchors, 3:6]
+    anchor_base_rpy = robot_base[safe_anchors, 3:6]
+    state_position, state_rpy, _ = relative_pose(
+        anchor_eef_position,
+        anchor_eef_rpy,
+        anchor_position,
+        anchor_base_rpy,
+    )
+    block_state = np.concatenate([state_position, state_rpy], axis=-1)
+
+    base_plan[~valid] = 0.0
+    manipulator_plan[~valid] = 0.0
+    block_state[~anchor_valid] = 0.0
+    return (
+        base_plan.astype(np.float32),
+        manipulator_plan.astype(np.float32),
+        valid.astype(bool),
+        block_state.astype(np.float32),
+        anchor_valid.astype(bool),
+    )
+
+
 def discover_episodes(root: Path, schema: RobotSchema, limit: int) -> list[Path]:
     robot_root = root / schema.source_dir
     if not robot_root.is_dir():
@@ -538,7 +635,12 @@ def robot_schema_metadata(schema: RobotSchema) -> dict[str, Any]:
     }
 
 
-def extensions_metadata(schema: RobotSchema, offsets: Sequence[int]) -> dict[str, Any]:
+def extensions_metadata(
+    schema: RobotSchema,
+    offsets: Sequence[int],
+    block_anchor_offsets: Sequence[int],
+    local_waypoint_offsets: Sequence[int],
+) -> dict[str, Any]:
     hand_dim = len(schema.hand_joint_indices)
     return {
         "version": 1,
@@ -569,6 +671,28 @@ def extensions_metadata(schema: RobotSchema, offsets: Sequence[int]) -> dict[str
             "valid_field": "action.plan.valid",
             "command_shift_applies_to_plan": False,
         },
+        "action_plan_block": {
+            "semantics": "block-anchor-relative future realized trajectory",
+            "num_blocks": len(block_anchor_offsets),
+            "video_latents_per_block": 2,
+            "rgb_frames_per_block": 8,
+            "block_anchor_offsets": list(block_anchor_offsets),
+            "local_waypoint_offsets": list(local_waypoint_offsets),
+            "global_waypoint_offsets": [
+                int(anchor + offset)
+                for anchor in block_anchor_offsets
+                for offset in local_waypoint_offsets
+            ],
+            "base_shape": [len(block_anchor_offsets), len(local_waypoint_offsets), 4],
+            "manipulator_shape": [
+                len(block_anchor_offsets), len(local_waypoint_offsets), 9 + hand_dim
+            ],
+            "state_shape": [len(block_anchor_offsets), 6],
+            "packing": "block_major_base_then_manipulator",
+            "coordinate_frame": "each_block_anchor_base",
+            "valid_field": "action.plan.block.valid",
+            "state_valid_field": "observation.plan.block.state_valid",
+        },
         "depth": {
             "source": "depth_image_{head,arm}.mp4",
             "quality": "lossy_h264_pseudo_range_depth",
@@ -584,6 +708,30 @@ def extensions_metadata(schema: RobotSchema, offsets: Sequence[int]) -> dict[str
                 "shape": [len(offsets) * (9 + hand_dim)], "role": "future_target"
             },
             "action.plan.valid": {"shape": [len(offsets)], "role": "mask"},
+            "action.plan.block.base_waypoints": {
+                "shape": [len(block_anchor_offsets) * len(local_waypoint_offsets) * 4],
+                "role": "block_future_target",
+            },
+            "action.plan.block.manipulator": {
+                "shape": [
+                    len(block_anchor_offsets)
+                    * len(local_waypoint_offsets)
+                    * (9 + hand_dim)
+                ],
+                "role": "block_future_target",
+            },
+            "action.plan.block.valid": {
+                "shape": [len(block_anchor_offsets) * len(local_waypoint_offsets)],
+                "role": "block_mask",
+            },
+            "observation.plan.block.state": {
+                "shape": [len(block_anchor_offsets) * 6],
+                "role": "block_anchor_state",
+            },
+            "observation.plan.block.state_valid": {
+                "shape": [len(block_anchor_offsets)],
+                "role": "block_state_mask",
+            },
             "observation.robot_joint": {
                 "shape": [len(schema.joint_names) * 3], "role": "auxiliary_state"
             },
@@ -646,6 +794,8 @@ def dataframe_for_episode(
     media_fps: float,
     control_fps: float,
     offsets: np.ndarray,
+    block_anchor_offsets: np.ndarray,
+    local_waypoint_offsets: np.ndarray,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     length = len(data["action"])
     robot_base = np.asarray(data["robot_base"], dtype=np.float64)
@@ -659,6 +809,20 @@ def dataframe_for_episode(
     source_action_index = np.minimum(np.arange(length) + 1, length - 1)
     base_plan, manipulator_plan, plan_valid = build_plan_labels(
         robot_base, robot_hand, robot_joint, schema.hand_joint_indices, offsets
+    )
+    (
+        block_base_plan,
+        block_manipulator_plan,
+        block_plan_valid,
+        block_state,
+        block_state_valid,
+    ) = build_block_plan_labels(
+        robot_base,
+        robot_hand,
+        robot_joint,
+        schema.hand_joint_indices,
+        block_anchor_offsets,
+        local_waypoint_offsets,
     )
 
     frame_index = np.arange(length, dtype=np.int64)
@@ -684,6 +848,15 @@ def dataframe_for_episode(
         "action.plan.base_waypoints": list_column(base_plan.reshape(length, -1)),
         "action.plan.manipulator": list_column(manipulator_plan.reshape(length, -1)),
         "action.plan.valid": list_column(plan_valid),
+        "action.plan.block.base_waypoints": list_column(
+            block_base_plan.reshape(length, -1)
+        ),
+        "action.plan.block.manipulator": list_column(
+            block_manipulator_plan.reshape(length, -1)
+        ),
+        "action.plan.block.valid": list_column(block_plan_valid.reshape(length, -1)),
+        "observation.plan.block.state": list_column(block_state.reshape(length, -1)),
+        "observation.plan.block.state_valid": list_column(block_state_valid),
         "observation.base.world": list_column(robot_base.astype(np.float32)),
         "observation.eef.world": list_column(robot_hand.astype(np.float32)),
         "observation.robot_joint": list_column(robot_joint.reshape(length, -1).astype(np.float32)),
@@ -707,6 +880,11 @@ def dataframe_for_episode(
         "base_plan": base_plan,
         "manipulator_plan": manipulator_plan,
         "plan_valid": plan_valid,
+        "block_base_plan": block_base_plan,
+        "block_manipulator_plan": block_manipulator_plan,
+        "block_plan_valid": block_plan_valid,
+        "block_state": block_state,
+        "block_state_valid": block_state_valid,
     }
     return pd.DataFrame(columns), arrays
 
@@ -733,6 +911,8 @@ def convert_embodiment(
     schema: RobotSchema,
     source_paths: Sequence[Path],
     offsets: np.ndarray,
+    block_anchor_offsets: np.ndarray,
+    local_waypoint_offsets: np.ndarray,
     link_mode: str,
     control_fps: float,
 ) -> Path:
@@ -789,6 +969,8 @@ def convert_embodiment(
             media_fps=media_fps,
             control_fps=control_fps,
             offsets=offsets,
+            block_anchor_offsets=block_anchor_offsets,
+            local_waypoint_offsets=local_waypoint_offsets,
         )
         chunk = episode_index // 1000
         parquet_path = dataset_root / f"data/chunk-{chunk:03d}/episode_{episode_index:06d}.parquet"
@@ -850,7 +1032,15 @@ def convert_embodiment(
     write_json(dataset_root / "meta/embodiment.json", {"embodiment_tag": "xdof"})
     write_json(dataset_root / "meta/robot_schema.json", robot_schema_metadata(schema))
     write_json(dataset_root / "meta/calibration.json", calibration_metadata(schema))
-    write_json(dataset_root / "meta/extensions.json", extensions_metadata(schema, offsets.tolist()))
+    write_json(
+        dataset_root / "meta/extensions.json",
+        extensions_metadata(
+            schema,
+            offsets.tolist(),
+            block_anchor_offsets.tolist(),
+            local_waypoint_offsets.tolist(),
+        ),
+    )
     write_json(dataset_root / "meta/relative_stats_dreamzero.json", {})
     write_json(
         dataset_root / "meta/stats.json",
@@ -886,6 +1076,30 @@ def convert_embodiment(
         "action.plan.base_waypoints": {"dtype": "float32", "shape": [len(offsets) * 4]},
         "action.plan.manipulator": {"dtype": "float32", "shape": [len(offsets) * (9 + hand_dim)]},
         "action.plan.valid": {"dtype": "bool", "shape": [len(offsets)]},
+        "action.plan.block.base_waypoints": {
+            "dtype": "float32",
+            "shape": [len(block_anchor_offsets) * len(local_waypoint_offsets) * 4],
+        },
+        "action.plan.block.manipulator": {
+            "dtype": "float32",
+            "shape": [
+                len(block_anchor_offsets)
+                * len(local_waypoint_offsets)
+                * (9 + hand_dim)
+            ],
+        },
+        "action.plan.block.valid": {
+            "dtype": "bool",
+            "shape": [len(block_anchor_offsets) * len(local_waypoint_offsets)],
+        },
+        "observation.plan.block.state": {
+            "dtype": "float32",
+            "shape": [len(block_anchor_offsets) * 6],
+        },
+        "observation.plan.block.state_valid": {
+            "dtype": "bool",
+            "shape": [len(block_anchor_offsets)],
+        },
         "observation.base.world": {"dtype": "float32", "shape": [6]},
         "observation.eef.world": {"dtype": "float32", "shape": [6]},
         "observation.robot_joint": {
@@ -1281,6 +1495,12 @@ def command_convert(args: argparse.Namespace) -> int:
         raise FileExistsError(f"Refusing to overwrite existing output root: {output_root}")
     output_root.mkdir(parents=True)
     offsets = parse_offsets(args.waypoint_offsets)
+    block_anchor_offsets = parse_offsets(args.block_anchor_offsets)
+    local_waypoint_offsets = parse_offsets(args.block_local_offsets)
+    if block_anchor_offsets[0] != 0:
+        raise ValueError("--block-anchor-offsets must begin at 0")
+    if np.any(local_waypoint_offsets <= 0):
+        raise ValueError("--block-local-offsets must be positive")
     dataset_roots: list[Path] = []
     for embodiment in args.embodiments:
         schema = ROBOT_SCHEMAS[embodiment]
@@ -1293,6 +1513,8 @@ def command_convert(args: argparse.Namespace) -> int:
             schema=schema,
             source_paths=source_paths,
             offsets=offsets,
+            block_anchor_offsets=block_anchor_offsets,
+            local_waypoint_offsets=local_waypoint_offsets,
             link_mode=args.link_mode,
             control_fps=args.control_fps,
         )
@@ -1346,6 +1568,16 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument(
         "--waypoint-offsets", default="1,4,8,12,16,24",
         help="Comma-separated control-frame offsets for extension action-plan labels",
+    )
+    convert.add_argument(
+        "--block-anchor-offsets",
+        default="0,8,16,24",
+        help="Comma-separated anchor offsets for block-major plan labels",
+    )
+    convert.add_argument(
+        "--block-local-offsets",
+        default="4,8",
+        help="Comma-separated local waypoint offsets inside every block",
     )
     convert.add_argument("--control-fps", type=float, default=30.0)
     convert.add_argument("--link-mode", choices=["hardlink", "symlink", "copy"], default="hardlink")

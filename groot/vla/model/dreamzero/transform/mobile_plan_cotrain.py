@@ -159,3 +159,160 @@ class MobilePlanCotrainTransform(DreamTransform):
         # The torch DataLoader calls transforms per sample; batching belongs to
         # MobilePlanDataCollator, which retains the semantic branch keys.
         return self.apply_single(data)
+
+
+class MobileBlockPlanDataCollator(DefaultDataCollator):
+    """Stack multiblock samples while retaining their semantic axes."""
+
+    def __init__(
+        self,
+        tokenizer_path: str = "google/umt5-xxl",
+        max_length: int = 512,
+        num_views: int = 1,
+        embodiment_tag_mapping=None,
+        num_plan_blocks: int = 4,
+        plan_waypoints_per_block: int = 2,
+        base_action_dim: int = 4,
+        manipulator_action_dim: int = 21,
+        max_state_dim: int = 64,
+    ):
+        super().__init__(
+            tokenizer_path=tokenizer_path,
+            max_length=max_length,
+            num_views=num_views,
+            embodiment_tag_mapping=embodiment_tag_mapping,
+        )
+        self.num_plan_blocks = int(num_plan_blocks)
+        self.plan_waypoints_per_block = int(plan_waypoints_per_block)
+        self.base_action_dim = int(base_action_dim)
+        self.manipulator_action_dim = int(manipulator_action_dim)
+        self.max_state_dim = int(max_state_dim)
+        if self.num_plan_blocks <= 0 or self.plan_waypoints_per_block <= 0:
+            raise ValueError("Plan block and waypoint counts must be positive")
+
+    def _validate_batch_shapes(
+        self, batch: Dict[str, Any], batch_size: int
+    ) -> None:
+        blocks = self.num_plan_blocks
+        waypoints = self.plan_waypoints_per_block
+        packed_width = 2 * waypoints
+
+        expected = {
+            "base_action": (
+                batch_size,
+                blocks,
+                waypoints,
+                self.base_action_dim,
+            ),
+            "manipulator_action": (
+                batch_size,
+                blocks,
+                waypoints,
+                self.manipulator_action_dim,
+            ),
+            "base_action_mask": (
+                batch_size,
+                blocks,
+                waypoints,
+                self.base_action_dim,
+            ),
+            "manipulator_action_mask": (
+                batch_size,
+                blocks,
+                waypoints,
+                self.manipulator_action_dim,
+            ),
+            "plan_local_offsets": (batch_size, waypoints),
+            "block_anchor_offsets": (batch_size, blocks),
+            "global_plan_offsets": (batch_size, blocks * waypoints),
+        }
+        for key, shape in expected.items():
+            if tuple(batch[key].shape) != shape:
+                raise ValueError(
+                    f"{key}: expected {shape}, got {tuple(batch[key].shape)}"
+                )
+        expected_action = (blocks * packed_width, self.manipulator_action_dim)
+        if tuple(batch["action"].shape[1:]) != expected_action:
+            raise ValueError(
+                f"Expected packed action [B,{expected_action[0]},"
+                f"{expected_action[1]}], got {batch['action'].shape}"
+            )
+        expected_state = (blocks, self.max_state_dim)
+        if tuple(batch["state"].shape[1:]) != expected_state:
+            raise ValueError(
+                f"Expected state [B,{blocks},{self.max_state_dim}], "
+                f"got {batch['state'].shape}"
+            )
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = super().__call__(features)
+        self._validate_batch_shapes(batch, len(features))
+        return batch
+
+
+class MobileBlockPlanCotrainTransform(MobilePlanCotrainTransform):
+    """Pack configurable local dual-plan chunks for DreamZero block routing."""
+
+    num_plan_blocks: int = 4
+    plan_waypoints_per_block: int = 2
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.plan_horizon != self.plan_waypoints_per_block:
+            raise ValueError("plan_horizon must equal waypoints per block")
+        if self.action_horizon != 2 * self.plan_waypoints_per_block:
+            raise ValueError("action_horizon must be the single-block flow width")
+
+    def _prepare_action(self, data: dict):
+        base = _numpy(data["base_action"]).astype(np.float32)
+        manipulator = _numpy(data["manipulator_action"]).astype(np.float32)
+        base_mask = _numpy(data["base_action_mask"]).astype(bool)
+        manipulator_mask = _numpy(data["manipulator_action_mask"]).astype(bool)
+        expected_base = (
+            self.num_plan_blocks,
+            self.plan_waypoints_per_block,
+            self.base_action_dim,
+        )
+        expected_manipulator = (
+            self.num_plan_blocks,
+            self.plan_waypoints_per_block,
+            self.manipulator_action_dim,
+        )
+        if base.shape != expected_base:
+            raise ValueError(f"Unexpected block Base action shape: {base.shape}")
+        if manipulator.shape != expected_manipulator:
+            raise ValueError(
+                f"Unexpected block Manipulator action shape: {manipulator.shape}"
+            )
+        padded_base = np.zeros(
+            (*base.shape[:-1], self.manipulator_action_dim), dtype=np.float32
+        )
+        padded_base[..., : self.base_action_dim] = base
+        padded_base_mask = np.zeros_like(padded_base, dtype=bool)
+        padded_base_mask[..., : self.base_action_dim] = base_mask
+        block_action = np.concatenate([padded_base, manipulator], axis=1)
+        block_mask = np.concatenate([padded_base_mask, manipulator_mask], axis=1)
+        action = block_action.reshape(
+            self.num_plan_blocks * self.action_horizon,
+            self.manipulator_action_dim,
+        )
+        action_mask = block_mask.reshape(action.shape)
+        return action, action_mask, action.shape[0]
+
+    def apply_single(self, data: dict) -> dict:
+        data = self._canonicalize(data)
+        transformed = DreamTransform.apply_single(self, data)
+        for key in (
+            "base_action",
+            "manipulator_action",
+            "base_action_mask",
+            "manipulator_action_mask",
+            "plan_valid",
+            "plan_local_offsets",
+            "plan_time_seconds",
+            "block_anchor_offsets",
+            "global_plan_offsets",
+            "block_state_valid",
+        ):
+            transformed[key] = _numpy(data[key])
+        return transformed
