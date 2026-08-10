@@ -40,7 +40,9 @@ class VGGT3DWAMConfig(PretrainedConfig):
         video_temporal_heads: int = 4,
         video_fusion_dim: int = 256,
         video_query_heads: int = 8,
+        video_query_local_residual: bool = False,
         video_decoder_dim: int = 128,
+        video_decoder_latent_residual_blocks: int = 0,
         temporal_codec_num_downsample_stages: int = 2,
         temporal_decoder_num_upsample_stages: int = 2,
         temporal_codec_use_layer_cache: bool = True,
@@ -119,7 +121,11 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.video_temporal_heads = video_temporal_heads
         self.video_fusion_dim = video_fusion_dim
         self.video_query_heads = video_query_heads
+        self.video_query_local_residual = video_query_local_residual
         self.video_decoder_dim = video_decoder_dim
+        self.video_decoder_latent_residual_blocks = (
+            video_decoder_latent_residual_blocks
+        )
         self.temporal_codec_num_downsample_stages = (
             temporal_codec_num_downsample_stages
         )

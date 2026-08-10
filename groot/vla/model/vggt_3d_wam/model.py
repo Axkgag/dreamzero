@@ -82,11 +82,15 @@ class VGGT3DWAMModel(PreTrainedModel):
             temporal_heads=config.video_temporal_heads,
             fusion_dim=config.video_fusion_dim,
             query_heads=config.video_query_heads,
+            query_local_residual=config.video_query_local_residual,
         )
         self.video_decoder = VideoDecoder(
             config.latent_dim,
             config.video_decoder_dim,
             config.latent_spatial_stride,
+            latent_residual_blocks=(
+                config.video_decoder_latent_residual_blocks
+            ),
         )
         self.metric_encoder = MetricTokenEncoder(
             input_dim=2 * config.feature_tap_dim,

@@ -42,7 +42,9 @@ model:
     video_temporal_heads: 8
     video_fusion_dim: 256
     video_query_heads: 8
+    video_query_local_residual: true
     video_decoder_dim: 256
+    video_decoder_latent_residual_blocks: 3
     temporal_codec_num_downsample_stages: 2
     temporal_decoder_num_upsample_stages: 2
     temporal_codec_use_layer_cache: true

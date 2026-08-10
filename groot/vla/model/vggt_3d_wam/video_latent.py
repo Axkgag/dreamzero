@@ -54,6 +54,7 @@ class LearnedSpatialQueryResampler(nn.Module):
         num_heads: int,
         source_size: tuple[int, int] = (12, 23),
         target_size: tuple[int, int] = (10, 20),
+        use_local_residual: bool = False,
     ) -> None:
         super().__init__()
         self.source_size = source_size
@@ -79,6 +80,16 @@ class LearnedSpatialQueryResampler(nn.Module):
             nn.GELU(),
             nn.Linear(4 * channels, channels),
         )
+        self.local_projection = (
+            nn.Conv2d(channels, channels, 1)
+            if use_local_residual
+            else None
+        )
+        if self.local_projection is not None:
+            # Preserve the pretrained v3 resampler exactly at initialization.
+            # The local path is learned gradually during v3.1 fine-tuning.
+            nn.init.zeros_(self.local_projection.weight)
+            nn.init.zeros_(self.local_projection.bias)
 
     def forward(
         self,
@@ -111,6 +122,15 @@ class LearnedSpatialQueryResampler(nn.Module):
                 align_corners=False,
             )
         query = query.flatten(2).transpose(1, 2).expand(batch, -1, -1)
+        if self.local_projection is not None:
+            local = F.interpolate(
+                inputs,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            local = self.local_projection(local)
+            query = query + local.flatten(2).transpose(1, 2)
         attended, _ = self.cross_attention(
             self.query_norm(query),
             self.source_norm(source),
@@ -182,6 +202,7 @@ class VideoLatentBranch(nn.Module):
         temporal_heads: int,
         fusion_dim: int,
         query_heads: int,
+        query_local_residual: bool = False,
     ) -> None:
         super().__init__()
         if temporal_stride != 4:
@@ -203,6 +224,7 @@ class VideoLatentBranch(nn.Module):
         self.spatial_resampler = LearnedSpatialQueryResampler(
             fusion_dim,
             query_heads,
+            use_local_residual=query_local_residual,
         )
         self.latent_projection = nn.Sequential(
             nn.GroupNorm(math.gcd(8, fusion_dim), fusion_dim),
@@ -301,16 +323,28 @@ class VideoDecoder(nn.Module):
         latent_dim: int,
         hidden_dim: int,
         spatial_stride: int = 16,
+        latent_residual_blocks: int = 0,
     ) -> None:
         super().__init__()
         if spatial_stride != 16:
             raise ValueError(
                 "The Wan2.2-compatible video decoder requires spatial stride 16"
             )
+        if latent_residual_blocks < 0:
+            raise ValueError("latent_residual_blocks must be non-negative")
         hidden_dim = max(32, hidden_dim)
         self.spatial_stride = spatial_stride
         self.temporal_decoder = WanTemporalDecoder(latent_dim, spatial_kernel=3)
         self.input_projection = nn.Conv2d(latent_dim, hidden_dim, 3, padding=1)
+        latent_refine: list[nn.Module] = []
+        for _ in range(latent_residual_blocks):
+            block = SpatialResidualBlock(hidden_dim)
+            # A zero-initialized final convolution makes each newly added
+            # residual block an exact identity before v3.1 fine-tuning.
+            nn.init.zeros_(block.conv2.weight)
+            nn.init.zeros_(block.conv2.bias)
+            latent_refine.append(block)
+        self.latent_refine = nn.Sequential(*latent_refine)
         decoder_channels = (
             [192, 128, 96, 64]
             if hidden_dim >= 256
@@ -353,6 +387,7 @@ class VideoDecoder(nn.Module):
             width,
         )
         frames = self.input_projection(frames)
+        frames = self.latent_refine(frames)
         frames = self.spatial_decoder(frames)
         frames = self.output_projection(F.silu(frames)).tanh()
         expected_size = (height * self.spatial_stride, width * self.spatial_stride)

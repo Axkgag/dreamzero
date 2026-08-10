@@ -23,6 +23,10 @@ from groot.vla.model.vggt_3d_wam.temporal_codec import (
     wan_latent_time,
     wan_video_time,
 )
+from groot.vla.model.vggt_3d_wam.video_latent import (
+    LearnedSpatialQueryResampler,
+    VideoDecoder,
+)
 
 
 def _tiny_config() -> VGGT3DWAMConfig:
@@ -97,6 +101,67 @@ def test_wan_temporal_contract_and_gradients():
     assert frames.grad is not None
     assert encoder.downsample1.conv.conv.weight.grad is not None
     assert decoder.upsample1.expand.weight.grad is not None
+
+
+def test_v31_local_residual_starts_from_v3_resampler_function():
+    torch.manual_seed(0)
+    v3 = LearnedSpatialQueryResampler(
+        channels=8,
+        num_heads=2,
+        source_size=(3, 5),
+        target_size=(2, 4),
+        use_local_residual=False,
+    ).eval()
+    v31 = LearnedSpatialQueryResampler(
+        channels=8,
+        num_heads=2,
+        source_size=(3, 5),
+        target_size=(2, 4),
+        use_local_residual=True,
+    ).eval()
+    missing, unexpected = v31.load_state_dict(v3.state_dict(), strict=False)
+
+    assert unexpected == []
+    assert set(missing) == {
+        "local_projection.weight",
+        "local_projection.bias",
+    }
+    inputs = torch.randn(2, 8, 3, 5)
+    with torch.no_grad():
+        expected = v3(inputs)
+        actual = v31(inputs)
+    torch.testing.assert_close(actual, expected)
+
+    with torch.no_grad():
+        v31.local_projection.weight.copy_(
+            torch.eye(8).reshape(8, 8, 1, 1)
+        )
+        changed = v31(inputs)
+    assert not torch.allclose(changed, expected)
+
+
+def test_v31_decoder_refinement_starts_as_identity():
+    torch.manual_seed(0)
+    v3 = VideoDecoder(
+        latent_dim=8,
+        hidden_dim=32,
+        latent_residual_blocks=0,
+    ).eval()
+    v31 = VideoDecoder(
+        latent_dim=8,
+        hidden_dim=32,
+        latent_residual_blocks=3,
+    ).eval()
+    missing, unexpected = v31.load_state_dict(v3.state_dict(), strict=False)
+
+    assert unexpected == []
+    assert missing
+    latent = torch.randn(1, 1, 8, 3, 2, 4)
+    with torch.no_grad():
+        expected = v3(latent)
+        actual = v31(latent)
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (1, 9, 1, 3, 32, 64)
 
 
 def test_numpy_rng_state_loads_with_weights_only(tmp_path):

@@ -20,11 +20,11 @@ DEFAULT_NUM_GPUS=4
 DEFAULT_MAX_STEPS=30000
 DEFAULT_SAVE_STEPS=5000
 DEFAULT_EVAL_STEPS=5000
-DEFAULT_PER_DEVICE_BATCH_SIZE=2
-DEFAULT_HEAD_LEARNING_RATE=5e-5
-DEFAULT_BACKBONE_LEARNING_RATE=2e-5
-DEFAULT_WARMUP_RATIO=0.01
-DEFAULT_MIN_LR_RATE=0.2
+DEFAULT_PER_DEVICE_BATCH_SIZE=1
+DEFAULT_HEAD_LEARNING_RATE=2e-5
+DEFAULT_BACKBONE_LEARNING_RATE=5e-6
+DEFAULT_WARMUP_RATIO=0.02
+DEFAULT_MIN_LR_RATE=0.5
 DEFAULT_MAX_EVAL_SAMPLES=256
 
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d_%H%M%S)"}
@@ -104,9 +104,9 @@ echo "  video_contract=33x160x320 -> 9x10x20 -> 33x160x320"
 echo "  temporal_layout=frame0 + 8 chunks of 4 frames (shared by 2D/3D)"
 echo "  temporal_window=[0],[1:5],[5:9],... (closed bidirectional chunks)"
 echo "  feature_taps=[4,11,17,23], frame/global 1024->128 + concat"
-echo "  video_fusion=4x256 concat -> 1024->256 -> learned 10x20 queries -> 48"
+echo "  video_fusion=4x256 concat -> 1024->256 -> local-residual 10x20 queries -> 48"
 echo "  temporal_codec=two cached causal stride-2 stages; decoder=x2,x2"
-echo "  video_decoder=256->192->128->96->64, learned 2x upsampling"
+echo "  video_decoder=3x residual(256) -> 256->192->128->96->64, learned 2x upsampling"
 echo "  video_losses=Charbonnier + 0.1 LPIPS + 0.2 SSIM + 0.1 spatial-gradient + 0.1 temporal-difference"
 echo "  metric_grid=B0-forward x[0,3] y[-2,2] z[-0.5,2], 8x12x8=768 tokens"
 echo "  pointmap_decoder=40x80 ray rendering -> learned 80x160 refinement"
