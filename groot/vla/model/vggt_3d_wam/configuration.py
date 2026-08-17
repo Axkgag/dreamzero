@@ -41,6 +41,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         video_fusion_dim: int = 256,
         video_query_heads: int = 8,
         video_query_local_residual: bool = False,
+        video_rgb_path_enabled: bool = True,
         video_decoder_dim: int = 128,
         video_decoder_latent_residual_blocks: int = 0,
         temporal_codec_num_downsample_stages: int = 2,
@@ -122,6 +123,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.video_fusion_dim = video_fusion_dim
         self.video_query_heads = video_query_heads
         self.video_query_local_residual = video_query_local_residual
+        self.video_rgb_path_enabled = video_rgb_path_enabled
         self.video_decoder_dim = video_decoder_dim
         self.video_decoder_latent_residual_blocks = (
             video_decoder_latent_residual_blocks

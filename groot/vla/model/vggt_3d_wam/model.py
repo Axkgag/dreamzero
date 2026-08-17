@@ -83,6 +83,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             fusion_dim=config.video_fusion_dim,
             query_heads=config.video_query_heads,
             query_local_residual=config.video_query_local_residual,
+            use_rgb_path=config.video_rgb_path_enabled,
         )
         self.video_decoder = VideoDecoder(
             config.latent_dim,
@@ -192,12 +193,14 @@ class VGGT3DWAMModel(PreTrainedModel):
         self,
         features: BackboneOutput,
         video_size: tuple[int, int],
+        rgb_video: torch.Tensor,
         *,
         sample_posterior: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.video_encoder(
             features.feature_levels,
             video_size,
+            rgb_video=rgb_video,
             sample_posterior=sample_posterior,
         )
 
@@ -234,6 +237,7 @@ class VGGT3DWAMModel(PreTrainedModel):
         latent, mu, logvar = self._encode_2d_features(
             features,
             tuple(canonical.shape[-2:]),
+            canonical,
             sample_posterior=sample_posterior,
         )
         if wan_layout:
@@ -285,6 +289,7 @@ class VGGT3DWAMModel(PreTrainedModel):
         latent_2d, mu_2d, logvar_2d = self._encode_2d_features(
             features,
             tuple(canonical.shape[-2:]),
+            canonical,
             sample_posterior=sample_posterior,
         )
         latent_3d, _, voxel_visible = self.metric_encoder(
@@ -781,6 +786,7 @@ class VGGT3DWAMModel(PreTrainedModel):
         latent, mu, logvar = self._encode_2d_features(
             features,
             tuple(video.shape[-2:]),
+            masked_video,
             sample_posterior=self.training,
         )
         geometry_tokens, token_grid, voxel_visible = self.metric_encoder(
@@ -811,6 +817,10 @@ class VGGT3DWAMModel(PreTrainedModel):
         )
 
         video_recon_loss = charbonnier_loss(reconstructed, video)
+        video_mse = F.mse_loss(reconstructed.detach(), video)
+        video_psnr = 10.0 * torch.log10(
+            video_mse.new_tensor(4.0) / video_mse.clamp_min(1e-8)
+        )
         video_ssim_loss = (
             ssim_loss(reconstructed, video)
             if self.config.ssim_loss_weight > 0
@@ -934,6 +944,7 @@ class VGGT3DWAMModel(PreTrainedModel):
         outputs = {
             "loss": total_loss,
             "video_recon_loss": video_recon_loss,
+            "video_psnr": video_psnr,
             "video_lpips_loss": video_lpips_loss,
             "video_ssim_loss": video_ssim_loss,
             "video_spatial_gradient_loss": video_spatial_gradient_loss,

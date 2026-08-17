@@ -43,6 +43,9 @@ model:
     video_fusion_dim: 256
     video_query_heads: 8
     video_query_local_residual: true
+    # Lightweight per-frame RGB detail path. Its zero-initialized residual
+    # projection preserves pre-v3.4 checkpoint behavior at initialization.
+    video_rgb_path_enabled: true
     video_decoder_dim: 256
     video_decoder_latent_residual_blocks: 3
     temporal_codec_num_downsample_stages: 2

@@ -45,6 +45,44 @@ class FusionResidualBlock(nn.Module):
         return hidden + residual
 
 
+class LightweightRGBEncoder(nn.Module):
+    """Preserve local RGB detail on the final ``H/16 x W/16`` lattice."""
+
+    def __init__(self, output_channels: int) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            # Start with an exact spatial-to-channel rearrangement, following
+            # Wan VAE's information-preserving first compression step.
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(12, 32, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 96, 3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(96, 128, 3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.output_projection = nn.Conv2d(128, output_channels, 1)
+        # Preserve pre-RGB-path behavior exactly at initialization. The final
+        # projection learns first, then starts updating the RGB encoder.
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(
+                "LightweightRGBEncoder expects [N,3,H,W], "
+                f"got {tuple(rgb.shape)}"
+            )
+        if rgb.shape[-2] % 16 or rgb.shape[-1] % 16:
+            raise ValueError(
+                "RGB dimensions must be divisible by 16, "
+                f"got {tuple(rgb.shape[-2:])}"
+            )
+        return self.output_projection(self.encoder(rgb))
+
+
 class LearnedSpatialQueryResampler(nn.Module):
     """Cross-attend fixed 10x20 latent queries to a 12x23 feature grid."""
 
@@ -203,6 +241,7 @@ class VideoLatentBranch(nn.Module):
         fusion_dim: int,
         query_heads: int,
         query_local_residual: bool = False,
+        use_rgb_path: bool = True,
     ) -> None:
         super().__init__()
         if temporal_stride != 4:
@@ -225,6 +264,9 @@ class VideoLatentBranch(nn.Module):
             fusion_dim,
             query_heads,
             use_local_residual=query_local_residual,
+        )
+        self.rgb_encoder = (
+            LightweightRGBEncoder(fusion_dim) if use_rgb_path else None
         )
         self.latent_projection = nn.Sequential(
             nn.GroupNorm(math.gcd(8, fusion_dim), fusion_dim),
@@ -250,6 +292,7 @@ class VideoLatentBranch(nn.Module):
         features: tuple[torch.Tensor, ...] | list[torch.Tensor],
         video_size: tuple[int, int],
         *,
+        rgb_video: torch.Tensor | None = None,
         sample_posterior: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(features) != self.level_count:
@@ -279,6 +322,35 @@ class VideoLatentBranch(nn.Module):
             )
         )
         spatial = self.spatial_resampler(spatial, latent_size)
+        if self.rgb_encoder is not None:
+            expected_video_shape = (
+                batch,
+                time,
+                views,
+                3,
+                video_height,
+                video_width,
+            )
+            if rgb_video is None or tuple(rgb_video.shape) != expected_video_shape:
+                actual_shape = None if rgb_video is None else tuple(rgb_video.shape)
+                raise ValueError(
+                    "RGB local path expects canonical video "
+                    f"{expected_video_shape}, got {actual_shape}"
+                )
+            rgb_local = self.rgb_encoder(
+                rgb_video.reshape(
+                    batch * time * views,
+                    3,
+                    video_height,
+                    video_width,
+                )
+            )
+            if rgb_local.shape != spatial.shape:
+                raise ValueError(
+                    "RGB and VGGT feature lattices must match, got "
+                    f"{tuple(rgb_local.shape)} and {tuple(spatial.shape)}"
+                )
+            spatial = spatial + rgb_local
         spatial = self.latent_projection(spatial)
         latent_h, latent_w = spatial.shape[-2:]
         spatial = spatial.reshape(

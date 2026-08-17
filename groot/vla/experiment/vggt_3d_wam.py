@@ -113,6 +113,7 @@ class VGGTJSONLLossLoggerCallback(TrainerCallback):
                 or key.endswith("_learning_rate")
                 or key.endswith("_avg")
                 or key.endswith("_ratio")
+                or key.startswith("eval_")
             )
             if not keep:
                 continue
@@ -135,8 +136,40 @@ class VGGTTrainer(Trainer):
         )
         super().__init__(*args, **kwargs)
         self.loss_windows: dict[str, list[float]] = {}
+        self.eval_diagnostic_sums: dict[str, float] = {}
+        self.eval_diagnostic_batches = 0
         self._last_train_visualization_step = -1
         self._val_visualizations_saved = 0
+        self._diagnostic_ratio_pairs = {
+            "pointmap_inside_grid_ratio": (
+                "pointmap_inside_grid_count",
+                "pointmap_raw_valid_count",
+            ),
+            "pointmap_inside_grid_weight_ratio": (
+                "pointmap_inside_grid_weight",
+                "pointmap_raw_valid_weight",
+            ),
+            "ray_valid_ratio": (
+                "ray_valid_sample_count",
+                "ray_total_sample_count",
+            ),
+            "ray_supervised_pixel_ratio": (
+                "ray_supervised_pixel_count",
+                "ray_inside_grid_count",
+            ),
+            "free_space_sample_ratio": (
+                "free_space_sample_count",
+                "ray_valid_sample_count",
+            ),
+            "surface_sample_ratio": (
+                "surface_sample_count",
+                "ray_valid_sample_count",
+            ),
+            "multiview_correspondence_ratio": (
+                "multiview_correspondence_count",
+                "multiview_candidate_count",
+            ),
+        }
 
     def create_optimizer(self):
         """Use a conservative LR for pretrained LoRA and a faster LR for heads."""
@@ -248,7 +281,7 @@ class VGGTTrainer(Trainer):
             if key != "loss"
             and torch.is_tensor(value)
             and value.numel() == 1
-            and key.endswith(("_loss", "_count", "_weight"))
+            and key.endswith(("_loss", "_count", "_weight", "_psnr"))
         }
         if not tracked:
             return {}
@@ -263,7 +296,8 @@ class VGGTTrainer(Trainer):
         return {
             key: float(
                 values[index] / world_size
-                if key.endswith("_loss") or key == "geometry_loss_weight"
+                if key.endswith(("_loss", "_psnr"))
+                or key == "geometry_loss_weight"
                 else values[index]
             )
             for index, key in enumerate(keys)
@@ -354,6 +388,11 @@ class VGGTTrainer(Trainer):
         with torch.no_grad():
             with self.compute_loss_context_manager():
                 outputs = model(inputs)
+        for key, value in self._distributed_diagnostics(outputs).items():
+            self.eval_diagnostic_sums[key] = (
+                self.eval_diagnostic_sums.get(key, 0.0) + value
+            )
+        self.eval_diagnostic_batches += 1
         self._maybe_save_visualization(inputs, outputs, training=False)
         return outputs["loss"].mean().detach(), None, None
 
@@ -371,47 +410,60 @@ class VGGTTrainer(Trainer):
                     family_lrs[str(family)] = float(group["lr"])
             for family, learning_rate in family_lrs.items():
                 logs[f"{family}_learning_rate"] = learning_rate
-        if self.state.global_step % 10 == 0:
+        is_evaluation = any(str(key).startswith("eval_") for key in logs)
+        if not is_evaluation and self.state.global_step % 10 == 0:
             for key, values in self.loss_windows.items():
                 if values:
                     logs[f"{key}_avg"] = sum(values) / len(values)
-            ratio_pairs = {
-                "pointmap_inside_grid_ratio": (
-                    "pointmap_inside_grid_count",
-                    "pointmap_raw_valid_count",
-                ),
-                "pointmap_inside_grid_weight_ratio": (
-                    "pointmap_inside_grid_weight",
-                    "pointmap_raw_valid_weight",
-                ),
-                "ray_valid_ratio": (
-                    "ray_valid_sample_count",
-                    "ray_total_sample_count",
-                ),
-                "ray_supervised_pixel_ratio": (
-                    "ray_supervised_pixel_count",
-                    "ray_inside_grid_count",
-                ),
-                "free_space_sample_ratio": (
-                    "free_space_sample_count",
-                    "ray_valid_sample_count",
-                ),
-                "surface_sample_ratio": (
-                    "surface_sample_count",
-                    "ray_valid_sample_count",
-                ),
-                "multiview_correspondence_ratio": (
-                    "multiview_correspondence_count",
-                    "multiview_candidate_count",
-                ),
-            }
-            for ratio_name, (numerator_key, denominator_key) in ratio_pairs.items():
+            for ratio_name, (
+                numerator_key,
+                denominator_key,
+            ) in self._diagnostic_ratio_pairs.items():
                 numerator = self.loss_windows.get(numerator_key, [])
                 denominator = self.loss_windows.get(denominator_key, [])
                 denominator_sum = sum(denominator)
                 if numerator and denominator_sum > 0:
                     logs[ratio_name] = sum(numerator) / denominator_sum
         return super().log(logs, *args, **kwargs)
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        self.eval_diagnostic_sums = {}
+        self.eval_diagnostic_batches = 0
+        output = super().evaluation_loop(
+            dataloader,
+            description,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if self.eval_diagnostic_batches:
+            for key, total in self.eval_diagnostic_sums.items():
+                suffix = (
+                    "" if key.endswith(("_loss", "_psnr")) else "_avg"
+                )
+                output.metrics[f"{metric_key_prefix}_{key}{suffix}"] = (
+                    total / self.eval_diagnostic_batches
+                )
+            for ratio_name, (
+                numerator_key,
+                denominator_key,
+            ) in self._diagnostic_ratio_pairs.items():
+                numerator = self.eval_diagnostic_sums.get(numerator_key, 0.0)
+                denominator = self.eval_diagnostic_sums.get(
+                    denominator_key, 0.0
+                )
+                if denominator > 0:
+                    output.metrics[f"{metric_key_prefix}_{ratio_name}"] = (
+                        numerator / denominator
+                    )
+        return output
 
     def evaluate(self, *args, **kwargs):
         self._val_visualizations_saved = 0
