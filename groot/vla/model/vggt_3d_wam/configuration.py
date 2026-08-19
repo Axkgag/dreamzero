@@ -53,6 +53,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         lpips_chunk_size: int = 8,
         ssim_loss_weight: float = 0.0,
         spatial_gradient_loss_weight: float = 0.0,
+        laplacian_loss_weight: float = 0.0,
         temporal_difference_loss_weight: float = 0.0,
         geometry_dim: int = 192,
         geometry_heads: int = 6,
@@ -143,6 +144,7 @@ class VGGT3DWAMConfig(PretrainedConfig):
         self.lpips_chunk_size = lpips_chunk_size
         self.ssim_loss_weight = ssim_loss_weight
         self.spatial_gradient_loss_weight = spatial_gradient_loss_weight
+        self.laplacian_loss_weight = laplacian_loss_weight
         self.temporal_difference_loss_weight = (
             temporal_difference_loss_weight
         )

@@ -1,5 +1,7 @@
 # VGGT-3D WAM：方案与实施路线
 
+> 实现核对：2026-08-17，远程 `multiblock-wam` 分支提交 `4242553`。
+
 ## 1. 目标
 
 Mobile manipulation 中，单纯的 2D video latent 容易把底盘 ego-motion、物体运动、
@@ -32,6 +34,8 @@ WAM 同时建模：
 | tokenizer loss、训练、验证和可视化 | 已实现 |
 | Base/Manipulator dual-plan WAM | 已实现 |
 | configurable sparse clean Base/EEF Prior | 已实现；当前为 3 offsets、Base+EEF heads |
+| multiblock dual-plan teacher forcing | 已实现；默认 4 blocks、每 block offsets `[2,4,8]` |
+| multiblock 离线 evaluator | 已实现；三种部署式模式 + teacher-forced oracle |
 | VGGT 多视角 `z_2d_video` 接入 WAM video stream | 未实现 |
 | `z_3d_video` 接入 WAM | 未实现 |
 | future 3D token/PointMap rollout | 未实现 |
@@ -145,18 +149,17 @@ frozen DINOv2-L/14 patch extractor
 ```
 
 DINO 完全冻结且无 LoRA。LoRA 只用于 24 对 frame/global aggregator blocks。
-`global_temporal_window=4`，使 aggregator 获得局部四帧时间感受野；后续 2D/3D
-causal temporal Transformer 和 `33→9` codec 继续负责完整 clip 的时间建模。
-
-当前 global window 的实际边界是 `[0:4],[4:8]...`，而 temporal codec 是
-`frame0 + [1:5],[5:9]...`。因此当前只对齐 stride/窗口宽度，没有严格对齐 chunk
-boundary。Stage 2 接入 WAM 前应通过实验决定保持局部重叠语义还是改成与 codec 完全
-相同的 `frame0 + 4-frame chunks`。
+`global_temporal_window=4` 且 `align_global_windows_to_codec=true`，使 aggregator
+与 codec 共用 `[0],[1:5],[5:9]...,[29:33]` 边界。后续 2D/3D causal temporal
+Transformer 和 `33→9` codec 继续负责完整 clip 的时间建模。该实现只保证 chunk-level
+online：每个四帧窗口闭合后才可编码，窗口内部的 global attention 仍为双向。
 
 ### 4.3 2D branch
 
 ```text
 shared features
+ -> learned 10x20 query resampler + local residual
+ -> zero-init lightweight RGB detail residual
  -> spatial bottleneck
  -> causal temporal Transformer
  -> learned 33->9 temporal encoder
@@ -164,6 +167,11 @@ shared features
  -> z_2d_video [B,V,48,9,10,20]
  -> learned 9->33 RGB decoder
 ```
+
+RGB detail path 先用 `PixelUnshuffle(2)`，再用三次 stride-2 卷积到 `H/16×W/16`，
+最终 1×1 projection 零初始化；因此旧 checkpoint matching-init 时初始输出保持原路径。
+decoder 在 48-channel latent lattice 上先经过 3 个 residual blocks，再做 temporal/spatial
+上采样。训练与验证同时记录 reconstruction loss 和 `video_psnr`。
 
 它与 Wan VAE 对齐的是每个 view 的输入输出 channel、spatial stride 16 和
 `4k+1 <-> k+1` 时间 lattice。两者的 latent 统计分布未必相同，因此 WAM 集成时要
@@ -250,6 +258,12 @@ coarse geometry，不能用于毫米级重建或强 collision/contact labels。
 默认 plan offsets 为 `[1,4,8,12,16,24]` frames。Base token 表示
 `[x,y,sin(yaw),cos(yaw)]`；Manipulator token 联合表示 EEF pose 和 hand
 configuration。
+
+仓库还保留独立的 multiblock 路径。其当前默认训练合同是 4 个 video blocks，
+每 block 使用局部 offsets `[2,4,8]`，按 block-major 排列 3 个 Base 与 3 个
+Manipulator flow tokens；完整窗口共 24 个 flow tokens。clean-prior 配置在每个 block
+起点插入 1 个 endpoint Base prior register，因此 DiT 内部每 block 为 7 个 registers。
+该路径仍使用 Wan VAE，并不表示 VGGT latent 已接入 WAM。
 
 当前 `clean_prior` architecture 已在同一 WAM 中加入可配置的 sparse clean tokens：
 
@@ -500,6 +514,7 @@ head/wrist observation
 报告：
 
 - head/wrist RGB reconstruction；
+- reconstruction PSNR（训练/验证原生输出 `video_psnr`）；
 - PointMap coordinate/Euclidean error；
 - inside-grid、ray-valid、surface/free、multiview coverage；
 - 2D/3D latent statistics；

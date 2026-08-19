@@ -46,7 +46,13 @@ class FusionResidualBlock(nn.Module):
 
 
 class LightweightRGBEncoder(nn.Module):
-    """Preserve local RGB detail on the final ``H/16 x W/16`` lattice."""
+    """Encode a four-level residual RGB pyramid onto the latent lattice.
+
+    The original v4 path is retained as the deepest ``H/16`` branch.  Three
+    zero-initialized lateral projections add the ``H/2``, ``H/4`` and ``H/8``
+    levels, so a v4 checkpoint produces exactly the same output before the
+    newly added pyramid paths start learning.
+    """
 
     def __init__(self, output_channels: int) -> None:
         super().__init__()
@@ -63,6 +69,24 @@ class LightweightRGBEncoder(nn.Module):
             nn.Conv2d(96, 128, 3, stride=2, padding=1),
             nn.SiLU(),
         )
+        level_channels = (32, 64, 96, 128)
+        self.pyramid_refine = nn.ModuleList(
+            SpatialResidualBlock(channels) for channels in level_channels
+        )
+        for block in self.pyramid_refine:
+            # Keep every new residual stage an exact identity when a v4
+            # checkpoint is used to initialize the model.
+            nn.init.zeros_(block.conv2.weight)
+            nn.init.zeros_(block.conv2.bias)
+        self.pyramid_projections = nn.ModuleList(
+            nn.Conv2d(channels, output_channels, 1)
+            for channels in level_channels[:-1]
+        )
+        for projection in self.pyramid_projections:
+            # The old deepest RGB path remains solely responsible for the
+            # initial output; shallower levels are introduced gradually.
+            nn.init.zeros_(projection.weight)
+            nn.init.zeros_(projection.bias)
         self.output_projection = nn.Conv2d(128, output_channels, 1)
         # Preserve pre-RGB-path behavior exactly at initialization. The final
         # projection learns first, then starts updating the RGB encoder.
@@ -80,7 +104,27 @@ class LightweightRGBEncoder(nn.Module):
                 "RGB dimensions must be divisible by 16, "
                 f"got {tuple(rgb.shape[-2:])}"
             )
-        return self.output_projection(self.encoder(rgb))
+        hidden = self.encoder[0](rgb)
+        hidden = self.encoder[2](self.encoder[1](hidden))
+        level_0 = self.pyramid_refine[0](hidden)
+        hidden = self.encoder[4](self.encoder[3](level_0))
+        level_1 = self.pyramid_refine[1](hidden)
+        hidden = self.encoder[6](self.encoder[5](level_1))
+        level_2 = self.pyramid_refine[2](hidden)
+        hidden = self.encoder[8](self.encoder[7](level_2))
+        level_3 = self.pyramid_refine[3](hidden)
+
+        output = self.output_projection(level_3)
+        target_size = level_3.shape[-2:]
+        for level, projection in zip(
+            (level_0, level_1, level_2),
+            self.pyramid_projections,
+        ):
+            # Area downsampling keeps the lateral path inexpensive and avoids
+            # aliasing when the shallow RGB maps join the H/16 lattice.
+            lateral = F.interpolate(level, size=target_size, mode="area")
+            output = output + projection(lateral)
+        return output
 
 
 class LearnedSpatialQueryResampler(nn.Module):

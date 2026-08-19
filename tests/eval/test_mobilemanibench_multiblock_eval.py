@@ -3,17 +3,21 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 EVAL_DIR = Path(__file__).resolve().parents[2] / "scripts" / "eval"
 sys.path.insert(0, str(EVAL_DIR))
 
 from evaluate_mobilemanibench_multiblock_plan import (  # noqa: E402
     MetricAccumulator,
+    build_transform_and_collator,
     compose_block_plans,
     prepare_inference_batch,
+    teacher_forced_block_observation,
 )
 
 
@@ -25,6 +29,80 @@ def _identity_manipulator(blocks: int, waypoints: int) -> np.ndarray:
 
 
 class MobileManiBenchMultiBlockEvalTest(unittest.TestCase):
+    def test_teacher_forced_block_observation_slices_arrived_history(self) -> None:
+        root = {
+            "video.head": np.arange(33, dtype=np.int64)[:, None],
+            "video.wrist": np.arange(100, 133, dtype=np.int64)[:, None],
+            "state.eef_position": np.arange(12, dtype=np.float32).reshape(4, 3),
+            "state.eef_rotation_rpy": np.arange(12, 24, dtype=np.float32).reshape(4, 3),
+            "annotation.task": np.asarray(["task"]),
+        }
+        anchors = [0, 8, 16, 24]
+
+        block0 = teacher_forced_block_observation(root, 0, anchors, 8)
+        block1 = teacher_forced_block_observation(root, 1, anchors, 8)
+        block2 = teacher_forced_block_observation(root, 2, anchors, 8)
+        block3 = teacher_forced_block_observation(root, 3, anchors, 8)
+
+        np.testing.assert_array_equal(block0["video.head"][:, 0], [0])
+        np.testing.assert_array_equal(block1["video.head"][:, 0], np.arange(9))
+        np.testing.assert_array_equal(block2["video.head"][:, 0], np.arange(8, 17))
+        np.testing.assert_array_equal(block3["video.head"][:, 0], np.arange(16, 25))
+        np.testing.assert_array_equal(
+            block3["video.wrist"][:, 0], np.arange(116, 125)
+        )
+        for block_index, observation in enumerate(
+            (block0, block1, block2, block3)
+        ):
+            self.assertEqual(observation["state.eef_position"].shape, (4, 3))
+            np.testing.assert_array_equal(
+                observation["state.eef_position"],
+                np.repeat(
+                    root["state.eef_position"][block_index : block_index + 1],
+                    4,
+                    axis=0,
+                ),
+            )
+        self.assertEqual(root["video.head"].shape[0], 33)
+
+    def test_transform_keeps_supervised_per_sample_schema(self) -> None:
+        class FakeTransform:
+            def __init__(self):
+                self.training = False
+
+            def train(self):
+                self.training = True
+
+        transform = FakeTransform()
+        collator = object()
+        cfg = OmegaConf.create(
+            {
+                "train_dataset": {
+                    "plan_transform": {
+                        "transforms": [{"stats_path": "old-stats.json"}]
+                    }
+                },
+                "data_collator": {"_target_": "unused.FakeCollator"},
+            }
+        )
+        stats_path = Path("new-stats.json")
+
+        with patch(
+            "evaluate_mobilemanibench_multiblock_plan.instantiate",
+            side_effect=[transform, collator],
+        ) as instantiate_mock:
+            actual_transform, actual_collator = build_transform_and_collator(
+                cfg, stats_path
+            )
+
+        self.assertIs(actual_transform, transform)
+        self.assertIs(actual_collator, collator)
+        self.assertTrue(transform.training)
+        transform_config = instantiate_mock.call_args_list[0].args[0]
+        self.assertEqual(
+            transform_config.transforms[0].stats_path, str(stats_path)
+        )
+
     def test_compose_block_plans_uses_predicted_endpoint_as_next_anchor(self) -> None:
         base = np.zeros((2, 2, 4), dtype=np.float32)
         base[..., 3] = 1.0
@@ -78,6 +156,10 @@ class MobileManiBenchMultiBlockEvalTest(unittest.TestCase):
         self.assertEqual(
             summary["primary_metrics"]["composed_eef_position_l2_m"], 0.0
         )
+        self.assertEqual(summary["primary_metrics"]["composed_base_ade_m"], 0.0)
+        self.assertEqual(summary["primary_metrics"]["composed_base_fde_m"], 0.0)
+        self.assertEqual(summary["primary_metrics"]["composed_eef_ade_m"], 0.0)
+        self.assertEqual(summary["primary_metrics"]["composed_eef_fde_m"], 0.0)
 
     def test_prepare_inference_batch_removes_future_state_and_action_blocks(self) -> None:
         class IdentityTransform:

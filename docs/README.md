@@ -13,9 +13,15 @@
 从 [MM 当前状态与文档入口](./MM/README.md) 开始阅读。该页面区分：
 
 - 当前已经实现并测试的代码；
+- 已实现的 multiblock dual-plan teacher forcing 与离线 evaluator；
 - 尚未实现的研究阶段；
 - 数据、训练和验证命令；
 - 只用于追溯的历史实验/工作树记录。
+
+当前 multiblock 合同与执行入口见
+[多 Block Teacher Forcing 实现规范](./MM/MOBILEMANIBENCH_MULTIBLOCK_TEACHER_FORCING_EXECUTION_PLAN.md)；
+VGGT v3.x 优化状态见
+[VGGT Tokenizer 优化计划](./MM/MOBILEMANIBENCH_VGGT_TOKENIZER_OPTIMIZATION_PLAN.md)。
 
 ## 文档状态约定
 

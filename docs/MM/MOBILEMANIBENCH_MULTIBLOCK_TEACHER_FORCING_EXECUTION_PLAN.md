@@ -1,9 +1,9 @@
 # MobileManiBench WAM 多 Block Teacher Forcing 完整执行方案
 
-> 文档状态：单一目标实现规范
+> 文档状态：已实现路径的规范与验收记录；训练收敛和仿真成功率仍待实验确认
 > 目标仓库：`/mnt/yihao/codes/dreamzero`
 > 目标任务：MobileManiBench 5-task、Wan2.2-TI2V-5B、Base/Manipulator 双分支 waypoint 预测
-> 目标日期：2026-08-09
+> 实现核对：2026-08-17，`multiblock-wam` 分支提交 `4242553`
 
 ## 1. 目标架构与不可变约束
 
@@ -12,13 +12,14 @@
 - 33 个 RGB 帧经 Wan VAE 编码为 `z0...z8` 共 9 个 latent；
 - `num_frame_per_block=2`，未来 8 个 latent 被拆成 4 个 video block；
 - 每个 video block 覆盖 8 个 RGB 帧；
-- 默认每个 block 均匀预测 2 个 waypoint，局部 offsets 为 `[4, 8]`；
+- 默认每个 block 预测 3 个 waypoint，局部 offsets 为 `[2, 4, 8]`；
 - block anchors 与 local offsets 是实验配置，不固化进 parquet；
-- 每个 block 包含 `2 Base + 2 Manipulator = 4` 个 flow action token；
-- 4 个 block 共 16 个 flow action token；
+- 每个 block 包含 `3 Base + 3 Manipulator = 6` 个 flow action token；
+- 4 个 block 共 24 个 flow action token；
 - 每个 block 使用该 block 起点处的 1 个 state token，共 4 个 state token；
 - 训练使用 GT future video 的 block-causal teacher forcing；
-- 部署时每次只使用当前真实观测和当前 state，预测当前 block 的局部计划 `[+4,+8]`，不依赖未来 GT；
+- 部署时每次只使用当前真实观测和当前 state，预测当前 block 的局部计划
+  `[+2,+4,+8]`，不依赖未来 GT；
 - primary inference 不使用 RGB repeat 补足 block。
 
 这里的“与原版 DreamZero 一致”有严格边界：clean/noisy 双路
@@ -35,41 +36,47 @@ num_frames: 33
 num_frame_per_block: 2       # 历史键名；单位是 VAE latent frame，不是 RGB frame
 max_chunk_size: 4
 num_plan_blocks: 4
-plan_waypoints_per_block: 2
-plan_local_offsets: [4, 8]
-plan_block_stride: 8
+plan_waypoints_per_block: 3
+plan_local_offsets: [2, 4, 8]
+# derived video/block stride: 8 RGB frames
 # DreamZero 语义：horizon 表示单个 block/chunk 的对外长度。
-action_horizon: 4
-num_flow_action_per_block: 4
+action_horizon: 6
+num_flow_action_per_block: 6
 # P = num_prior_tokens_per_block；未启用 prior 时 P=0，endpoint prior 时 P=1
-# DiT 内部实际分块宽度：num_action_per_block = 4 + P
+# DiT 内部实际分块宽度：num_action_per_block = 6 + P
 state_horizon: 1
 num_state_per_block: 1
 # 4-block 完整窗口的派生不变量（不要作为独立 Hydra override）：
-# training_flow_action_tokens = 4 * 4 = 16
-# training_internal_action_registers = 4 * (4 + P)
+# training_flow_action_tokens = 4 * 6 = 24
+# training_internal_action_registers = 4 * (6 + P)
 # training_state_tokens = 4 * 1 = 4
 ```
 
 这里必须保持原版 DreamZero 的命名语义：`action_horizon` 和
 `state_horizon` 表示单个 block 在推理时产生/消费的 chunk 长度；训练
 tensor 的总长度由实际 `num_training_blocks` 动态派生。对于 4-block
-完整窗口，flow action/state tensor 分别为 16/4 tokens，但不能因此把配置中的
-单-block horizon 写成 16/4。
+完整窗口，flow action/state tensor 分别为 24/4 tokens，但不能因此把配置中的
+单-block horizon 写成 24/4。
 
 全局 waypoint 时间点为：
 
 ```text
-[4, 8, 12, 16, 20, 24, 28, 32]
+[2, 4, 8, 10, 12, 16, 18, 20, 24, 26, 28, 32]
 ```
 
-这是全局每 4 个 RGB 帧一个 waypoint 的严格均匀采样。不要继续使用当前 `[1,4,8,12,16,24]` 再按 video block 生硬切分；这种切分会导致每个 block token 数不同，也不符合固定 block action register 的设计。
+当前默认在每个 8-frame block 内使用 `[2,4,8]`，兼顾中间监督与 endpoint。不要继续
+使用单 block baseline 的 `[1,4,8,12,16,24]` 再按 video block 生硬切分；这种切分会
+导致每个 block token 数不同，也不符合固定 block action register 的设计。
 
 ## 2. 当前实现核对结果
 
 以下结论以当前代码为准，而不是以旧文档为准。
 
-### 2.1 当前 Mobile WAM 是单 block 设计
+### 2.1 legacy Mobile WAM baseline 是单 block 设计
+
+以下内容用于解释为什么不能只改旧脚本参数。当前仓库已经另行实现 multiblock
+Dataset/Transform/Collator、DiT、policy head、训练脚本和 evaluator；旧单 block 路径仍
+保留用于公平 baseline。
 
 当前训练脚本 `scripts/train/mobilemanibench_plan_training_wan22_5b.sh` 使用：
 
@@ -180,9 +187,9 @@ state:  [B, num_training_blocks * 1, state_dim]
 动态得到训练 horizon。Mobile multiblock 必须保留同一语义：
 
 ```text
-配置/单次推理 action_horizon = 4
+配置/单次推理 action_horizon = 6
 配置/单次推理 state_horizon  = 1
-4-block 训练 action tokens   = 4 * 4 = 16
+4-block 训练 action tokens   = 4 * 6 = 24
 4-block 训练 state tokens    = 4 * 1 = 4
 ```
 
@@ -206,10 +213,10 @@ waypoint、physical-time embedding、physical consistency 和 clean prior
 
 | Block | Video latent | RGB 范围 | Block anchor | 局部 waypoint offsets | 全局目标帧 | Action token |
 |---|---|---:|---:|---|---|---|
-| 0 | `z1,z2` | `t+1...t+8` | `t` | `[4,8]` | `t+4,t+8` | `B0_4,B0_8,M0_4,M0_8` |
-| 1 | `z3,z4` | `t+9...t+16` | `t+8` | `[4,8]` | `t+12,t+16` | `B1_4,B1_8,M1_4,M1_8` |
-| 2 | `z5,z6` | `t+17...t+24` | `t+16` | `[4,8]` | `t+20,t+24` | `B2_4,B2_8,M2_4,M2_8` |
-| 3 | `z7,z8` | `t+25...t+32` | `t+24` | `[4,8]` | `t+28,t+32` | `B3_4,B3_8,M3_4,M3_8` |
+| 0 | `z1,z2` | `t+1...t+8` | `t` | `[2,4,8]` | `t+2,t+4,t+8` | `B0_2,B0_4,B0_8,M0_2,M0_4,M0_8` |
+| 1 | `z3,z4` | `t+9...t+16` | `t+8` | `[2,4,8]` | `t+10,t+12,t+16` | `B1_2,B1_4,B1_8,M1_2,M1_4,M1_8` |
+| 2 | `z5,z6` | `t+17...t+24` | `t+16` | `[2,4,8]` | `t+18,t+20,t+24` | `B2_2,B2_4,B2_8,M2_2,M2_4,M2_8` |
+| 3 | `z7,z8` | `t+25...t+32` | `t+24` | `[2,4,8]` | `t+26,t+28,t+32` | `B3_2,B3_4,B3_8,M3_2,M3_4,M3_8` |
 
 其中 `B` 表示 Base waypoint token，`M` 表示 Manipulator waypoint token。
 
@@ -218,35 +225,35 @@ waypoint、physical-time embedding、physical consistency 和 clean prior
 推荐规范张量先保留结构：
 
 ```text
-base_plan:        [batch, 4 blocks, 2 waypoints, 4]
-manipulator_plan: [batch, 4 blocks, 2 waypoints, 21]
-plan_valid:       [batch, 4 blocks, 2 waypoints]
+base_plan:        [batch, 4 blocks, 3 waypoints, 4]
+manipulator_plan: [batch, 4 blocks, 3 waypoints, 21]
+plan_valid:       [batch, 4 blocks, 3 waypoints]
 state:            [batch, 4 blocks, 64]
 ```
 
 进入 DiT 前再 flatten 为：
 
 ```text
-block 0: Base[2], Manipulator[2]
-block 1: Base[2], Manipulator[2]
-block 2: Base[2], Manipulator[2]
-block 3: Base[2], Manipulator[2]
+block 0: Base[3], Manipulator[3]
+block 1: Base[3], Manipulator[3]
+block 2: Base[3], Manipulator[3]
+block 3: Base[3], Manipulator[3]
 ```
 
 最终 action tensor：
 
 ```text
-[batch, 16, 21]
+[batch, 24, 21]
 ```
 
 不要采用以下布局：
 
 ```text
-[全部 8 个 Base][全部 8 个 Manipulator]
+[全部 12 个 Base][全部 12 个 Manipulator]
 ```
 
 因为底层 causal attention 按连续的单 block 宽度切 action
-register（无 prior 时为 4，启用 endpoint prior 时为 5）；
+register（无 prior 时为 6，启用 endpoint prior 时为 7）；
 branch-major 会把前两个 block 错当成纯 Base block，并破坏
 video/action/state block 对齐。
 
@@ -329,7 +336,7 @@ source of truth。
 ```yaml
 mobilemanibench_plan_label_source: dynamic
 block_anchor_offsets: [0, 8, 16, 24]
-plan_local_offsets: [4, 8]
+plan_local_offsets: [2, 4, 8]
 ```
 
 Dataset 使用公共 geometry helper 对每条 trajectory 向量化计算：
@@ -348,7 +355,7 @@ EEF target  = inv(B_anchor) * EEF_target
 8-RGB-frame video block 决定的结构不变量，不作为 action sampling
 消融参数。`plan_local_offsets` 的数量 K 可以配置；collator、packing、
 flow register 和 clean-prior internal register 必须分别动态派生为
-`K`、`2K` 和 `2K+1`，不得硬编码 K=2 或 16 个总 flow token。
+`K`、`2K` 和 `2K+1`，不得硬编码 K=3 或 24 个总 flow token。
 
 公共动态 helper 必须与 converter 的 `build_block_plan_labels()` 做逐值
 一致性测试，防止在线与离线几何语义分叉。
@@ -430,7 +437,7 @@ offset 后只生成一个新的小型 statistics 文件，不重写 parquet。
 
 ### 5.3 `MobilePlanCotrainTransform`
 
-修改 `groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py`，推荐新增 multiblock 子类：
+`groot/vla/model/dreamzero/transform/mobile_plan_cotrain.py` 已新增 multiblock 子类：
 
 ```text
 输入：
@@ -463,7 +470,8 @@ block_anchor_offsets     [B,4]
 
 ### 6.1 新增 multiblock 模型类
 
-不要直接把当前 `WanVideoDiTDualPlan` 改成另一种不兼容语义。建议在 `groot/vla/model/dreamzero/modules/` 新增：
+实现没有改写旧 `WanVideoDiTDualPlan`，而是在
+`groot/vla/model/dreamzero/modules/` 新增：
 
 ```text
 wan_video_dit_dual_plan_multiblock.py
@@ -488,13 +496,13 @@ training/inference forward；否则即使 shape 一致，也无法保证 WAM 行
 
 ```text
 num_plan_blocks=4
-plan_waypoints_per_block=2
-plan_local_offsets=(4,8)
-num_flow_action_per_block=4
+plan_waypoints_per_block=3
+plan_local_offsets=(2,4,8)
+num_flow_action_per_block=6
 num_prior_tokens_per_block=P
-num_action_per_block=4+P      # DiT 内部 action register 分块宽度
-action_horizon=4              # 单 block/单次推理的 flow 输入输出
-# runtime: action.shape[1] = actual_num_blocks * 4
+num_action_per_block=6+P      # DiT 内部 action register 分块宽度
+action_horizon=6              # 单 block/单次推理的 flow 输入输出
+# runtime: action.shape[1] = actual_num_blocks * 6
 ```
 
 不要继续让 `plan_horizon` 同时表示“每个 block waypoint 数”和“全窗口 waypoint 总数”。这两个量必须拆开命名。
@@ -504,14 +512,14 @@ action_horizon=4              # 单 block/单次推理的 flow 输入输出
 encoder 输入先 reshape：
 
 ```text
-[B,16,21] -> [B,4 blocks,4 tokens,21]
+[B,24,21] -> [B,4 blocks,6 tokens,21]
 ```
 
 每个 block 内：
 
 ```text
-token 0-1: Base，取前 4 维
-token 2-3: Manipulator，取前 21 维
+token 0-2: Base，取前 4 维
+token 3-5: Manipulator，取前 21 维
 ```
 
 继续复用：
@@ -520,26 +528,31 @@ token 2-3: Manipulator，取前 21 维
 - branch type embedding；
 - physical time offset embedding。
 
-offset embedding 使用局部时间 `[4/30, 8/30]` 秒，并在每个 block 重复。block 身份由 action register 的 block 位置、RoPE 和 causal attention 对齐提供，不需要把全局 `[4,8,...32]` 误当作相对当前 block 的时间。
+offset embedding 使用局部时间 `[2/30, 4/30, 8/30]` 秒，并在每个 block 重复。
+block 身份由 action register 的 block 位置、RoPE 和 causal attention 对齐提供，不需要
+把全局 offsets 误当作相对当前 block 的时间。
 
 ### 6.3 decoder 行为
 
-decoder 对每个 block 独立拆出 2 个 Base hidden 与 2 个 Manipulator hidden，使用共享 branch decoder，随后恢复 block-major layout。
+decoder 对每个 block 独立拆出 3 个 Base hidden 与 3 个 Manipulator hidden，使用共享
+branch decoder，随后恢复 block-major layout。
 
 输出 flow tensor仍为：
 
 ```text
-[B,16,21]
+[B,24,21]
 ```
 
-提供公共 helper：
+当前实现由 encoder、decoder、action head 共享同一个 block-major shape 公式，但没有
+导出以下独立公共 helper：
 
 ```text
 pack_block_plan(...)
 unpack_block_plan(...)
 ```
 
-Dataset、loss、inference 和 tests 必须共用同一个 helper，避免四处手写 slicing。
+若后续再增加新的 consumer，应先提取这两个 helper，避免继续复制 slicing；这不是当前
+提交中已经存在的 API。
 
 ### 6.4 权重初始化
 
@@ -558,7 +571,7 @@ projection 权重在各 block 间共享，因此当前 6-waypoint 模型的 proj
 
 ## 7. Policy head 与 timestep 修改
 
-建议新增：
+已新增：
 
 ```text
 groot/vla/model/dreamzero/action_head/mobile_plan_multiblock_flow_matching.py
@@ -574,12 +587,12 @@ groot/vla/model/dreamzero/action_head/mobile_plan_multiblock_flow_matching.py
 noisy_latents = 9             # z0...z8，与 clean_x 等长
 future_latents = 8
 num_video_blocks = 8 / 2 = 4
-training_flow_action_tokens = action.shape[1] = 4 * 4 = 16
+training_flow_action_tokens = action.shape[1] = 4 * 6 = 24
 training_state_tokens = state.shape[1] = 4 * 1 = 4
-per_block_flow_action_horizon = num_flow_action_per_block = 4
+per_block_flow_action_horizon = num_flow_action_per_block = 6
 num_prior_tokens_per_block = P
-per_block_internal_action_registers = num_action_per_block = 4 + P
-training_internal_action_registers = action_features.shape[1] = 4 * (4 + P)
+per_block_internal_action_registers = num_action_per_block = 6 + P
+training_internal_action_registers = action_features.shape[1] = 4 * (6 + P)
 per_block_state_horizon = num_state_per_block = 1
 ```
 
@@ -594,7 +607,7 @@ num_video_blocks
 ```
 
 这里必须使用当前 training tensor 的真实长度做验证，不能用单 block 配置
-`action_horizon=4`、`state_horizon=1` 去计算训练 block 数。
+`action_horizon=6`、`state_horizon=1` 去计算训练 block 数。
 
 ### 7.2 action timestep
 
@@ -604,31 +617,32 @@ video timestep block shape：
 [B,4,2]
 ```
 
-同一个 video block 内 2 个 latent 共用 timestep。coupled action mode 下，对应的 4 个 action token也共用该 block timestep：
+同一个 video block 内 2 个 latent 共用 timestep。coupled action mode 下，对应的 6 个
+action tokens 也共用该 block timestep：
 
 ```text
-[tv0,tv0,tv0,tv0,
- tv1,tv1,tv1,tv1,
- tv2,tv2,tv2,tv2,
- tv3,tv3,tv3,tv3]
+[tv0,tv0,tv0,tv0,tv0,tv0,
+ tv1,tv1,tv1,tv1,tv1,tv1,
+ tv2,tv2,tv2,tv2,tv2,tv2,
+ tv3,tv3,tv3,tv3,tv3,tv3]
 ```
 
 目标训练模式固定为 coupled/per-block：每个 video block 独立
-采样一个 timestep，该 block 的 2 个 video latent 与 4 个 action
+采样一个 timestep，该 block 的 2 个 video latent 与 6 个 action
 token 共用这个 timestep。不在本实现中引入 per-token action
 timestep，以保持原版 DreamZero 的 block-coupled flow-matching 语义。
 启用 clean prior 时，每个 prior register 使用 clean timestep `0`；它不是
-第 5 个 noisy flow token。例如 `P=1` 时单 block 内部 timestep 布局为
-`[0, tv_b, tv_b, tv_b, tv_b]`。
+额外 noisy flow token。例如 `P=1` 时单 block 内部 timestep 布局为
+`[0, tv_b, tv_b, tv_b, tv_b, tv_b, tv_b]`。
 
 ### 7.3 branch loss
 
 旧 loss 通过 `[:horizon]` 与 `[horizon:]` 切 Base/Manipulator，不适用于 block-major。必须先 reshape：
 
 ```text
-[B,16,21] -> [B,4,4,21]
-base = block[...,0:2,0:4]
-manipulator = block[...,2:4,0:21]
+[B,24,21] -> [B,4,6,21]
+base = block[...,0:3,0:4]
+manipulator = block[...,3:6,0:21]
 ```
 
 至少记录：
@@ -636,8 +650,8 @@ manipulator = block[...,2:4,0:21]
 ```text
 base_flow_loss/block_0...3
 manipulator_flow_loss/block_0...3
-base_flow_loss/offset_4, offset_8
-manipulator_flow_loss/offset_4, offset_8
+base_flow_loss/offset_2, offset_4, offset_8
+manipulator_flow_loss/offset_2, offset_4, offset_8
 valid_ratio/block_0...3
 dynamics_loss/block_0...3
 ```
@@ -666,7 +680,7 @@ action block b 不可见：
 
 video block 同样不能读取本 block/future block 的 clean GT。
 
-必须新增 dense-mask 单元测试：
+当前 dense-mask 单元测试位于 `tests/model/test_mobile_multiblock_plan.py`：
 
 1. block 0 只能读取 clean `z0`；
 2. block 1 能读取 clean `z1,z2`，不能读取 clean `z3...z8`；
@@ -701,7 +715,7 @@ action/video loss 只能使用合法的 noisy 输出与 validity mask。
 
 Physical consistency 只从已经按 block-major 解码的 flow 输出计算
 附加 loss，不得改变 clean/noisy tensor、attention mask、timestep
-或 register 分块。physical loss 先 unpack 到 `[B,4,2,...]`：
+或 register 分块。physical loss 先 unpack 到 `[B,4,3,...]`：
 
 - Base yaw unit loss：逐 `(block,waypoint)`；
 - EEF rotation loss：逐 `(block,waypoint)`；
@@ -717,11 +731,11 @@ Physical consistency 只从已经按 block-major 解码的 flow 输出计算
 local offset `8`：
 
 ```text
-每 block: [1 prior, 2 Base flow, 2 Manipulator flow]
-internal num_action_per_block = 5
-flow action_horizon = 4                    # 单 block 对外 flow chunk
-training flow action tokens = 16           # 4 blocks * 4
-training internal action registers = 20    # 4 blocks * 5
+每 block: [1 prior, 3 Base flow, 3 Manipulator flow]
+internal num_action_per_block = 7
+flow action_horizon = 6                    # 单 block 对外 flow chunk
+training flow action tokens = 24           # 4 blocks * 6
+training internal action registers = 28    # 4 blocks * 7
 ```
 
 该 prior token 可通过独立 decoder head 输出 Base 和 EEF target，但
@@ -756,25 +770,27 @@ block 的 prior peers；不能读取当前 clean/noisy future video。Flow
 ```text
 t：输入当前真实 RGB + 当前真实 state
    预测 video t+1...t+8 对应的 z1,z2
-   预测局部 Base/Manipulator waypoint at t+4,t+8
+   预测局部 Base/Manipulator waypoint at t+2,t+4,t+8
    执行动作
 
 t+8：获得新的真实 RGB/history + 新的真实 state
      将新 observation latents 写入 KV cache
-     预测下一 block 的 [+4,+8]
+     预测下一 block 的 [+2,+4,+8]
 ```
 
-每次模型对外只输出当前 block 的 2 个 Base waypoint 和 2 个 Manipulator waypoint。训练窗口里存在 4 个 action block，是为了让模型学习有历史条件时后续 block 的稳定性，不代表部署第一次调用就有未来 state。
+每次模型对外只输出当前 block 的 3 个 Base waypoint 和 3 个 Manipulator waypoint。
+训练窗口里存在 4 个 action block，是为了让模型学习有历史条件时后续 block 的稳定性，
+不代表部署第一次调用就有未来 state。
 
 正式推理应复用原版 `lazy_joint_video_action()`/cached rollout 的“一次一个
 block”算法语义，但不能原样复用当前 Mobile 单-block dual-plan 的固定
-6-waypoint unpack。multiblock action head 应设置 `self.action_horizon=4`，
-普通单次推理只创建当前 block 的 4 个 noisy flow action tokens；
-DiT 内部使用 `num_action_per_block=4+P`，由 encoder 注入 `P` 个 clean
-prior register。最后由专用 pack/unpack 还原 `Base[2] + Manipulator[2]`。
+6-waypoint long-plan unpack。multiblock action head 设置 `self.action_horizon=6`，
+普通单次推理只创建当前 block 的 6 个 noisy flow action tokens；
+DiT 内部使用 `num_action_per_block=6+P`，由 encoder 注入 `P` 个 clean
+prior register。最后由专用 block-major slicing 还原 `Base[3] + Manipulator[3]`。
 
 如果实现离线 4-block oracle 或变长 block 诊断，noise shape 必须由本次
-`num_inference_blocks * num_flow_action_per_block` 动态派生，不能把训练总长度 16
+`num_inference_blocks * num_flow_action_per_block` 动态派生，不能把训练总长度 24
 写回 `self.action_horizon`。优先继承并扩展原版 sampler/KV-cache 路径，不要
 另写一套不同的去噪与缓存语义。
 
@@ -784,14 +800,14 @@ prior register。最后由专用 pack/unpack 还原 `Base[2] + Manipulator[2]`�
 训练：
 clean/noisy video latents [B,9,...] = z0...z8
 block-aligned future latents [B,8,...] = z1...z8
-action               [B,16,21] = 4 blocks * 4 tokens
-internal action regs  [B,4*(4+P),D]
+action               [B,24,21] = 4 blocks * 6 tokens
+internal action regs  [B,4*(6+P),D]
 state                [B,4,64]  = 4 blocks * 1 token
 
 单次缓存推理：
 video future latents [B,2,...]
-action noise/output  [B,4,21]  = current block only
-internal action regs [B,4+P,D]
+action noise/output  [B,6,21]  = current block only
+internal action regs [B,6+P,D]
 state                [B,1,64]  = current real state only
 ```
 
@@ -799,13 +815,13 @@ state                [B,1,64]  = current real state only
 
 - action encoder/decoder 在 training forward 接受 4 blocks，在 cached inference 接受 1 block；
 - primary cached inference 的 noise action shape 固定为单 block
-  `action_horizon=num_flow_action_per_block=4`；变长/oracle 模式才按本次
+  `action_horizon=num_flow_action_per_block=6`；变长/oracle 模式才按本次
   `num_inference_blocks * num_flow_action_per_block` 动态计算；
-- DiT 内部 action register 数按 `num_inference_blocks * (4+P)` 派生；
+- DiT 内部 action register 数按 `num_inference_blocks * (6+P)` 派生；
 - state register 同理按本次 block 数计算；
 - cached attention 用 `current_block_index`/`current_start_frame` 选择正确 RoPE 与 KV 位置；
-- `get_action()` 只 unpack 当前 4 个 token 为 `Base[2] + Manipulator[2]`；
-- 单元测试必须确保 cached inference 从未静默 repeat/pad 到 16 个 action token或 4 个 state token。
+- `get_action()` 只拆分当前 6 个 token 为 `Base[3] + Manipulator[3]`；
+- 单元测试必须确保 cached inference 从未静默 repeat/pad 到 24 个 action token或 4 个 state token。
 
 ### 10.2 不使用 repeat 的约束
 
@@ -816,7 +832,7 @@ state                [B,1,64]  = current real state only
 1. 每次 reset，把最新真实帧作为新 `z0`，做独立 one-shot block 预测；
 2. 另行训练 `num_frame_per_block=1` 的模型。
 
-不要在 `K=2` 的 primary deployment 中用 4 帧 repeat 冒充 8 帧真实历史。
+不要在 primary deployment 中用 4 帧 repeat 冒充 8 帧真实历史。
 
 ### 10.3 不可部署但有价值的诊断模式
 
@@ -839,14 +855,14 @@ block `b` 的 Base/EEF waypoint 再左乘 `T_B0_Banchor(b)`，统一转换到初
 
 ### 11.1 evaluator 分层
 
-新增 evaluator，不改变当前 `scripts/eval/mobilemanibench_plan_eval.sh`：
+已新增独立 evaluator，不改变单 block 的 `scripts/eval/mobilemanibench_plan_eval.sh`：
 
 ```text
 scripts/eval/mobilemanibench_multiblock_plan_eval.sh
 scripts/eval/evaluate_mobilemanibench_multiblock_plan.py
 ```
 
-至少支持：
+当前支持：
 
 ```text
 single_block_reset
@@ -855,13 +871,17 @@ gt_history_cached
 oracle_four_block_teacher_forced
 ```
 
-其中正式报告的核心是：
+四种模式的实现边界为：
 
-- `single_block_reset`：当前帧独立预测 `[+4,+8]`；
+- `single_block_reset`：单个当前 RGB/state，reset cache，只预测 block 0 的
+  `[+2,+4,+8]`；
+- `episode_ordered_reset`：每个 block 都使用对应当前 RGB/state，但每个 block reset；
 - `gt_history_cached`：真实历史、每 8 帧滚动、无 future leakage；
-- closed-loop simulator success（若仿真接口可用）。
+- `oracle_four_block_teacher_forced`：完整 33 帧 clean window，只报告 teacher-forced
+  loss，不是部署 waypoint metric。
 
-oracle 模式只能放在诊断附录。
+脚本支持 `INSPECT_ONLY=1`，可在不加载 checkpoint 的情况下核对 split、动态 labels、
+offsets、stats path 和 task-balanced root windows。closed-loop simulator success 尚未实现。
 
 ### 11.2 waypoint 指标
 
@@ -881,7 +901,16 @@ plan ADE/FDE
 
 ### 11.3 video 指标和可视化
 
-当前 Mobile evaluator 没有评价或保存生成 video。新 evaluator 应保存：
+当前 multiblock evaluator 只保存 waypoint/prior 指标，不评价或保存生成 video。现有输出为：
+
+```text
+summary.json
+per_prediction_metrics.jsonl
+per_block_metrics.csv
+predictions.npz
+```
+
+生成 video 的以下产物仍是后续工作：
 
 - GT 与 predicted future video 并排 mp4；
 - head/wrist composite view；
@@ -901,8 +930,8 @@ block boundary discontinuity
 
 ### 11.4 与当前模型的公平对比
 
-当前单 block 模型 offsets 为 `[1,4,8,12,16,24]`，目标 multiblock
-模型为 `[4,8,12,16,20,24,28,32]`。公平直接对比使用交集：
+当前单 block 模型 offsets 为 `[1,4,8,12,16,24]`，multiblock 默认全局 offsets 为
+`[2,4,8,10,12,16,18,20,24,26,28,32]`。公平直接对比使用交集：
 
 ```text
 [4,8,12,16,24]
@@ -911,7 +940,7 @@ block boundary discontinuity
 同时分别报告：
 
 - 当前模型原生 6-point 指标；
-- 目标 multiblock 模型原生 8-point 指标；
+- multiblock 模型原生 12-point 指标；
 - common-offset 指标；
 - 目标 multiblock 模型 per-block 连续性与 cached-history 收益。
 
@@ -919,7 +948,7 @@ block boundary discontinuity
 
 ## 12. 配置与训练脚本
 
-建议新增而不是覆盖：
+已新增且不覆盖单 block 路径：
 
 ```text
 groot/vla/configs/data/dreamzero/mobilemanibench_multiblock_plan.yaml
@@ -934,17 +963,17 @@ scripts/train/mobilemanibench_multiblock_plan_training_wan22_5b.sh
 ```text
 num_frames=33
 num_frame_per_block=2
-num_flow_action_per_block=4
+num_flow_action_per_block=6
 num_prior_tokens_per_block=P
-num_action_per_block=4+P
+num_action_per_block=6+P
 num_state_per_block=1
-action_horizon=4
+action_horizon=6
 state_horizon=1
 num_plan_blocks=4
 max_chunk_size=4
 ```
 
-其中 `training_action_tokens=16`、`training_state_tokens=4` 是完整 4-block
+其中 `training_action_tokens=24`、`training_state_tokens=4` 是完整 4-block
 batch 的 shape 不变量，应从实际 tensor 和 block 数派生，不应作为独立 Hydra
 override 传入。模型始终按 runtime tensor shape 派生 block 数，
 不将 4-block 总长度写固到单 block horizon 配置中。
@@ -961,19 +990,25 @@ local_attn_size = max_chunk_size * num_frame_per_block + 1
 
 ### 12.1 output 目录
 
-使用全新目录，例如：
+当前脚本默认目录仍为：
 
 ```text
 work_dirs/mobilemanibench_g1_5tasks_wan22_5b_multiblock_k2_wp2
 ```
 
+该目录名保留了早期 `K=2/wp2` 命名，但当前 resolved config 实际是
+`K=3`、`plan_local_offsets=[2,4,8]`。新实验应通过 `OUTPUT_DIR` 覆盖为无歧义名称，
+例如 `..._multiblock_k3_offsets_2_4_8`；判断合同必须读
+`experiment_cfg/conf.yaml`，不能从目录名反推。
+
 禁止在当前单 block output dir 中自动 resume。新结构的 action/state horizon 与 scheduler 都不同。
 
 ### 12.2 优化器与初始化约束
 
-这不是对原 checkpoint 的同构 continuation。目标配置使用当前
-WAM baseline 的 `1e-5`，初始化只 matching-load shape 和语义同时
-匹配的参数，不 resume 旧 optimizer/scheduler。
+这不是对原 checkpoint 的同构 continuation。当前训练脚本使用 `1e-5`，从 raw Wan2.2
+components 构造模型，并没有实现从旧单 block checkpoint 做专用 matching-load；也不能
+resume 旧 optimizer/scheduler。只有同一 multiblock 结构、同一 resolved plan spec 的
+checkpoint 才可作为恢复候选。
 
 如果实现参数组：
 
@@ -982,13 +1017,14 @@ WAM baseline 的 `1e-5`，初始化只 matching-load shape 和语义同时
 已匹配加载的 Wan LoRA: 4e-6 ~ 1e-5
 ```
 
-训练时必须记录 dynamics/action 梯度比例、per-block validation
-loss 和生成视频，确认 Mobile 任务头没有破坏 WAM teacher-forcing
-主干。
+当前 action head 会记录 per-block Base/Manipulator flow loss，physical/prior 路径也有
+各自 scalar diagnostics；dynamics/action 梯度比例与生成视频尚未形成完整自动报告，
+不能在实验结论中假定这些验收已经完成。
 
 ## 13. 完整实施范围
 
-本文档定义的是一个完整目标结构。实现结果必须同时包含：
+当前提交已经具备核心 train/eval 链路。若要把它称为“完成实验验收的 multiblock WAM”，
+还必须同时满足以下完整范围；代码存在不等于所有实验项已经完成：
 
 - canonical world trajectory 上的动态 block-label provider；
 - spec-hashed train-only plan statistics 与 normalization round trip；
@@ -1003,24 +1039,25 @@ loss 和生成视频，确认 Mobile 任务头没有破坏 WAM teacher-forcing
 - 数据重建、shape、attention 防泄漏、forward/backward、checkpoint 和
   rolling evaluation 测试。
 
-任何只完成其中一部分的代码都不应被描述成本文档的
-目标 WAM 实现。
+当前尚缺专用旧 checkpoint matching initializer、生成 video 评估与 simulator
+closed-loop，因此准确状态是“核心结构和离线 waypoint evaluator 已实现，完整研究验收未完成”。
 
 ## 14. 测试清单
 
-建议新增测试：
+当前实际测试文件：
 
 ```text
 tests/data/test_mobilemanibench_block_plan_labels.py
-tests/data/test_mobilemanibench_block_plan_dataset.py
-tests/data/test_mobile_block_plan_transform.py
-tests/model/test_mobile_multiblock_plan_packing.py
-tests/model/test_mobile_multiblock_timestep_alignment.py
-tests/model/test_mobile_multiblock_teacher_forcing_mask.py
-tests/model/test_mobile_multiblock_policy_head.py
-tests/model/test_mobile_multiblock_checkpoint_init.py
-tests/eval/test_mobile_multiblock_plan_composition.py
+tests/model/test_mobile_multiblock_plan.py
+tests/eval/test_mobilemanibench_multiblock_eval.py
 ```
+
+后两个文件分别合并覆盖 collator/shape、三 waypoint encoder/decoder、per-block prior、
+coupled timestep、attention 防泄漏，以及局部 plan composition、零误差 metric 和推理 batch
+去除 future state/action。独立 checkpoint matching test 当前不存在。
+
+2026-08-17 在远程现有环境以 `CUDA_VISIBLE_DEVICES=0` 运行上述三个文件的
+`unittest`，15/15 通过。
 
 必须覆盖：
 
@@ -1095,22 +1132,22 @@ tests/eval/test_mobile_multiblock_plan_composition.py
 
 - [x] 动态 block-label spec 与 geometry helper
 - [x] 动态/物化 geometry 数值一致性测试
-- [ ] full-window step filter
+- [x] full-window step filter
 - [x] spec-hashed train-only plan stats
 - [x] structured Dataset/Transform/Collator
 - [ ] block-major pack/unpack helper
-- [ ] multiblock dual-plan encoder/decoder
-- [ ] multiblock policy head
-- [ ] 4-block action timestep mapping
-- [ ] attention leakage tests
+- [x] multiblock dual-plan encoder/decoder
+- [x] multiblock policy head
+- [x] 4-block action timestep mapping
+- [x] attention leakage tests
 - [ ] matching checkpoint initialization
 - [ ] 完整 teacher-forcing forward/backward 与 overfit 验证
 - [ ] video generation保存与可视化
-- [ ] episode-ordered reset evaluator
-- [ ] GT-history cached evaluator
+- [x] episode-ordered reset evaluator
+- [x] GT-history cached evaluator
 - [ ] common-offset baseline comparison
-- [ ] 当前配置启用的 structured physical loss
-- [ ] 当前配置启用的 per-block clean endpoint prior
+- [x] 当前配置启用的 structured physical loss
+- [x] 当前配置启用的 per-block clean endpoint prior
 - [ ] simulator closed-loop evaluation
 
 ## 18. 不应采用的捷径

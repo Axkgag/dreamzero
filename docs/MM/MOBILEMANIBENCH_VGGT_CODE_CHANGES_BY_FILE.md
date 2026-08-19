@@ -2,7 +2,7 @@
 
 ## 1. 文档目的与统计范围
 
-> 当前配置校对：2026-07-30
+> 当前配置校对：2026-08-17，远程 `multiblock-wam` 分支提交 `4242553`
 > 本文前 9 节描述当前实现；第 10 节以后是按时间追加的开发与修复记录，旧数值仅表示
 > 当时状态。当前常量始终以第 3、7 节和实际 YAML 为准。
 
@@ -166,12 +166,16 @@ embed。tuple 参数统一转为 list，保证 Hugging Face JSON 序列化稳定
 
 ```text
 global_temporal_window = 4
+align_global_windows_to_codec = true
 freeze_dino = true
 dino_image_chunk_size = 4
 backbone_gradient_checkpointing = true
 latent_spatial_stride = 16
 latent_temporal_stride = 4
 video_decoder_dim = 256
+video_query_local_residual = true
+video_rgb_path_enabled = true
+video_decoder_latent_residual_blocks = 3
 ```
 
 ### `groot/vla/model/vggt_3d_wam/backbone.py`
@@ -184,9 +188,10 @@ video_decoder_dim = 256
 完整 clip 时间建模继续由后续 2D/3D temporal branch 完成。tiny 单测可切换为轻量
 conv patch 前端。
 
-实现中的 global windows 是 `[0:4],[4:8]...`，而 `WanTemporalEncoder` 是首帧独立、
-随后 `[1:5],[5:9]...`。所以二者宽度/stride 相同，但边界并非严格对齐；脚本中的
-“Wan-aligned source-frame chunks”应理解为宽度对齐，而不是 exact boundary contract。
+`align_global_windows_to_codec=true` 时，global windows 是
+`[0],[1:5],[5:9]...,[29:33]`，与 `WanTemporalEncoder` 的首帧和四帧 chunk 边界
+严格一致。window 内 global attention 仍为双向，所以该合同是 chunk-level online，
+不是 frame-level causal attention。
 
 WAM 的 `160×320` 输入不能被 DINO patch size 14 整除。backbone 只在内部对右侧和
 下侧补零到 `168×322`，得到 `12×23` patch grid；外部输入、2D latent 和 RGB
@@ -236,20 +241,23 @@ wan_video_time(T') = 1 + 4(T'-1)
 33 -> 9 -> 33
 ```
 
-`WanTemporalEncoder` 对首帧使用独立投影，对后续每组 4 帧使用 learnable stride-4
-temporal convolution；`WanTemporalDecoder` 用独立首帧投影和 learnable channel-to-time
-expansion 恢复后续 4 帧。temporal residual convolution 只做左侧 padding，归一化按
-每个时空位置执行，不通过 normalization 泄漏未来信息。
+`WanTemporalEncoder` 与 `WanTemporalDecoder` 对首帧单独处理，后续时间通过两个带
+layer cache 的 causal stride-2 stages 完成 `4↔1` 压缩/展开。每层 cache 跨相邻 chunk
+保留左侧上下文；full-clip 与 chunked path 使用相同的 `frame0 + 4k` lattice。temporal
+residual convolution 只做左侧 padding，归一化按每个时空位置执行，不通过
+normalization 泄漏未来信息。
 
 ### `groot/vla/model/vggt_3d_wam/video_latent.py`
 
-`VideoLatentBranch` 执行 spatial bottleneck、逐空间位置 temporal transformer、
-因果 temporal attention 和 learnable `33 -> 9` 压缩，再预测 `mu/logvar` 并重参数
-采样。空间 bottleneck 自适应到严格的 `H/16 × W/16`，生产配置输出 48 channel。
+`VideoLatentBranch` 拼接四层 frame/global taps，经 `1024→256` residual fusion 和
+learned `10×20` query resampler；生产配置启用 local residual。随后叠加轻量 RGB detail
+path：`PixelUnshuffle(2)` 后三次 stride-2 卷积到 `H/16×W/16`，最终 1×1 projection
+零初始化。再执行逐空间位置 causal temporal transformer、两级 cached `33→9` codec，
+预测 `mu/logvar` 并重参数采样。生产配置输出 48 channel。
 
-`VideoDecoder` 不再使用时间插值加浅层逐帧卷积。它先执行 learnable `9 -> 33`
-时间展开，再通过四级 learned spatial upsampling 恢复 16 倍空间尺寸，使用 `tanh`
-输出与 Wan VAE 一致的 `[-1,1]` RGB 范围。
+`VideoDecoder` 先在 48-channel latent lattice 上执行 3 个 residual blocks，再通过两级
+cached temporal decoder 完成 `9→33`，最后用四级 learned spatial upsampling 恢复
+16 倍空间尺寸，使用 `tanh` 输出与 Wan VAE 一致的 `[-1,1]` RGB 范围。
 
 ### `groot/vla/model/vggt_3d_wam/metric_tokens.py`
 
@@ -475,7 +483,8 @@ codec、decoder 和 geometry heads 使用主学习率。scheduler 对两类 LR �
 指向用户提供的 `model.pt`。
 
 正式 shell launcher 会覆盖部分基础值：`max_steps=30000`、save/eval 每 5000 step、
-warmup ratio `0.01`。可视化间隔仍来自 YAML：train 1000、val 5000。
+heads LR `2e-5`、aggregator LoRA LR `5e-6`、warmup ratio `0.02`、最低 LR 倍率
+`0.5`。可视化间隔仍来自 YAML：train 1000、val 5000。
 
 ### `groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml`
 
@@ -499,9 +508,13 @@ multiview_occlusion_threshold = 0.15 m
 
 ```text
 global_temporal_window = 4
+align_global_windows_to_codec = true
 latent_spatial_stride = 16
 latent_temporal_stride = 4
+video_query_local_residual = true
+video_rgb_path_enabled = true
 video_decoder_dim = 256
+video_decoder_latent_residual_blocks = 3
 ```
 
 ### `groot/vla/configs/data/dreamzero/mobilemanibench_vggt.yaml`
@@ -533,7 +546,7 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 
 ```bash
 VGGT_CHECKPOINT_PATH=/mnt/yihao/codes/ReconDrive/checkpoints/model.pt \
-  NUM_GPUS=8 \
+  NUM_GPUS=4 \
   bash scripts/train/mobilemanibench_vggt_training.sh
 ```
 
@@ -1784,3 +1797,39 @@ Trainer/checkpoint tests            3/3 PASS
 real LPIPS safetensors save         PASS
 incomplete-checkpoint fallback      PASS
 ```
+
+## 19. VGGT v3.x 与 RGB detail path 更新
+
+提交 `72af601`、`1f2700b` 和 `4242553` 在 V2 之后进一步更新了当前生产结构：
+
+```text
+aligned global windows     [0],[1:5],[5:9],...,[29:33]
+feature taps               [4,11,17,23]，frame/global 各 128 后 concat
+2D fusion                  four-level 1024 -> 256
+spatial resampler          learned 10x20 queries + local residual
+RGB detail path            PixelUnshuffle(2), 32->64->96->128, zero-init 256 projection
+2D latent                  [B,V,48,9,10,20]
+latent decoder refinement  3 x residual(256)
+temporal codec             two cached causal stride-2 stages；decoder x2,x2
+```
+
+`video_rgb_path_enabled=true` 时，`VGGT3DWAMModel` 会把 canonical `[-1,1]` RGB 与
+四层 VGGT features 一起传给 2D encoder。零初始化只发生在 RGB encoder 的最终 projection，
+所以从旧 checkpoint 做 matching-only 初始化时，新增分支初始增量严格为零；这不等于
+RGB encoder 永久冻结，projection 获得梯度后整条分支可训练。
+
+`model.py` 新增逐 batch 的 `video_psnr`，`VGGTTrainer` 将 `_psnr` 标量与 loss 一样做
+分布式平均，并写入 Trainer/W&B/`loss_log.jsonl`；validation 指标键为
+`eval_video_psnr`。当前独立验证入口和原有 RGB/PointMap 可视化合同不变。
+
+2026-08-17 在远程现有环境运行可用的 VGGT `unittest`：17/18 通过。失败项是
+`test_frozen_backbone_only_trains_lora_parameters`：它仍断言 `model.backbone` 中所有
+trainable 参数都必须是 LoRA `down/up`，但 v3.0 的
+`frame_tap_projections`/`global_tap_projections` 也是有意新增的 trainable 参数，且
+`VGGTTrainer.create_optimizer()` 明确把它们归入 heads 参数组。该测试断言需要同步；
+不能继续把当前整组 VGGT tests 记为全绿。`test_vggt_3d_wam_tokenizer_contract.py`
+依赖 `pytest`，远程环境未安装 pytest，因此本次未执行。
+
+这些结构变化会新增参数，旧 checkpoint 应使用 `INIT_CHECKPOINT` 做 name-and-shape
+matching；只有同一当前结构且包含 model、trainer state、optimizer 和 scheduler 的完整
+checkpoint 才能自动 resume。

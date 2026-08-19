@@ -86,6 +86,31 @@ def spatial_gradient_loss(
     )
 
 
+def laplacian_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Match per-channel second-order spatial detail in ``[-1, 1]`` videos."""
+    prediction_frames = _flatten_video_frames(prediction).float()
+    target_frames = _flatten_video_frames(target).float()
+    channels = prediction_frames.shape[1]
+    kernel = prediction_frames.new_tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
+    ).reshape(1, 1, 3, 3)
+    kernel = kernel.expand(channels, 1, 3, 3)
+    prediction_laplacian = F.conv2d(
+        F.pad(prediction_frames, (1, 1, 1, 1), mode="reflect"),
+        kernel,
+        groups=channels,
+    )
+    target_laplacian = F.conv2d(
+        F.pad(target_frames, (1, 1, 1, 1), mode="reflect"),
+        kernel,
+        groups=channels,
+    )
+    return charbonnier_loss(prediction_laplacian, target_laplacian)
+
+
 def temporal_difference_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,

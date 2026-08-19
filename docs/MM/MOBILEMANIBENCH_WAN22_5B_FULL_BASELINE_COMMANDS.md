@@ -3,6 +3,7 @@
 > 当前脚本默认使用五任务数据集、10,000 steps、`clean_prior +
 > physical_consistency`；无 prior baseline 通过环境变量显式选择。
 > 下文保留全量转换/划分记录，同时给出当前 five-task 训练入口。
+> VGGT 与 multiblock 默认值已按远程提交 `4242553` 校对（2026-08-17）。
 > 实现状态和关键张量合同见 [README.md](./README.md)。
 
 ## 1. 实验目标与固定路径
@@ -529,19 +530,21 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 ```text
 video_contract=33x160x320 -> 9x10x20 -> 33x160x320
 temporal_layout=frame0 + 8 chunks of 4 frames (shared by 2D/3D)
-temporal_window=4 (Wan-aligned source-frame chunks)
+temporal_window=[0],[1:5],[5:9],... (closed bidirectional chunks)
+video_fusion=4x256 concat -> 1024->256 -> local-residual 10x20 queries -> 48
+video_decoder=3x residual(256) -> learned temporal/spatial upsampling
+rgb_path=PixelUnshuffle(2) + 32->64->96->128 -> zero-init 256 residual
 metric_grid=B0-forward x[0,3] y[-2,2] z[-0.5,2], 8x12x8=768 tokens
 video_losses=Charbonnier + LPIPS + SSIM + spatial-gradient + temporal-difference
 pointmap_decoder=40x80 ray rendering -> learned 80x160 refinement
-geometry_fusion=2-layer, 2-level, 8-head deformable cross-attention
+geometry_fusion=layer11 fine + layer23 learned coarse adapter
 dino=frozen, no LoRA, no_grad chunks of 4 images
 aggregator=rank-8 LoRA + activation checkpointing
 Preflight checks passed; training was not started.
 ```
 
-上述 `Wan-aligned` 是启动脚本当前打印文本，只表示窗口宽度为4。实际 aggregator
-windows 为 `[0:4],[4:8]...`，temporal codec 为 `frame0+[1:5],[5:9]...`，边界并未
-严格对齐。
+aggregator 与 temporal codec 都使用 `[0],[1:5],[5:9]...,[29:33]` 边界。chunk 内
+global attention 为双向，因此它是四帧闭合后的 chunk-online 协议，不是逐帧 causal。
 
 ### 10.2 生产规模训练前的 2-step GPU smoke
 
@@ -561,10 +564,10 @@ OUTPUT_DIR=/mnt/yihao/codes/dreamzero/work_dirs/mobilemanibench_5tasks_vggt_smok
 bash scripts/train/mobilemanibench_vggt_training.sh
 ```
 
-如果这一步出现 OOM，不能直接启动 8 卡 DDP；DDP 不会降低每张 GPU 上的模型和
+如果这一步出现 OOM，不能直接启动多卡 DDP；DDP 不会降低每张 GPU 上的模型和
 单样本显存，需要先调整 activation/checkpointing 或模型执行策略。
 
-### 10.3 启动 8 卡、30000-step VGGT tokenizer 训练
+### 10.3 启动 4 卡、30000-step VGGT tokenizer 训练
 
 脚本已经写入默认数据、checkpoint、batch size、训练步数和保存间隔，因此正式启动
 只需要：
@@ -581,16 +584,16 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 |---|---:|
 | Dataset | 五任务 G1 |
 | VGGT checkpoint | `/mnt/yihao/codes/ReconDrive/checkpoints/model.pt` |
-| GPU | 8 |
+| GPU | 4 |
 | Per-device batch | 1 |
 | Gradient accumulation | 1 |
-| Global batch | 8 |
+| Global batch | 4 |
 | Max steps | 30000 |
-| 新建 2D/3D heads learning rate | `5e-5` |
-| VGGT aggregator LoRA learning rate | `2e-5` |
+| 新建 2D/3D heads learning rate | `2e-5` |
+| VGGT aggregator LoRA learning rate | `5e-6` |
 | Scheduler | cosine with minimum LR |
-| Warmup ratio | `0.01`（300 steps） |
-| Minimum LR rate | `0.2` |
+| Warmup ratio | `0.02`（600 steps） |
+| Minimum LR rate | `0.5` |
 | Save interval | 5000 |
 | Eval interval | 5000 |
 | 训练内 validation | 从 24197 个 held-out clips 均匀固定抽取 256 个 |
@@ -630,7 +633,7 @@ bash scripts/train/mobilemanibench_vggt_training.sh
 
 matching-only 不恢复 optimizer/global step；空 `INIT_CHECKPOINT` 会完全跳过。
 
-不要在当前 WAN2.2 action baseline 占满 8 张 GPU 时同时启动 VGGT 训练。
+不要在当前 WAN2.2 action baseline 占用目标 GPU 时同时启动 VGGT 训练。
 
 ### 10.4 VGGT checkpoint 验证
 
@@ -649,7 +652,38 @@ bash scripts/eval/mobilemanibench_vggt_validate.sh
 <checkpoint>/validation_metrics.json
 ```
 
-## 11. 最终执行顺序摘要
+## 11. Multiblock WAM 训练与离线评估
+
+当前默认 multiblock 合同是 4 个 blocks、每 block local offsets `[2,4,8]`：
+
+```text
+24 flow tokens = 4 * (3 Base + 3 Manipulator)
+4 state tokens = 4 * 1
+28 internal action registers = 4 * (1 endpoint prior + 6 flow)
+```
+
+训练入口会先生成/复用 spec-hashed train-only statistics：
+
+```bash
+bash scripts/train/mobilemanibench_multiblock_plan_training_wan22_5b.sh
+```
+
+预检与 checkpoint 评估：
+
+```bash
+INSPECT_ONLY=1 \
+  bash scripts/eval/mobilemanibench_multiblock_plan_eval.sh
+
+MODE=gt_history_cached \
+CHECKPOINT=/absolute/path/to/checkpoint-N \
+  bash scripts/eval/mobilemanibench_multiblock_plan_eval.sh
+```
+
+`MODE` 还支持 `single_block_reset`、`episode_ordered_reset` 与仅作 loss 诊断的
+`oracle_four_block_teacher_forced`。evaluator 输出 waypoint/prior 指标、CSV/JSONL 和
+`predictions.npz`；当前不输出生成视频指标，也不代表 simulator closed-loop 成功率。
+
+## 12. 最终执行顺序摘要
 
 ```text
 1. convert_mobilemanibench_to_gear.py convert
@@ -663,6 +697,7 @@ bash scripts/eval/mobilemanibench_vggt_validate.sh
 8. 在 split=val 的固定 1024 样本上运行离线轨迹评估
 9. 比较多个 checkpoint，选择验证指标最优模型
 10. VGGT：先 preflight，再运行单卡 2-step 显存 smoke
-11. VGGT：启动 8 卡 30000-step tokenizer 训练
+11. VGGT：启动默认 4 卡 30000-step tokenizer 训练
 12. 使用 `mobilemanibench_vggt_validate.sh` 验证 VGGT checkpoint
+13. Multiblock：运行 preflight、训练，并分别比较 reset/cached evaluator modes
 ```

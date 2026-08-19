@@ -1,9 +1,9 @@
 # DreamZero Mobile 双计划 VLA 代码导读
 
-> **2026-07-28 阅读快照。** 后续代码已提交到 `092f247`，验证器和 VGGT 路径也继续
-> 更新。当前实现状态请先阅读
+> **2026-07-28 单 block 阅读快照。** 后续代码已加入 sparse clean prior、multiblock
+> teacher forcing 和对应 evaluator；本文不覆盖这些路径。当前实现状态请先阅读
 > [MM/README.md](./MM/README.md) 和
-> [MM/MOBILEMANIBENCH_CODE_CHANGES_BY_FILE_PHASE0-2.md](./MM/MOBILEMANIBENCH_CODE_CHANGES_BY_FILE_PHASE0-2.md)。
+> [MM/MOBILEMANIBENCH_MULTIBLOCK_TEACHER_FORCING_EXECUTION_PLAN.md](./MM/MOBILEMANIBENCH_MULTIBLOCK_TEACHER_FORCING_EXECUTION_PLAN.md)。
 
 > 本文解释远端服务器 `yihao@A100-gpu003` 上
 > `/mnt/yihao/codes/dreamzero` 当前工作区中的实现。

@@ -12,6 +12,7 @@ from .geometry import invert_transform, points_in_metric_grid, scale_intrinsics
 from .losses import (
     ChunkedLPIPSLoss,
     charbonnier_loss,
+    laplacian_loss,
     spatial_gradient_loss,
     ssim_loss,
     temporal_difference_loss,
@@ -831,6 +832,11 @@ class VGGT3DWAMModel(PreTrainedModel):
             if self.config.spatial_gradient_loss_weight > 0
             else video.new_zeros(())
         )
+        video_laplacian_loss = (
+            laplacian_loss(reconstructed, video)
+            if self.config.laplacian_loss_weight > 0
+            else video.new_zeros(())
+        )
         video_temporal_difference_loss = (
             temporal_difference_loss(reconstructed, video)
             if self.config.temporal_difference_loss_weight > 0
@@ -848,6 +854,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             + self.config.ssim_loss_weight * video_ssim_loss
             + self.config.spatial_gradient_loss_weight
             * video_spatial_gradient_loss
+            + self.config.laplacian_loss_weight * video_laplacian_loss
             + self.config.temporal_difference_loss_weight
             * video_temporal_difference_loss
         )
@@ -948,6 +955,7 @@ class VGGT3DWAMModel(PreTrainedModel):
             "video_lpips_loss": video_lpips_loss,
             "video_ssim_loss": video_ssim_loss,
             "video_spatial_gradient_loss": video_spatial_gradient_loss,
+            "video_laplacian_loss": video_laplacian_loss,
             "video_temporal_difference_loss": video_temporal_difference_loss,
             "video_quality_loss": video_quality_loss,
             "kl_2d_loss": kl_2d_loss,

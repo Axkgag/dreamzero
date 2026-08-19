@@ -57,6 +57,7 @@ model:
     lpips_chunk_size: 8
     ssim_loss_weight: 0.2
     spatial_gradient_loss_weight: 0.1
+    laplacian_loss_weight: 0.05
     temporal_difference_loss_weight: 0.1
     geometry_dim: 256
     geometry_heads: 8

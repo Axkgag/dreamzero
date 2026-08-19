@@ -7,6 +7,9 @@ The evaluator keeps the deployment contract explicit:
 * ``episode_ordered_reset`` predicts every requested block independently;
 * ``gt_history_cached`` predicts a block at a time and feeds only RGB frames
   that have actually arrived before the next prediction;
+* ``teacher_forced_open_loop`` slices the complete root window into arrived
+  RGB chunks, runs the full Flow solver for every block, and reports waypoint
+  metrics under ground-truth history and anchor-state conditioning;
 * ``oracle_four_block_teacher_forced`` evaluates the stochastic training loss
   with the complete clean 33-frame target window.  It is a diagnostic upper
   bound, not a deployment waypoint metric.
@@ -62,8 +65,10 @@ INFERENCE_MODES = (
     "episode_ordered_reset",
     "gt_history_cached",
 )
+TEACHER_FORCED_OPEN_LOOP_MODE = "teacher_forced_open_loop"
 ORACLE_MODE = "oracle_four_block_teacher_forced"
-ALL_MODES = (*INFERENCE_MODES, ORACLE_MODE)
+FULL_WINDOW_MODES = (TEACHER_FORCED_OPEN_LOOP_MODE, ORACLE_MODE)
+ALL_MODES = (*INFERENCE_MODES, *FULL_WINDOW_MODES)
 
 
 def parse_args() -> argparse.Namespace:
@@ -453,6 +458,35 @@ class MetricAccumulator:
                         target,
                         float(errors[source][waypoint_index]),
                     )
+
+        flat_valid = np.asarray(valid, dtype=bool).reshape(-1)
+        valid_indices = np.flatnonzero(flat_valid)
+        if valid_indices.size:
+            flat_errors = _waypoint_errors(
+                pred_base_global.reshape(-1, pred_base_global.shape[-1]),
+                gt_base_global.reshape(-1, gt_base_global.shape[-1]),
+                pred_manip_global.reshape(-1, pred_manip_global.shape[-1]),
+                gt_manip_global.reshape(-1, gt_manip_global.shape[-1]),
+                hand_dim,
+            )
+            endpoint = int(valid_indices[-1])
+            window_metrics = {
+                "composed_base_ade_m": float(
+                    np.mean(flat_errors["base_xy_l2_m"][valid_indices])
+                ),
+                "composed_base_fde_m": float(
+                    flat_errors["base_xy_l2_m"][endpoint]
+                ),
+                "composed_eef_ade_m": float(
+                    np.mean(flat_errors["eef_position_l2_m"][valid_indices])
+                ),
+                "composed_eef_fde_m": float(
+                    flat_errors["eef_position_l2_m"][endpoint]
+                ),
+            }
+            for name, value in window_metrics.items():
+                self._append(self.overall, name, value)
+                self._append(self.by_task[task], name, value)
         self.num_windows += 1
 
     @staticmethod
@@ -472,6 +506,10 @@ class MetricAccumulator:
             "hand_mae",
             "composed_base_xy_l2_m",
             "composed_eef_position_l2_m",
+            "composed_base_ade_m",
+            "composed_base_fde_m",
+            "composed_eef_ade_m",
+            "composed_eef_fde_m",
             "base_prior_xy_l2_m",
         )
         return {
@@ -630,11 +668,12 @@ def build_datasets(
     mode: str,
 ) -> dict[str, Any]:
     common = _dataset_kwargs(dataset_root, cfg, anchors, local_offsets)
+    needs_full_video = mode in FULL_WINDOW_MODES
     root_dataset = MobileManiBenchBlockPlanDataset(
         **common,
-        load_videos=mode == ORACLE_MODE,
+        load_videos=needs_full_video,
         video_delta_indices=(
-            list(range(int(cfg.num_frames))) if mode == ORACLE_MODE else [0]
+            list(range(int(cfg.num_frames))) if needs_full_video else [0]
         ),
         require_full_video_window=True,
     )
@@ -674,7 +713,13 @@ def build_transform_and_collator(cfg: Any, stats_path: Path):
         cfg.train_dataset.plan_transform, stats_path
     )
     model_transform = instantiate(transform_cfg)
-    model_transform.eval()
+    # DreamTransform.training controls the *sample schema*, not the model's
+    # train/eval mode.  Its eval form omits supervised action fields and adds
+    # a batch dimension internally, while this evaluator deliberately applies
+    # the transform per sample and then uses the training data collator.  Keep
+    # the transform in per-sample supervised form; the loaded model itself is
+    # still in evaluation/inference mode.
+    model_transform.train()
     collator = instantiate(cfg.data_collator)
     return model_transform, collator
 
@@ -685,6 +730,66 @@ def _merge_history_video(current: dict[str, Any], history: dict[str, Any]) -> No
         raise KeyError("History sample has no video.* fields")
     for key in video_keys:
         current[key] = history[key]
+
+
+def teacher_forced_block_observation(
+    root_sample: dict[str, Any],
+    block_index: int,
+    anchors: list[int],
+    block_stride: int,
+) -> dict[str, Any]:
+    """Slice one causal inference input from a complete clean root window.
+
+    Block 0 receives only the root RGB frame.  Later blocks receive exactly
+    the preceding block's nine arrived frames, matching ``gt_history_cached``
+    without requiring every anchor to be exposed as a separate dataset root.
+    Only the current anchor state is retained semantically.  It is repeated
+    across the four pre-collation slots required by the multiblock collator;
+    ``prepare_inference_batch`` then keeps the first slot only.
+    """
+    if not 0 <= block_index < len(anchors):
+        raise IndexError(f"Invalid block index {block_index} for {len(anchors)} blocks")
+    anchor_offset = int(anchors[block_index])
+    video_start = 0 if block_index == 0 else anchor_offset - block_stride
+    video_stop = anchor_offset + 1
+    if video_start < 0:
+        raise ValueError(
+            f"Block {block_index} has invalid history range "
+            f"[{video_start},{video_stop})"
+        )
+
+    observation = dict(root_sample)
+    video_keys = [
+        key for key in root_sample if str(key).startswith("video.")
+    ]
+    if not video_keys:
+        raise KeyError("Teacher-forced root sample has no video.* fields")
+    for key in video_keys:
+        value = root_sample[key]
+        if int(value.shape[0]) < video_stop:
+            raise ValueError(
+                f"{key} has {value.shape[0]} frames, but block {block_index} "
+                f"needs frames [{video_start},{video_stop})"
+            )
+        observation[key] = value[video_start:video_stop]
+
+    state_keys = ("state.eef_position", "state.eef_rotation_rpy")
+    for key in state_keys:
+        if key not in root_sample:
+            raise KeyError(f"Teacher-forced root sample is missing {key}")
+        value = root_sample[key]
+        if int(value.shape[0]) <= block_index:
+            raise ValueError(
+                f"{key} has {value.shape[0]} anchors, but block "
+                f"{block_index} was requested"
+            )
+        current_state = np.asarray(value[block_index : block_index + 1])
+        observation[key] = np.repeat(
+            current_state,
+            len(anchors),
+            axis=0,
+        )
+    return observation
 
 
 def prepare_inference_batch(
@@ -824,6 +929,7 @@ def _evaluation_metadata(
             "single_block_reset": "one current RGB/state; cache reset; block 0 only",
             "episode_ordered_reset": "each block uses current RGB/state; cache reset for every block",
             "gt_history_cached": "block 0 reset, later blocks receive only the 9 RGB frames that have arrived",
+            "teacher_forced_open_loop": "four Flow rollouts from one clean root window; GT arrived RGB and anchor state; cached across blocks",
             "oracle_four_block_teacher_forced": "full clean 33-frame training window; loss-only diagnostic",
         }[args.mode],
         "episode_ids": sorted(episode_ids),
@@ -845,8 +951,13 @@ def _evaluation_metadata(
             anchor + offset for anchor in anchors for offset in local_offsets
         ],
         "plan_stats_path": str(stats_path),
-        "future_state_leakage": False if args.mode in INFERENCE_MODES else None,
+        "future_state_leakage": (
+            False
+            if args.mode in (*INFERENCE_MODES, TEACHER_FORCED_OPEN_LOOP_MODE)
+            else None
+        ),
         "deployment_metric": args.mode in INFERENCE_MODES,
+        "teacher_forced_history": args.mode == TEACHER_FORCED_OPEN_LOOP_MODE,
     }
 
 
@@ -920,6 +1031,136 @@ def run_oracle(
         ) as handle:
             for row in rows:
                 handle.write(json.dumps(row, allow_nan=False) + "\n")
+
+
+def run_teacher_forced_open_loop(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    dataset: MobileManiBenchBlockPlanDataset,
+    root_indices: list[int],
+    episode_tasks: dict[int, str],
+    model_transform: Any,
+    collator: Any,
+    plan_transform: MobilePlanTransform,
+    anchors: list[int],
+    local_offsets: list[int],
+    block_stride: int,
+    rollout_blocks: int,
+    rank: int,
+    world_size: int,
+    output_dir: Path,
+    metadata: dict[str, Any],
+) -> None:
+    """Run full Flow sampling with GT arrived RGB and anchor states."""
+    accumulator = MetricAccumulator(anchors, local_offsets)
+    action_head = model.action_head
+    flow_tokens_per_block = 2 * len(local_offsets)
+    if int(action_head.action_horizon) != flow_tokens_per_block:
+        raise ValueError(
+            f"Checkpoint action_horizon={action_head.action_horizon} does not "
+            f"match 2*K={flow_tokens_per_block}"
+        )
+    prior_index = _prior_waypoint_index(action_head, local_offsets)
+
+    for ordinal, root_index in enumerate(root_indices, start=1):
+        root = dataset[root_index]
+        episode_index = int(root["episode_index"])
+        root_frame = int(root["frame_index"])
+        task = episode_tasks[episode_index]
+        hand_dim = int(root["hand_dim"])
+        block_base_predictions: list[np.ndarray] = []
+        block_manip_predictions: list[np.ndarray] = []
+        block_base_gt: list[np.ndarray] = []
+        block_manip_gt: list[np.ndarray] = []
+        block_valid: list[np.ndarray] = []
+
+        for block_index in range(rollout_blocks):
+            anchor_frame = root_frame + anchors[block_index]
+            raw_observation = teacher_forced_block_observation(
+                root,
+                block_index,
+                anchors,
+                block_stride,
+            )
+            inference_seed = sample_seed(
+                args.seed,
+                [(episode_index, root_frame), (block_index, anchor_frame)],
+            )
+            if block_index == 0:
+                reset_sampler_state(action_head, inference_seed)
+            else:
+                action_head.seed = int(inference_seed)
+            batch = prepare_inference_batch(
+                raw_observation,
+                model_transform,
+                collator,
+                flow_tokens_per_block,
+            )
+            expected_video_frames = 1 if block_index == 0 else block_stride + 1
+            if int(batch["images"].shape[1]) != expected_video_frames:
+                raise ValueError(
+                    f"{args.mode} block {block_index} expected "
+                    f"{expected_video_frames} RGB frames, got "
+                    f"{batch['images'].shape[1]}"
+                )
+            if int(batch["state"].shape[1]) != 1:
+                raise ValueError("Inference must expose exactly one current state")
+
+            with torch.inference_mode(), torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16
+            ):
+                output = model.get_action(batch)
+            if rank == 0:
+                base_pred, manip_pred, base_prior, eef_prior = _physical_predictions(
+                    output,
+                    plan_transform,
+                    int(action_head.manipulator_action_dim),
+                )
+                base_gt = to_numpy(root["base_plan"])[block_index]
+                manip_gt = to_numpy(root["manipulator_plan"])[block_index]
+                valid = to_numpy(root["plan_valid"])[block_index].astype(bool)
+                accumulator.add_block(
+                    episode_index=episode_index,
+                    root_frame_index=root_frame,
+                    anchor_frame_index=anchor_frame,
+                    task=task,
+                    block_index=block_index,
+                    base_pred=base_pred,
+                    base_gt=base_gt,
+                    manip_pred=manip_pred,
+                    manip_gt=manip_gt,
+                    valid=valid,
+                    hand_dim=hand_dim,
+                    base_prior_pred=base_prior,
+                    eef_prior_pred=eef_prior,
+                    prior_waypoint_index=prior_index,
+                )
+                block_base_predictions.append(base_pred)
+                block_manip_predictions.append(manip_pred)
+                block_base_gt.append(base_gt)
+                block_manip_gt.append(manip_gt)
+                block_valid.append(valid)
+            if world_size > 1:
+                dist.barrier()
+
+        if rank == 0:
+            accumulator.add_composed_window(
+                task=task,
+                base_pred=np.stack(block_base_predictions),
+                base_gt=np.stack(block_base_gt),
+                manip_pred=np.stack(block_manip_predictions),
+                manip_gt=np.stack(block_manip_gt),
+                valid=np.stack(block_valid),
+                hand_dim=hand_dim,
+            )
+            print(
+                f"[eval:{args.mode}] {ordinal}/{len(root_indices)} root windows",
+                flush=True,
+            )
+
+    if rank == 0:
+        accumulator.save(output_dir, metadata)
 
 
 def run_inference(
@@ -1197,6 +1438,26 @@ def main() -> int:
             root_indices=root_indices,
             model_transform=model_transform,
             collator=collator,
+            rank=rank,
+            world_size=world_size,
+            output_dir=output_dir,
+            metadata=metadata,
+        )
+    elif args.mode == TEACHER_FORCED_OPEN_LOOP_MODE:
+        plan_transform = MobilePlanTransform(stats_path=stats_path)
+        run_teacher_forced_open_loop(
+            args=args,
+            model=model,
+            dataset=root_dataset,
+            root_indices=root_indices,
+            episode_tasks=episode_tasks,
+            model_transform=model_transform,
+            collator=collator,
+            plan_transform=plan_transform,
+            anchors=anchors,
+            local_offsets=local_offsets,
+            block_stride=block_stride,
+            rollout_blocks=rollout_blocks,
             rank=rank,
             world_size=world_size,
             output_dir=output_dir,

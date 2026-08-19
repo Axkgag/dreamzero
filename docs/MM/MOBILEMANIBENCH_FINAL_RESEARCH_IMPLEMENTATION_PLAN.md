@@ -1,7 +1,7 @@
 # MobileManiBench 最终研究方案实施修改计划
 
-> 状态：**滚动实施计划；Phase 0–4 与独立 VGGT tokenizer 已实现，当前重点是训练消融与 Phase 6 集成**
-> 初版日期：2026-07-23；当前实现校对：2026-07-30
+> 状态：**滚动实施计划；Phase 0–4、独立 VGGT tokenizer 与 multiblock 核心路径已实现，当前重点是训练消融与 Phase 6 集成**
+> 初版日期：2026-07-23；当前实现校对：2026-08-17（`4242553`）
 > 目标仓库：`/mnt/yihao/codes/dreamzero`
 > 数据集：smoke v2 用于链路测试，G1 five-task 用于当前正式实验
 > 相关文档：[当前状态入口](./README.md)、[vggt_3d_wam_proposal.md](../vggt_3d_wam_proposal.md)、[MOBILEMANIBENCH_TO_DREAMZERO.md](./MOBILEMANIBENCH_TO_DREAMZERO.md)
@@ -18,6 +18,7 @@
 | Phase 5 | tokenizer 已实现并在独立训练，表示质量仍需实验确认 |
 | Phase 6 | 未实现；VGGT tokens 尚未接入 WAM |
 | Phase 7 | 离线 evaluator 已实现；控制器/仿真闭环未实现 |
+| Multiblock 扩展 | 4-block train/eval 核心路径已实现；checkpoint matching、video 指标与仿真未完成 |
 
 ## 1. 目标
 
@@ -939,7 +940,6 @@ camera intrinsics K
 dynamic camera pose/extrinsics
 coarse depth MP4
 depth confidence/valid mask
-segmentation/dynamic mask
 ```
 
 ### 11.3 2D 分支
@@ -949,9 +949,13 @@ segmentation/dynamic mask
 ```text
 multi-view RGB
 -> shared VGGT backbone
--> per-view 2D features
+-> [4,11,17,23] frame/global taps
+-> learned 10x20 queries + local residual
+-> zero-init lightweight RGB detail residual
 -> TemporalTransformer_2D
--> z_2d_video
+-> two-stage cached temporal codec
+-> z_2d_video [B,V,48,9,10,20]
+-> 3 residual blocks on the latent lattice + temporal/spatial decoder
 ```
 
 `z_2d_video` 必须具备：
@@ -1016,12 +1020,13 @@ VGGT image features
 
 ```text
 L_tokenizer =
-    lambda_rgb * L_2d_reconstruction
-  + lambda_feature * L_2d_feature
-  + lambda_depth * L_coarse_depth
-  + lambda_masked_view * L_masked_view
-  + lambda_temporal * L_temporal_geometry
-  + lambda_cross_view * L_cross_view
+    Charbonnier
+  + 0.1 * LPIPS
+  + 0.2 * SSIM
+  + 0.1 * spatial_gradient
+  + 0.1 * temporal_difference
+  + beta_2d * KL
+  + warmup(0.4) * geometry_quality(0.25) * L_geometry
 ```
 
 当前 loss 还包括 LPIPS、SSIM、RGB spatial/temporal gradient、ray surface、
@@ -1029,7 +1034,7 @@ free-space/surface occupancy、multiview、temporal geometry、surface normal �
 gradient。具体权重以
 `groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml` 为准。
 
-建议实验顺序：
+`masked_view_probability=0`，因此当前没有 masked-view training。建议实验顺序：
 
 1. 先训练/验证 2D-only。
 2. 加入低权重 depth。
@@ -1038,7 +1043,7 @@ gradient。具体权重以
 
 ### 11.7 验收标准
 
-- VGGT train/val 复用 `meta/plan_splits.json`，同一 source trajectory 不跨 split。
+- VGGT train/val 复用 `meta/plan_splits.json`，同一 source trajectory 不跨 split（当前尚未满足）。
 - 2D-only 重建质量达到可用于 WAM 的水平。
 - 加入3D后2D指标不显著退化。
 - 3D tokens 可解码出优于常数/单目无几何基线的 coarse depth。
@@ -1249,7 +1254,6 @@ scripts/train/mobilemanibench_plan_training_wan22_5b.sh
 scripts/train/calibrate_mobile_plan_loss_weights.py
 tests/data/test_mobilemanibench_plan_dataset.py
 tests/data/test_mobilemanibench_plan_transform.py
-tests/model/test_mobile_plan_phase2.py
 tests/model/test_mobile_plan_dual_plan.py
 tests/model/test_mobile_plan_physical_losses.py
 tests/model/test_mobile_plan_clean_prior.py
@@ -1261,6 +1265,21 @@ groot/vla/configs/model/vggt_3d_wam/encoder_decoder.yaml
 scripts/train/mobilemanibench_vggt_training.sh
 scripts/eval/validate_vggt_3d_wam.py
 tests/model/test_vggt_*.py
+
+groot/vla/data/dataset/mobilemanibench_block_plan.py
+groot/vla/data/plan_geometry.py
+groot/vla/utils/mobile_plan_spec.py
+groot/vla/model/dreamzero/action_head/mobile_plan_multiblock_flow_matching.py
+groot/vla/model/dreamzero/modules/wan_video_dit_dual_plan_multiblock.py
+groot/vla/configs/data/dreamzero/mobilemanibench_multiblock_plan.yaml
+groot/vla/configs/model/dreamzero/transform/mobile_plan_multiblock_cotrain.yaml
+groot/vla/configs/model/dreamzero/action_head/mobile_plan_multiblock_*.yaml
+scripts/train/mobilemanibench_multiblock_plan_training_wan22_5b.sh
+scripts/eval/evaluate_mobilemanibench_multiblock_plan.py
+scripts/eval/mobilemanibench_multiblock_plan_eval.sh
+tests/data/test_mobilemanibench_block_plan_labels.py
+tests/model/test_mobile_multiblock_plan.py
+tests/eval/test_mobilemanibench_multiblock_eval.py
 ```
 
 ### 14.3 尚待新增或扩展

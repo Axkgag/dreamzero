@@ -1,5 +1,9 @@
 # MobileManiBench VGGT Tokenizer 优化计划
 
+> 状态核对：2026-08-17，远程 `multiblock-wam` 分支提交 `4242553`。
+> 第 3–8 节的“当前实现”指 v3.0 之前的 V2 baseline；标为“本轮计划”的内容已在
+> `72af601` 实现。`1f2700b` 与 `4242553` 的后续改动见第 12 节。
+
 ## 1. 目标与固定合同
 
 本轮目标是先得到一个可冻结、可重建、可用于重新训练 WAM，并支持 chunk-online 推理的
@@ -28,6 +32,9 @@ feature taps             [4,11,17,23]
 per-layer projection     frame 1024->128，global 1024->128，直接 concat
 2D fusion                four-level concat 1024->256->48
 2D spatial resampler     learned 10x20 queries
+2D query residual        enabled
+RGB detail path          zero-init lightweight H/16 residual
+2D decoder latent blocks 3 residual blocks
 3D levels                layer 11 fine + layer 23 coarse
 geometry auxiliary loss  inside-grid masks
 feature fusion gate      不使用 frame/global gate 或 layer gate
@@ -72,7 +79,7 @@ RGB multi-view video
 
 ## 3. 优化点一：方案 A aligned chunk 与 Wan-style temporal codec
 
-### 3.1 当前实现
+### 3.1 v3.0 之前的 baseline
 
 Backbone global windows：
 
@@ -91,7 +98,7 @@ frames [1:5], [5:9], ... 使用一次 kernel_t=4,stride_t=4 Conv3d
 问题是 global window 和 latent chunk 错位，而且一次 stride-4 卷积没有复现 Wan VAE 的
 两级下采样与跨 chunk 时间感受野。
 
-### 3.2 本轮计划实现
+### 3.2 v3.0 已实现
 
 **方案 A 的在线协议**
 
@@ -184,7 +191,7 @@ output:
 
 ## 4. 优化点二：`[4,11,17,23]` frame/global feature taps
 
-### 4.1 当前实现
+### 4.1 v3.0 之前的 baseline
 
 Backbone 主链每层是：
 
@@ -195,7 +202,7 @@ tokens 1024 -> frame block -> frame 1024 -> global block -> global 1024
 当前 branch 只使用最后层 global feature `[B,T,V,1024,12,23]`，没有保留 frame feature，
 也没有使用 transformer-depth 中间层。
 
-### 4.2 本轮计划实现
+### 4.2 v3.0 已实现
 
 主链继续保持 1024 维，不把 frame/global concat 后送入下一层。
 
@@ -242,7 +249,7 @@ checkpoint 兼容，但不扩展为 branch fusion gate。
 
 ## 5. 优化点三：2D four-level fusion 与 learned spatial resampler
 
-### 5.1 当前实现
+### 5.1 v3.0 之前的 baseline
 
 ```text
 last global [B,T,V,1024,12,23]
@@ -254,7 +261,7 @@ last global [B,T,V,1024,12,23]
 
 单步通道压缩和固定平均池化可能丢失边缘、小物体与机械臂细节。
 
-### 5.2 本轮计划实现
+### 5.2 v3.0 已实现
 
 四层按固定顺序直接 concat：
 
@@ -303,7 +310,7 @@ output      [B*T*V,10*20,256]
 
 ## 6. 优化点四：3D two-level true-depth features
 
-### 6.1 当前实现
+### 6.1 v3.0 之前的 baseline
 
 ```text
 level 0 = layer 23 feature，12x23
@@ -312,7 +319,7 @@ level 1 = avg_pool(layer 23)，6x11
 
 两个 level 只有空间尺度差异，没有 transformer-depth 差异。
 
-### 6.2 本轮计划实现
+### 6.2 v3.0 已实现
 
 固定使用：
 
@@ -359,7 +366,7 @@ camera projection
 
 ## 7. 优化点五：inside-grid auxiliary masks
 
-### 7.1 当前实现
+### 7.1 v3.0 之前的 baseline
 
 PointMap coordinate、ray/surface、occupancy 和 multiview correspondence 已过滤 metric grid
 外 GT；以下辅助 loss 仍主要依赖 `pointmap_valid`：
@@ -372,7 +379,7 @@ depth gradient loss
 
 因此 grid 外 GT 仍可能进入辅助监督。
 
-### 7.2 本轮计划实现
+### 7.2 v3.0 已实现
 
 统一计算：
 
@@ -424,7 +431,7 @@ auxiliary_outside_rejected_count
 
 ## 8. 优化点六：2D/3D two-stage causal temporal decoder
 
-### 8.1 当前实现
+### 8.1 v3.0 之前的 baseline
 
 2D 和 3D decoder 当前共用简化 `WanTemporalDecoder`：
 
@@ -447,7 +454,7 @@ temporal residual refinement
 当前 temporal encoder/decoder 是粗粒度 `stride-4 / latent-to-4` 配对；当本轮 encoder
 升级为两级 stride-2 后，保留一次展开会造成明显的时间层次不对称。
 
-### 8.2 本轮计划实现
+### 8.2 v3.0 已实现
 
 2D 和 3D 使用相同的时间拓扑和 state API，但各自持有权重和 cache：
 
@@ -581,22 +588,23 @@ configuration.py / YAML
   feature layers/dims, temporal codec, resampler, geometry levels and mask switches
 ```
 
-建议固定配置：
+当前实际配置键：
 
 ```yaml
-online_tokenizer_mode: chunk
 align_global_windows_to_codec: true
 global_attention_causal: false
 temporal_codec_num_downsample_stages: 2
 temporal_codec_use_layer_cache: true
 temporal_decoder_num_upsample_stages: 2
-temporal_decoder_use_layer_cache: true
 feature_tap_layers: [4, 11, 17, 23]
-feature_tap_frame_dim: 128
-feature_tap_global_dim: 128
+feature_tap_dim: 128
 video_fusion_dim: 256
-video_latent_dim: 48
-video_latent_size: [10, 20]
+video_query_local_residual: true
+video_rgb_path_enabled: true
+video_decoder_latent_residual_blocks: 3
+latent_dim: 48
+latent_spatial_stride: 16
+latent_temporal_stride: 4
 geometry_feature_layers: [11, 23]
 mask_auxiliary_losses_to_grid: true
 ```
@@ -629,3 +637,27 @@ mask_auxiliary_losses_to_grid: true
 - 报告 PointMap inside-grid error 和 auxiliary valid ratios；
 - 固定样本可视化 chunk 边界、机械臂、小物体和 3D scatter；
 - 同时报告 peak memory、step time 和 feature cache 大小。
+
+## 12. v3.1–当前实现补充
+
+`1f2700b` 在 v3.0 合同上加入两项 2D 重建增强：learned query resampler 的 local
+residual，以及 decoder latent lattice 上的 3 个 residual blocks。`4242553` 又加入
+轻量 RGB detail path：
+
+```text
+canonical RGB [-1,1]
+ -> PixelUnshuffle(2)
+ -> Conv 12->32
+ -> stride-2 Conv 32->64->96->128
+ -> zero-initialized 1x1 projection 128->256
+ -> add to VGGT query-resampled 10x20 features
+```
+
+最终 projection 的 weight/bias 均为零，因此新增路径在初始化时不改变旧模型输出；
+matching-only 初始化可以安全跳过新增参数。训练开始后先更新最终 projection，随后梯度
+进入 RGB encoder。当前 `model.py` 还输出 `video_psnr`，Trainer 会记录
+`video_psnr_avg` 与 `eval_video_psnr`。
+
+这些增强没有改变对外 tensor contract：`33×160×320 -> 9×10×20 -> 33×160×320`，
+也没有把 tokenizer 接入 WAM。Stage 2 仍需单独实现 multi-view latent layout、统计归一化
+和 WAM adapter。

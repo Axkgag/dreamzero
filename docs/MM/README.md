@@ -1,7 +1,7 @@
 # MobileManiBench / VGGT 文档入口与当前实现状态
 
-> 校对日期：2026-07-30
-> 代码基准：远程当前工作树（包含可配置 sparse clean prior 与 physical-consistency 实现）
+> 校对日期：2026-08-17
+> 代码基准：远程 `multiblock-wam` 分支提交 `4242553`
 > 远程仓库：`/mnt/yihao/codes/dreamzero`
 
 本页是 MobileManiBench 相关文档的状态入口。代码、配置和脚本是实现事实的最终来源；
@@ -25,6 +25,9 @@ proposal 与 implementation plan 描述目标，历史报告只说明当时的�
 | VGGT 2D/3D tokenizer | 已实现 | `groot/vla/model/vggt_3d_wam/` |
 | VGGT 独立训练、日志、验证、可视化 | 已实现 | `vggt_3d_wam.py`、对应 train/eval shell |
 | configurable sparse clean Base/EEF Prior | 已实现 | `mobile_plan_clean_prior_flow_matching.py`、`wan_video_dit_dual_plan_prior.py` |
+| 4-block dual-plan teacher forcing | 已实现 | `mobile_plan_multiblock_flow_matching.py`、`wan_video_dit_dual_plan_multiblock.py` |
+| dynamic block-local labels 与 spec-hashed stats | 已实现 | `mobilemanibench_block_plan.py`、`mobile_plan_spec.py` |
+| multiblock checkpoint 离线 evaluator | 已实现 | `evaluate_mobilemanibench_multiblock_plan.py`、对应 shell |
 | VGGT `z_2d/z_3d` 接入 WAM | **未实现** | Phase 6 计划 |
 | future 3D flow、控制器与仿真成功率 | **未实现** | 后续研究阶段 |
 
@@ -58,6 +61,28 @@ token 6..11  = Manipulator，按 embodiment mask 有效
 
 physical loss 只作用于有效 horizon 和有效 embodiment 维；collision、contact 与
 differentiable IK 仍未进入训练目标。
+
+### Multiblock dual-plan
+
+multiblock 路径与上面的单 block baseline 并存，不能混用两者的 horizon。当前默认合同为：
+
+```text
+RGB frames / Wan latents  33 / 9
+video blocks              4，每 block 2 个 future latent = 8 个 RGB frames
+block anchors             [0,8,16,24]
+local waypoint offsets    [2,4,8]
+waypoints per block       3
+flow tokens per block     3 Base + 3 Manipulator = 6
+training flow tokens      4 * 6 = 24
+state tokens              4 * 1 = 4
+clean-prior registers     每 block 1 个 endpoint Base prior
+internal registers        每 block 7，完整训练窗口共 28
+```
+
+标签从 canonical world trajectory 动态派生，并分别表达在每个 block 起点的 Base
+坐标系；统计文件按 anchors/offsets 的 spec hash 保存。训练使用完整 33 帧 GT future
+video 的 block-causal teacher forcing。部署式推理每次只输出一个 block，不能把训练用的
+24-token 总长度当成单次 `action_horizon`。
 
 ### Sparse clean prior
 
@@ -130,7 +155,12 @@ grid [Z,Y,X] = [8,12,8] = 768 voxels
 
 - DINOv2 完全冻结、无 LoRA；
 - VGGT frame/global aggregator 使用 rank-8 LoRA；
-- `global_temporal_window=4`，当前 global windows 为 `[0:4],[4:8]...`；
+- `global_temporal_window=4` 且 `align_global_windows_to_codec=true`，global windows 为
+  `[0],[1:5],[5:9]...,[29:33]`；
+- 2D learned query resampler 启用 local residual，decoder 在 latent lattice 上先经过
+  3 个 residual blocks；
+- 轻量 RGB detail path 使用 `PixelUnshuffle(2)` 与三次 stride-2 卷积，下游 1×1
+  projection 零初始化，因此 matching-init 时不破坏旧路径；
 - 2-level、2-layer、8-head deformable image-to-voxel aggregation；
 - PointMap ray rendering 为 `40×80`，learned refinement 输出 `80×160`；
 - geometry 主权重 `0.4`，质量系数 `0.25`，warmup 后有效权重 `0.1`；
@@ -139,9 +169,9 @@ grid [Z,Y,X] = [8,12,8] = 768 voxels
 深度来自有损 H.264 pseudo-range，内外参仍按 nominal calibration 使用。因此这些
 3D tokens 只应表述为 coarse geometry，不能支持毫米级重建或强碰撞/接触结论。
 
-注意 temporal codec 的边界是 `frame0 + [1:5],[5:9]...`，与当前 aggregator 的
-`[0:4],[4:8]...` 相差一帧。两者 stride 都是 4，但尚不能描述为严格 chunk-boundary
-对齐；这是接入 WAM 前需要决定是否修正的实现问题。
+aggregator 与 temporal codec 现在使用相同的
+`frame0 + [1:5],[5:9]...,[29:33]` chunk boundary。该协议是 chunk-online：四帧
+窗口闭合后才产生对应 latent；chunk 内 global attention 仍为双向，不能描述为逐帧在线。
 
 ## 3. 数据集状态
 
@@ -179,8 +209,9 @@ sibling episodes 可能跨 split。VGGT validation 可用于训练监控，但�
 
 1. [Phase 0–2 当前实现指南](./MOBILEMANIBENCH_CODE_CHANGES_BY_FILE_PHASE0-2.md)
 2. [VGGT 当前代码指南](./MOBILEMANIBENCH_VGGT_CODE_CHANGES_BY_FILE.md)
-3. [Wan2.2-5B 数据、训练与验证命令](./MOBILEMANIBENCH_WAN22_5B_FULL_BASELINE_COMMANDS.md)
-4. [数据转换方案](./MOBILEMANIBENCH_TO_DREAMZERO.md)
+3. [Multiblock teacher forcing 实现规范](./MOBILEMANIBENCH_MULTIBLOCK_TEACHER_FORCING_EXECUTION_PLAN.md)
+4. [Wan2.2-5B 数据、训练与验证命令](./MOBILEMANIBENCH_WAN22_5B_FULL_BASELINE_COMMANDS.md)
+5. [数据转换方案](./MOBILEMANIBENCH_TO_DREAMZERO.md)
 
 ### 目标与计划
 
@@ -211,6 +242,17 @@ MOBILE_PLAN_LOSS_PROFILE=flow_only \
 
 # 双路 checkpoint 离线轨迹评估
 bash scripts/eval/mobilemanibench_plan_eval.sh
+
+# 4-block 训练（默认 [2,4,8]，clean endpoint prior + physical consistency）
+bash scripts/train/mobilemanibench_multiblock_plan_training_wan22_5b.sh
+
+# multiblock 数据/offset/split 预检，不加载模型
+INSPECT_ONLY=1 \
+  bash scripts/eval/mobilemanibench_multiblock_plan_eval.sh
+
+# multiblock 部署式 GT-history cached 轨迹评估
+MODE=gt_history_cached CHECKPOINT=/absolute/path/to/checkpoint-N \
+  bash scripts/eval/mobilemanibench_multiblock_plan_eval.sh
 
 # VGGT tokenizer
 bash scripts/train/mobilemanibench_vggt_training.sh
