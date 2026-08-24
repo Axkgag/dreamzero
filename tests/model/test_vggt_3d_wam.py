@@ -133,11 +133,20 @@ class VGGT3DWAMModelTest(unittest.TestCase):
 
     def test_saved_checkpoint_does_not_require_source_vggt_file(self) -> None:
         model = VGGT3DWAMModel(tiny_config()).eval()
+        frozen_name, frozen_parameter = next(model.named_parameters())
+        frozen_parameter.requires_grad_(False)
+        with torch.no_grad():
+            frozen_parameter.fill_(0.125)
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             restored = VGGT3DWAMModel.from_pretrained(directory)
             self.assertTrue(restored.config.init_random)
             self.assertIsNone(restored.config.vggt_checkpoint_path)
+            restored_parameter = dict(restored.named_parameters())[frozen_name]
+            torch.testing.assert_close(
+                restored_parameter,
+                frozen_parameter,
+            )
 
     def test_frozen_shared_lpips_tensors_are_excluded_from_checkpoint(
         self,

@@ -45,6 +45,52 @@ class FusionResidualBlock(nn.Module):
         return hidden + residual
 
 
+class SpaceToDepthResidualDownsample(nn.Module):
+    """Preserve sub-pixel layout before learning a residual downsample.
+
+    The packed channel mean exactly matches integer-ratio area downsampling.
+    A zero-initialized residual path can then learn position-sensitive detail
+    without changing a pretrained v4.1 RGB pyramid at initialization.
+    """
+
+    def __init__(self, channels: int, factor: int) -> None:
+        super().__init__()
+        if factor < 2 or factor & (factor - 1):
+            raise ValueError(
+                "Space-to-depth factor must be a power of two >= 2, "
+                f"got {factor}"
+            )
+        self.channels = channels
+        self.factor = factor
+        packed_channels = channels * factor * factor
+        self.residual = nn.Sequential(
+            nn.Conv2d(packed_channels, channels, 1),
+            SpatialResidualBlock(channels),
+            nn.Conv2d(channels, channels, 1),
+        )
+        # Preserve the exact v4.1 area-downsample result before fine-tuning.
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        height, width = inputs.shape[-2:]
+        if height % self.factor or width % self.factor:
+            raise ValueError(
+                "RGB pyramid feature size must be divisible by its "
+                f"space-to-depth factor {self.factor}, got {height}x{width}"
+            )
+        packed = F.pixel_unshuffle(inputs, self.factor)
+        batch, _, target_height, target_width = packed.shape
+        area_base = packed.reshape(
+            batch,
+            self.channels,
+            self.factor * self.factor,
+            target_height,
+            target_width,
+        ).mean(dim=2)
+        return area_base + self.residual(packed)
+
+
 class LightweightRGBEncoder(nn.Module):
     """Encode a four-level residual RGB pyramid onto the latent lattice.
 
@@ -82,6 +128,10 @@ class LightweightRGBEncoder(nn.Module):
             nn.Conv2d(channels, output_channels, 1)
             for channels in level_channels[:-1]
         )
+        self.pyramid_downsamplers = nn.ModuleList(
+            SpaceToDepthResidualDownsample(channels, factor)
+            for channels, factor in zip(level_channels[:-1], (8, 4, 2))
+        )
         for projection in self.pyramid_projections:
             # The old deepest RGB path remains solely responsible for the
             # initial output; shallower levels are introduced gradually.
@@ -116,13 +166,17 @@ class LightweightRGBEncoder(nn.Module):
 
         output = self.output_projection(level_3)
         target_size = level_3.shape[-2:]
-        for level, projection in zip(
+        for level, downsampler, projection in zip(
             (level_0, level_1, level_2),
+            self.pyramid_downsamplers,
             self.pyramid_projections,
         ):
-            # Area downsampling keeps the lateral path inexpensive and avoids
-            # aliasing when the shallow RGB maps join the H/16 lattice.
-            lateral = F.interpolate(level, size=target_size, mode="area")
+            lateral = downsampler(level)
+            if lateral.shape[-2:] != target_size:
+                raise RuntimeError(
+                    "RGB pyramid downsample produced an unexpected size: "
+                    f"expected {target_size}, got {lateral.shape[-2:]}"
+                )
             output = output + projection(lateral)
         return output
 
@@ -269,6 +323,33 @@ class LearnedUpsampleBlock(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.refine(self.upsample(inputs))
+
+
+class LatentPyramidUpsampleBlock(nn.Module):
+    """Build one latent scale and expose a zero-init decoder injection."""
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.upsample = nn.Sequential(
+            nn.Conv2d(input_channels, 4 * output_channels, 1),
+            nn.PixelShuffle(2),
+        )
+        self.refine = SpatialResidualBlock(output_channels)
+        self.injection_projection = nn.Conv2d(
+            output_channels,
+            output_channels,
+            1,
+        )
+        # The v4.1 decoder remains bit-identical until this path learns.
+        nn.init.zeros_(self.injection_projection.weight)
+        nn.init.zeros_(self.injection_projection.bias)
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.refine(self.upsample(inputs))
+        return features, self.injection_projection(features)
 
 
 class VideoLatentBranch(nn.Module):
@@ -477,6 +558,14 @@ class VideoDecoder(nn.Module):
             stages.append(LearnedUpsampleBlock(channels, next_channels))
             channels = next_channels
         self.spatial_decoder = nn.Sequential(*stages)
+        latent_pyramid: list[nn.Module] = []
+        channels = hidden_dim
+        for next_channels in decoder_channels:
+            latent_pyramid.append(
+                LatentPyramidUpsampleBlock(channels, next_channels)
+            )
+            channels = next_channels
+        self.latent_pyramid = nn.ModuleList(latent_pyramid)
         self.output_projection = nn.Conv2d(channels, 3, 3, padding=1)
 
     def forward(
@@ -504,7 +593,14 @@ class VideoDecoder(nn.Module):
         )
         frames = self.input_projection(frames)
         frames = self.latent_refine(frames)
-        frames = self.spatial_decoder(frames)
+        latent_features = frames
+        for decoder_stage, latent_stage in zip(
+            self.spatial_decoder,
+            self.latent_pyramid,
+        ):
+            frames = decoder_stage(frames)
+            latent_features, injection = latent_stage(latent_features)
+            frames = frames + injection
         frames = self.output_projection(F.silu(frames)).tanh()
         expected_size = (height * self.spatial_stride, width * self.spatial_stride)
         if output_size is not None and tuple(output_size) != expected_size:
