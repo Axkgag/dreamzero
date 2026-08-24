@@ -12,6 +12,10 @@ plan_horizon: 3
 plan_waypoints_per_block: 3
 plan_local_offsets: [2, 4, 8]
 block_anchor_offsets: [0, 8, 16, 24]
+# EEF xyz stays in the block-anchor Base frame; only rotation becomes a
+# principal rotvec from the current anchor EEF to the future EEF.
+# anchor_base_rotation6d, current_eef_delta_rotvec
+eef_rotation_representation: anchor_base_rotation6d
 mobilemanibench_plan_stats_path: ???
 base_action_dim: 4
 max_manipulator_action_dim: 21
@@ -33,6 +37,7 @@ mobilemanibench_plan_dataset:
   label_source: ${mobilemanibench_plan_label_source}
   block_anchor_offsets: ${block_anchor_offsets}
   plan_local_offsets: ${plan_local_offsets}
+  eef_rotation_representation: ${eef_rotation_representation}
 
 train_dataset:
   _target_: groot.vla.data.dataset.MobileManiBenchBlockPlanDataset
@@ -48,6 +53,7 @@ train_dataset:
   label_source: ${mobilemanibench_plan_label_source}
   block_anchor_offsets: ${block_anchor_offsets}
   plan_local_offsets: ${plan_local_offsets}
+  eef_rotation_representation: ${eef_rotation_representation}
   split: train
   split_manifest_path: ${mobilemanibench_split_manifest}
   require_full_video_window: true
@@ -60,6 +66,7 @@ train_dataset:
         plan_waypoints_per_block: ${plan_waypoints_per_block}
         block_anchor_offsets: ${block_anchor_offsets}
         plan_local_offsets: ${plan_local_offsets}
+        eef_rotation_representation: ${eef_rotation_representation}
       - ${model_specific_transform}
 
 val_dataset:
@@ -76,6 +83,7 @@ val_dataset:
   label_source: ${mobilemanibench_plan_label_source}
   block_anchor_offsets: ${block_anchor_offsets}
   plan_local_offsets: ${plan_local_offsets}
+  eef_rotation_representation: ${eef_rotation_representation}
   split: val
   split_manifest_path: ${mobilemanibench_split_manifest}
   max_samples: ${max_eval_samples}
@@ -89,4 +97,5 @@ val_dataset:
         plan_waypoints_per_block: ${plan_waypoints_per_block}
         block_anchor_offsets: ${block_anchor_offsets}
         plan_local_offsets: ${plan_local_offsets}
+        eef_rotation_representation: ${eef_rotation_representation}
       - ${model_specific_transform}

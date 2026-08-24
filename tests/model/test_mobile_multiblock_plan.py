@@ -102,6 +102,25 @@ class MobileMultiBlockPlanTest(unittest.TestCase):
         self.assertEqual(tuple(hidden.shape), (2, 28, 32))
         self.assertEqual(tuple(prior_decoder(hidden, category).shape), (2, 24, 21))
 
+        delta_prior_decoder = MultiBlockCleanPriorActionDecoder(
+            base_action_dim=4,
+            manipulator_action_dim=21,
+            hidden_size=16,
+            model_dim=32,
+            num_embodiments=1,
+            waypoints_per_block=3,
+            prior_flow_index=2,
+            eef_prior_dim=6,
+        )
+        delta_prediction = delta_prior_decoder(hidden, category).reshape(
+            2, 4, 6, 21
+        )
+        self.assertGreater(delta_prediction[:, :, 2, 8:14].abs().sum().item(), 0)
+        torch.testing.assert_close(
+            delta_prediction[:, :, 2, 14:],
+            torch.zeros_like(delta_prediction[:, :, 2, 14:]),
+        )
+
     def test_teacher_forcing_blocks_only_read_earlier_clean_video(self) -> None:
         attention = CausalWanSelfAttention(
             dim=8,

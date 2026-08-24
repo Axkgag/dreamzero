@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""Offline validation for MobileManiBench multiblock WAM checkpoints.
+"""Fixed-protocol offline validation for MobileManiBench multiblock WAM.
 
-The evaluator keeps the deployment contract explicit:
-
-* ``single_block_reset`` predicts only the first block from one current frame;
-* ``episode_ordered_reset`` predicts every requested block independently;
-* ``gt_history_cached`` predicts a block at a time and feeds only RGB frames
-  that have actually arrived before the next prediction;
-* ``teacher_forced_open_loop`` slices the complete root window into arrived
-  RGB chunks, runs the full Flow solver for every block, and reports waypoint
-  metrics under ground-truth history and anchor-state conditioning;
-* ``oracle_four_block_teacher_forced`` evaluates the stochastic training loss
-  with the complete clean 33-frame target window.  It is a diagnostic upper
-  bound, not a deployment waypoint metric.
+Each root sample is evaluated with every block configured by the checkpoint.
+The evaluator slices the complete root window into arrived RGB chunks, keeps
+the KV cache across block-wise Flow solves, and conditions later blocks on GT
+history and GT anchor state.  A full supervised forward on the same root also
+exports eval losses; it is a diagnostic and does not replace Flow metrics.
 
 All waypoint predictions are inverse-normalized before metric computation.
 Per-block labels remain in each block's anchor-Base frame; composed metrics
@@ -37,13 +30,19 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from groot.vla.data.dataset import MobileManiBenchBlockPlanDataset
+from groot.vla.data.plan_geometry import euler_rpy_to_matrix
 from groot.vla.data.transform import MobilePlanTransform
-from groot.vla.utils.mobile_plan_spec import dynamic_block_plan_stats_path
+from groot.vla.utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
+    dynamic_block_plan_stats_path,
+)
 
 from evaluate_mobilemanibench_plan import (
     initialize_distributed,
     load_episode_tasks,
     load_model,
+    read_json,
     read_jsonl,
     reset_sampler_state,
     resolve_episode_split,
@@ -76,7 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--split", default="val")
-    parser.add_argument("--mode", choices=ALL_MODES, default="single_block_reset")
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -86,19 +84,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1140)
     parser.add_argument("--num-inference-steps", type=int, default=16)
-    parser.add_argument(
-        "--num-rollout-blocks",
-        type=int,
-        default=0,
-        help="0 uses every configured block; single_block_reset always uses one.",
-    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--inspect-only",
         action="store_true",
         help="Validate split, labels, offsets and sampling without loading a model.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # This executable intentionally exposes one stable offline protocol.  The
+    # internal mode label is retained only in result metadata for compatibility
+    # with existing analysis tools.
+    args.mode = TEACHER_FORCED_OPEN_LOOP_MODE
+    return args
 
 
 def _stats(values: Iterable[float]) -> dict[str, float | int | None]:
@@ -128,6 +125,56 @@ def _rz(yaw: np.ndarray) -> np.ndarray:
     result[..., 1, 1] = cosine
     result[..., 2, 2] = 1.0
     return result
+
+
+def rotation_vector_to_matrix(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=np.float64)
+    theta_sq = np.sum(np.square(value), axis=-1)
+    theta = np.sqrt(theta_sq)
+    x, y, z = np.moveaxis(value, -1, 0)
+    zero = np.zeros_like(x)
+    skew = np.stack(
+        [zero, -z, y, z, zero, -x, -y, x, zero], axis=-1
+    ).reshape(*value.shape[:-1], 3, 3)
+    small = theta_sq < 1e-8
+    a = np.empty_like(theta)
+    b = np.empty_like(theta)
+    a[small] = 1.0 - theta_sq[small] / 6.0
+    b[small] = 0.5 - theta_sq[small] / 24.0
+    regular = ~small
+    a[regular] = np.sin(theta[regular]) / theta[regular]
+    b[regular] = (1.0 - np.cos(theta[regular])) / theta_sq[regular]
+    identity = np.broadcast_to(np.eye(3), skew.shape)
+    return identity + a[..., None, None] * skew + b[..., None, None] * (skew @ skew)
+
+
+def canonicalize_manipulator_rotation(
+    manipulator: np.ndarray,
+    anchor_state: np.ndarray,
+    representation: str,
+    hand_dim: int,
+) -> np.ndarray:
+    """Convert configured EEF rotations to absolute anchor-Base rotation6d."""
+    manipulator = np.asarray(manipulator, dtype=np.float64)
+    if representation == EEF_ROTATION_ANCHOR_BASE_6D:
+        return manipulator.astype(np.float32, copy=False)
+    if representation != EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+        raise ValueError(f"Unknown EEF rotation representation: {representation}")
+    anchor_state = np.asarray(anchor_state, dtype=np.float64)
+    anchor_rotation = euler_rpy_to_matrix(anchor_state[..., 3:6])
+    while anchor_rotation.ndim < manipulator.ndim + 1:
+        anchor_rotation = np.expand_dims(anchor_rotation, axis=-3)
+    future_rotation = anchor_rotation @ rotation_vector_to_matrix(
+        manipulator[..., 3:6]
+    )
+    result = np.zeros_like(manipulator)
+    result[..., :3] = manipulator[..., :3]
+    result[..., 3:9] = future_rotation[..., :2, :].reshape(
+        *manipulator.shape[:-1], 6
+    )
+    if hand_dim:
+        result[..., 9 : 9 + hand_dim] = manipulator[..., 6 : 6 + hand_dim]
+    return result.astype(np.float32)
 
 
 def compose_block_plans(
@@ -625,7 +672,15 @@ def _resolve_stats_path(
         configured_path = Path(str(configured)).expanduser()
         if configured_path.is_file():
             return configured_path
-    dynamic = dynamic_block_plan_stats_path(dataset_root, anchors, local_offsets)
+    representation = str(
+        cfg.get("eef_rotation_representation", EEF_ROTATION_ANCHOR_BASE_6D)
+    )
+    dynamic = dynamic_block_plan_stats_path(
+        dataset_root,
+        anchors,
+        local_offsets,
+        eef_rotation_representation=representation,
+    )
     if require_existing and not dynamic.is_file():
         raise FileNotFoundError(
             f"No matching multiblock plan statistics: {dynamic}. Run the "
@@ -649,6 +704,9 @@ def _dataset_kwargs(
         "label_source": str(cfg.get("mobilemanibench_plan_label_source", "dynamic")),
         "block_anchor_offsets": anchors,
         "plan_local_offsets": local_offsets,
+        "eef_rotation_representation": str(
+            cfg.get("eef_rotation_representation", EEF_ROTATION_ANCHOR_BASE_6D)
+        ),
     }
 
 
@@ -789,6 +847,13 @@ def teacher_forced_block_observation(
             len(anchors),
             axis=0,
         )
+    if "physical_block_state" in root_sample:
+        current_physical_state = np.asarray(
+            root_sample["physical_block_state"][block_index : block_index + 1]
+        )
+        observation["physical_block_state"] = np.repeat(
+            current_physical_state, len(anchors), axis=0
+        )
     return observation
 
 
@@ -839,11 +904,18 @@ def _physical_predictions(
     eef_prior = None
     if "eef_prior_pred" in output:
         normalized = output["eef_prior_pred"].detach().float().cpu()
+        padded_normalized = torch.zeros(
+            (*normalized.shape[:-1], manipulator_dim), dtype=normalized.dtype
+        )
+        padded_normalized[..., : normalized.shape[-1]] = normalized
         dummy_base = torch.zeros(
             (*normalized.shape[:-1], 4), dtype=normalized.dtype
         )
         prior_physical = plan_transform.unapply(
-            {"base_action": dummy_base, "manipulator_action": normalized}
+            {
+                "base_action": dummy_base,
+                "manipulator_action": padded_normalized,
+            }
         )
         eef_prior = to_numpy(prior_physical["manipulator_plan"])[0, 0]
     return base, manipulator, base_prior, eef_prior
@@ -874,22 +946,10 @@ def _selected_root_indices(
     )
 
 
-def _rollout_blocks(args: argparse.Namespace, num_plan_blocks: int) -> int:
-    if args.mode == "single_block_reset":
-        return 1
-    if args.num_rollout_blocks <= 0:
-        return num_plan_blocks
-    if args.num_rollout_blocks > num_plan_blocks:
-        raise ValueError(
-            f"--num-rollout-blocks cannot exceed {num_plan_blocks}"
-        )
-    return args.num_rollout_blocks
-
-
 def _output_dir(args: argparse.Namespace, checkpoint: Path) -> Path:
     if args.output_dir is not None:
         return args.output_dir.resolve()
-    return checkpoint / f"mobile_multiblock_plan_eval_{args.split}_{args.mode}"
+    return checkpoint / f"mobile_multiblock_plan_eval_{args.split}"
 
 
 def _checkpoint_step(checkpoint: Path) -> int | None:
@@ -924,14 +984,13 @@ def _evaluation_metadata(
         "dataset_root": str(dataset_root),
         "split": args.split,
         "split_source": split_source,
-        "mode": args.mode,
-        "mode_contract": {
-            "single_block_reset": "one current RGB/state; cache reset; block 0 only",
-            "episode_ordered_reset": "each block uses current RGB/state; cache reset for every block",
-            "gt_history_cached": "block 0 reset, later blocks receive only the 9 RGB frames that have arrived",
-            "teacher_forced_open_loop": "four Flow rollouts from one clean root window; GT arrived RGB and anchor state; cached across blocks",
-            "oracle_four_block_teacher_forced": "full clean 33-frame training window; loss-only diagnostic",
-        }[args.mode],
+        "protocol": TEACHER_FORCED_OPEN_LOOP_MODE,
+        "mode": TEACHER_FORCED_OPEN_LOOP_MODE,
+        "protocol_contract": (
+            "one Flow rollout per configured block; GT arrived RGB and anchor "
+            "state; KV cache retained across blocks; supervised full-window "
+            "loss exported from the same root samples"
+        ),
         "episode_ids": sorted(episode_ids),
         "num_root_windows": len(root_indices),
         "root_task_counts": count_tasks_for_indices(
@@ -941,7 +1000,7 @@ def _evaluation_metadata(
         "max_samples": args.max_samples,
         "seed": args.seed,
         "num_inference_steps": args.num_inference_steps,
-        "num_rollout_blocks": rollout_blocks,
+        "num_plan_blocks": rollout_blocks,
         "world_size": world_size,
         "control_fps": float(root_dataset.control_fps),
         "block_stride": block_stride,
@@ -951,13 +1010,9 @@ def _evaluation_metadata(
             anchor + offset for anchor in anchors for offset in local_offsets
         ],
         "plan_stats_path": str(stats_path),
-        "future_state_leakage": (
-            False
-            if args.mode in (*INFERENCE_MODES, TEACHER_FORCED_OPEN_LOOP_MODE)
-            else None
-        ),
-        "deployment_metric": args.mode in INFERENCE_MODES,
-        "teacher_forced_history": args.mode == TEACHER_FORCED_OPEN_LOOP_MODE,
+        "future_state_leakage": False,
+        "deployment_metric": False,
+        "teacher_forced_history": True,
     }
 
 
@@ -1052,8 +1107,10 @@ def run_teacher_forced_open_loop(
     output_dir: Path,
     metadata: dict[str, Any],
 ) -> None:
-    """Run full Flow sampling with GT arrived RGB and anchor states."""
+    """Run every configured Flow block and export matching supervised losses."""
     accumulator = MetricAccumulator(anchors, local_offsets)
+    loss_values: dict[str, list[float]] = defaultdict(list)
+    loss_rows: list[dict[str, Any]] = []
     action_head = model.action_head
     flow_tokens_per_block = 2 * len(local_offsets)
     if int(action_head.action_horizon) != flow_tokens_per_block:
@@ -1062,6 +1119,13 @@ def run_teacher_forced_open_loop(
             f"match 2*K={flow_tokens_per_block}"
         )
     prior_index = _prior_waypoint_index(action_head, local_offsets)
+    rotation_representation = str(
+        getattr(
+            action_head.config,
+            "eef_rotation_representation",
+            EEF_ROTATION_ANCHOR_BASE_6D,
+        )
+    )
 
     for ordinal, root_index in enumerate(root_indices, start=1):
         root = dataset[root_index]
@@ -1074,6 +1138,44 @@ def run_teacher_forced_open_loop(
         block_base_gt: list[np.ndarray] = []
         block_manip_gt: list[np.ndarray] = []
         block_valid: list[np.ndarray] = []
+
+        # The full-window forward uses the same transformed root sample as
+        # training and provides eval loss diagnostics.  Its RNG stream is
+        # separate from Flow sampling, whose state is reset below per block.
+        loss_seed = sample_seed(
+            args.seed,
+            [(episode_index, root_frame), (ordinal, -1)],
+        )
+        torch.manual_seed(loss_seed)
+        torch.cuda.manual_seed_all(loss_seed)
+        supervised_batch = collator([model_transform(dict(root))])
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16
+        ):
+            supervised_output = model(supervised_batch)
+        if rank == 0:
+            loss_row: dict[str, Any] = {
+                "episode_index": episode_index,
+                "frame_index": root_frame,
+                "seed": loss_seed,
+            }
+            for name, value in supervised_output.items():
+                if not torch.is_tensor(value) or value.numel() != 1:
+                    continue
+                if name != "loss" and not name.endswith(("_loss", "_metric")):
+                    continue
+                scalar = float(value.detach().float().cpu())
+                if not math.isfinite(scalar):
+                    raise FloatingPointError(
+                        f"Non-finite eval metric {name} at "
+                        f"episode={episode_index}, frame={root_frame}: {scalar}"
+                    )
+                loss_values[name].append(scalar)
+                loss_row[name] = scalar
+            loss_rows.append(loss_row)
+        del supervised_batch, supervised_output
+        if world_size > 1:
+            dist.barrier()
 
         for block_index in range(rollout_blocks):
             anchor_frame = root_frame + anchors[block_index]
@@ -1119,6 +1221,26 @@ def run_teacher_forced_open_loop(
                 )
                 base_gt = to_numpy(root["base_plan"])[block_index]
                 manip_gt = to_numpy(root["manipulator_plan"])[block_index]
+                anchor_state = to_numpy(root["physical_block_state"])[block_index]
+                manip_pred = canonicalize_manipulator_rotation(
+                    manip_pred,
+                    anchor_state,
+                    rotation_representation,
+                    hand_dim,
+                )
+                manip_gt = canonicalize_manipulator_rotation(
+                    manip_gt,
+                    anchor_state,
+                    rotation_representation,
+                    hand_dim,
+                )
+                if eef_prior is not None:
+                    eef_prior = canonicalize_manipulator_rotation(
+                        eef_prior,
+                        anchor_state,
+                        rotation_representation,
+                        0,
+                    )
                 valid = to_numpy(root["plan_valid"])[block_index].astype(bool)
                 accumulator.add_block(
                     episode_index=episode_index,
@@ -1161,6 +1283,18 @@ def run_teacher_forced_open_loop(
 
     if rank == 0:
         accumulator.save(output_dir, metadata)
+        summary_path = output_dir / "summary.json"
+        summary = read_json(summary_path)
+        summary["teacher_forced_losses"] = {
+            name: _stats(values)
+            for name, values in sorted(loss_values.items())
+        }
+        write_json(summary_path, summary)
+        with (output_dir / "per_window_losses.jsonl").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            for row in loss_rows:
+                handle.write(json.dumps(row, allow_nan=False) + "\n")
 
 
 def run_inference(
@@ -1196,6 +1330,13 @@ def run_inference(
             f"match 2*K={flow_tokens_per_block}"
         )
     prior_index = _prior_waypoint_index(action_head, local_offsets)
+    rotation_representation = str(
+        getattr(
+            action_head.config,
+            "eef_rotation_representation",
+            EEF_ROTATION_ANCHOR_BASE_6D,
+        )
+    )
 
     for ordinal, root_index in enumerate(root_indices, start=1):
         root = root_dataset[root_index]
@@ -1261,6 +1402,26 @@ def run_inference(
                 )
                 base_gt = to_numpy(root["base_plan"])[block_index]
                 manip_gt = to_numpy(root["manipulator_plan"])[block_index]
+                anchor_state = to_numpy(root["physical_block_state"])[block_index]
+                manip_pred = canonicalize_manipulator_rotation(
+                    manip_pred,
+                    anchor_state,
+                    rotation_representation,
+                    hand_dim,
+                )
+                manip_gt = canonicalize_manipulator_rotation(
+                    manip_gt,
+                    anchor_state,
+                    rotation_representation,
+                    hand_dim,
+                )
+                if eef_prior is not None:
+                    eef_prior = canonicalize_manipulator_rotation(
+                        eef_prior,
+                        anchor_state,
+                        rotation_representation,
+                        0,
+                    )
                 valid = to_numpy(root["plan_valid"])[block_index].astype(bool)
                 accumulator.add_block(
                     episode_index=episode_index,
@@ -1356,7 +1517,9 @@ def main() -> int:
         args.sample_stride,
         args.max_samples,
     )
-    rollout_blocks = _rollout_blocks(args, len(anchors))
+    # Evaluation always covers the complete model-defined horizon.  Partial
+    # block rollouts are a debugging/inference concern, not a validation mode.
+    rollout_blocks = len(anchors)
 
     if args.inspect_only:
         episodes = read_jsonl(dataset_root / "meta/episodes.jsonl")
@@ -1369,18 +1532,14 @@ def main() -> int:
                     "dataset_root": str(dataset_root),
                     "split": args.split,
                     "split_source": split_source,
-                    "mode": args.mode,
+                    "protocol": TEACHER_FORCED_OPEN_LOOP_MODE,
                     "num_episodes": len(selected_episode_rows),
                     "num_root_windows": len(root_indices),
                     "root_task_counts": count_tasks_for_indices(
                         root_dataset.all_steps, root_indices, episode_tasks
                     ),
-                    "num_rollout_blocks": rollout_blocks,
-                    "num_block_predictions": (
-                        None
-                        if args.mode == ORACLE_MODE
-                        else len(root_indices) * rollout_blocks
-                    ),
+                    "num_plan_blocks": rollout_blocks,
+                    "num_block_predictions": len(root_indices) * rollout_blocks,
                     "block_anchor_offsets": anchors,
                     "plan_local_offsets": local_offsets,
                     "global_plan_offsets": [
@@ -1430,59 +1589,33 @@ def main() -> int:
     )
     output_dir = _output_dir(args, checkpoint)
 
-    if args.mode == ORACLE_MODE:
-        run_oracle(
-            args=args,
-            model=model,
-            dataset=root_dataset,
-            root_indices=root_indices,
-            model_transform=model_transform,
-            collator=collator,
-            rank=rank,
-            world_size=world_size,
-            output_dir=output_dir,
-            metadata=metadata,
-        )
-    elif args.mode == TEACHER_FORCED_OPEN_LOOP_MODE:
-        plan_transform = MobilePlanTransform(stats_path=stats_path)
-        run_teacher_forced_open_loop(
-            args=args,
-            model=model,
-            dataset=root_dataset,
-            root_indices=root_indices,
-            episode_tasks=episode_tasks,
-            model_transform=model_transform,
-            collator=collator,
-            plan_transform=plan_transform,
-            anchors=anchors,
-            local_offsets=local_offsets,
-            block_stride=block_stride,
-            rollout_blocks=rollout_blocks,
-            rank=rank,
-            world_size=world_size,
-            output_dir=output_dir,
-            metadata=metadata,
-        )
-    else:
-        plan_transform = MobilePlanTransform(stats_path=stats_path)
-        run_inference(
-            args=args,
-            model=model,
-            datasets=datasets,
-            root_indices=root_indices,
-            episode_tasks=episode_tasks,
-            model_transform=model_transform,
-            collator=collator,
-            plan_transform=plan_transform,
-            anchors=anchors,
-            local_offsets=local_offsets,
-            block_stride=block_stride,
-            rollout_blocks=rollout_blocks,
-            rank=rank,
-            world_size=world_size,
-            output_dir=output_dir,
-            metadata=metadata,
-        )
+    plan_transform = MobilePlanTransform(
+        stats_path=stats_path,
+        eef_rotation_representation=str(
+            cfg.get(
+                "eef_rotation_representation",
+                EEF_ROTATION_ANCHOR_BASE_6D,
+            )
+        ),
+    )
+    run_teacher_forced_open_loop(
+        args=args,
+        model=model,
+        dataset=root_dataset,
+        root_indices=root_indices,
+        episode_tasks=episode_tasks,
+        model_transform=model_transform,
+        collator=collator,
+        plan_transform=plan_transform,
+        anchors=anchors,
+        local_offsets=local_offsets,
+        block_stride=block_stride,
+        rollout_blocks=rollout_blocks,
+        rank=rank,
+        world_size=world_size,
+        output_dir=output_dir,
+        metadata=metadata,
+    )
     if rank == 0:
         print(f"Wrote evaluation to {output_dir}", flush=True)
     if world_size > 1:

@@ -158,6 +158,21 @@ class MobilePlanMultiBlockFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
     ) -> dict[str, torch.Tensor]:
         num_blocks = self._num_action_blocks(action_noise_pred)
         repeated_real = has_real_action.repeat_interleave(num_blocks)
+        converted_aux = dict(action_model_aux or {})
+        physical_state = converted_aux.get("physical_block_state")
+        if physical_state is not None:
+            if physical_state.shape[:2] != (
+                action_noise_pred.shape[0],
+                num_blocks,
+            ):
+                raise ValueError(
+                    "physical_block_state must be [batch,num_blocks,state_dim], "
+                    f"got {tuple(physical_state.shape)}"
+                )
+            converted_aux["physical_block_state"] = physical_state.reshape(
+                action_noise_pred.shape[0] * num_blocks,
+                physical_state.shape[-1],
+            )
         converted = {
             "action_noise_pred": self._branch_major_per_block(action_noise_pred),
             "training_target_action": self._branch_major_per_block(
@@ -186,7 +201,7 @@ class MobilePlanMultiBlockFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
             converted["timestep_action"],
             noisy_actions=converted["noisy_actions"],
             clean_actions=converted["clean_actions"],
-            action_model_aux=action_model_aux,
+            action_model_aux=converted_aux,
         )
 
         prediction_block = action_noise_pred.reshape(
@@ -288,6 +303,9 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
             base_action_dim=config.base_action_dim,
             manipulator_action_dim=config.manipulator_action_dim,
             huber_beta=config.physical_loss_huber_beta,
+            eef_rotation_representation=config.eef_rotation_representation,
+            eef_rotation_sigma_weight_base=config.eef_rotation_sigma_weight_base,
+            eef_rotation_sigma_weight_scale=config.eef_rotation_sigma_weight_scale,
         )
         self._latest_base_prior: torch.Tensor | None = None
         self._latest_eef_prior: torch.Tensor | None = None
@@ -356,8 +374,16 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
                 :,
                 :,
                 endpoint,
-                2 * self.base_action_dim : 2 * self.base_action_dim + 9,
-            ].reshape(batch * num_blocks, 1, 9)
+                2 * self.base_action_dim : (
+                    2 * self.base_action_dim
+                    + 3
+                    + self.prior_physical_losses.eef_rotation_dim
+                ),
+            ].reshape(
+                batch * num_blocks,
+                1,
+                3 + self.prior_physical_losses.eef_rotation_dim,
+            )
             if self.prior_config.predict_eef
             else None
         )
@@ -384,6 +410,14 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
             action_mask=prior_mask,
             has_real_action=repeated_real,
             eef_frame=self.prior_config.eef_frame,
+            anchor_state=(
+                action_model_aux["physical_block_state"].reshape(
+                    batch * num_blocks, -1
+                )
+                if action_model_aux is not None
+                and action_model_aux.get("physical_block_state") is not None
+                else None
+            ),
         )
         base_loss = (
             self.config.base_prior_xy_loss_weight * terms["base_prior_xy_loss"]
@@ -486,7 +520,11 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
                 :,
                 :,
                 endpoint,
-                2 * self.base_action_dim : 2 * self.base_action_dim + 9,
+                2 * self.base_action_dim : (
+                    2 * self.base_action_dim
+                    + 3
+                    + self.prior_physical_losses.eef_rotation_dim
+                ),
             ].detach()
 
     def get_action(

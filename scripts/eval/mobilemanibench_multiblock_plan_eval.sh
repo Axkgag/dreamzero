@@ -1,5 +1,5 @@
 #!/bin/bash
-# Offline evaluator for MobileManiBench multiblock Base/Manipulator plans.
+# Fixed-protocol offline evaluator for MobileManiBench multiblock plans.
 
 set -euo pipefail
 
@@ -19,13 +19,11 @@ DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_
 RUN_DIR=${RUN_DIR:-"$DEFAULT_RUN_DIR"}
 DATA_ROOT=${DATA_ROOT:-"$DEFAULT_DATA_ROOT"}
 SPLIT=${SPLIT:-val}
-MODE=${MODE:-gt_history_cached}
 NUM_GPUS=${NUM_GPUS:-2}
 EVAL_GPUS=${EVAL_GPUS:-"2,3"}
 MAX_SAMPLES=${MAX_SAMPLES:-1024}
 SAMPLE_STRIDE=${SAMPLE_STRIDE:-1}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-16}
-NUM_ROLLOUT_BLOCKS=${NUM_ROLLOUT_BLOCKS:-4}
 SEED=${SEED:-1140}
 OUTPUT_DIR=${OUTPUT_DIR:-""}
 INSPECT_ONLY=${INSPECT_ONLY:-0}
@@ -42,12 +40,10 @@ fi
 ARGS=(
   --dataset-root "$DATA_ROOT"
   --split "$SPLIT"
-  --mode "$MODE"
   --max-samples "$MAX_SAMPLES"
   --sample-stride "$SAMPLE_STRIDE"
   --seed "$SEED"
   --num-inference-steps "$NUM_INFERENCE_STEPS"
-  --num-rollout-blocks "$NUM_ROLLOUT_BLOCKS"
 )
 if [ -n "$OUTPUT_DIR" ]; then
   ARGS+=(--output-dir "$OUTPUT_DIR")
@@ -90,13 +86,13 @@ echo "MobileManiBench multiblock plan evaluation:"
 echo "  checkpoint=$CHECKPOINT"
 echo "  data_root=$DATA_ROOT"
 echo "  split=$SPLIT"
-echo "  mode=$MODE"
+echo "  protocol=teacher_forced_open_loop"
 echo "  eval_gpus=$EVAL_GPUS"
 echo "  max_root_windows=$MAX_SAMPLES"
 echo "  sample_stride=$SAMPLE_STRIDE"
-echo "  rollout_blocks=$NUM_ROLLOUT_BLOCKS"
+echo "  rollout_blocks=all configured blocks"
 echo "  num_inference_steps=$NUM_INFERENCE_STEPS"
-echo "  output_dir=${OUTPUT_DIR:-$CHECKPOINT/mobile_multiblock_plan_eval_${SPLIT}_${MODE}}"
+echo "  output_dir=${OUTPUT_DIR:-$CHECKPOINT/mobile_multiblock_plan_eval_${SPLIT}}"
 
 export CUDA_VISIBLE_DEVICES="$EVAL_GPUS"
 exec "$TORCHRUN_BIN" \

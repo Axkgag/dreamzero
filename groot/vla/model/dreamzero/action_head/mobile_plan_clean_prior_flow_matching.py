@@ -86,6 +86,13 @@ class MobilePlanCleanPriorFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
                 base_action_dim=config.base_action_dim,
                 manipulator_action_dim=config.manipulator_action_dim,
                 huber_beta=config.physical_loss_huber_beta,
+                eef_rotation_representation=config.eef_rotation_representation,
+                eef_rotation_sigma_weight_base=(
+                    config.eef_rotation_sigma_weight_base
+                ),
+                eef_rotation_sigma_weight_scale=(
+                    config.eef_rotation_sigma_weight_scale
+                ),
             )
         self.prior_physical_losses = MobilePlanPhysicalConsistencyLosses(
             config.plan_stats_path,
@@ -93,6 +100,9 @@ class MobilePlanCleanPriorFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
             base_action_dim=config.base_action_dim,
             manipulator_action_dim=config.manipulator_action_dim,
             huber_beta=config.physical_loss_huber_beta,
+            eef_rotation_representation=config.eef_rotation_representation,
+            eef_rotation_sigma_weight_base=config.eef_rotation_sigma_weight_base,
+            eef_rotation_sigma_weight_scale=config.eef_rotation_sigma_weight_scale,
         )
         self._latest_base_prior: torch.Tensor | None = None
         self._latest_eef_prior: torch.Tensor | None = None
@@ -140,7 +150,11 @@ class MobilePlanCleanPriorFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
             action_noise_pred[
                 :,
                 self.prior_flow_indices,
-                2 * self.base_action_dim : 2 * self.base_action_dim + 9,
+                2 * self.base_action_dim : (
+                    2 * self.base_action_dim
+                    + 3
+                    + self.prior_physical_losses.eef_rotation_dim
+                ),
             ]
             if self.prior_config.predict_eef
             else None
@@ -172,6 +186,11 @@ class MobilePlanCleanPriorFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
             action_mask=prior_action_mask,
             has_real_action=has_real_action,
             eef_frame=self.prior_config.eef_frame,
+            anchor_state=(
+                action_model_aux.get("physical_block_state")
+                if action_model_aux is not None
+                else None
+            ),
         )
         base_prior_loss = (
             self.config.base_prior_xy_loss_weight
@@ -334,7 +353,11 @@ class MobilePlanCleanPriorFlowMatchingActionHead(MobilePlanFlowMatchingActionHea
                 self._latest_eef_prior = action_model_prediction[
                     :,
                     self.prior_flow_indices,
-                    2 * self.base_action_dim : 2 * self.base_action_dim + 9,
+                    2 * self.base_action_dim : (
+                        2 * self.base_action_dim
+                        + 3
+                        + self.prior_physical_losses.eef_rotation_dim
+                    ),
                 ].detach()
 
     def get_action(

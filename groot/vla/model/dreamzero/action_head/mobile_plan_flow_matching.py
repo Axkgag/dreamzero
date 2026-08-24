@@ -9,6 +9,7 @@ from transformers.feature_extraction_utils import BatchFeature
 
 from .mobile_plan_physical_losses import MobilePlanPhysicalConsistencyLosses
 from .wan_flow_matching_action_tf import WANPolicyHead, WANPolicyHeadConfig
+from ....utils.mobile_plan_spec import EEF_ROTATION_ANCHOR_BASE_6D
 
 
 @dataclass(init=False)
@@ -30,6 +31,15 @@ class MobilePlanPolicyHeadConfig(WANPolicyHeadConfig):
     base_yaw_unit_loss_weight: float = field(default=0.01)
     eef_position_loss_weight: float = field(default=1.0)
     eef_rotation_loss_weight: float = field(default=1.0)
+    eef_rotation_representation: str = field(
+        default=EEF_ROTATION_ANCHOR_BASE_6D
+    )
+    eef_rotation_sigma_weight_base: float = field(default=1.0)
+    eef_rotation_sigma_weight_scale: float = field(default=0.0)
+    eef_rotation_x0_loss_weight: float = field(default=0.0)
+    eef_rotation_x0_loss_start_step: int = field(default=0)
+    eef_rotation_x0_loss_ramp_steps: int = field(default=0)
+    action_flow_weight_floor: float = field(default=0.0)
     hand_loss_weight: float = field(default=1.0)
     base_eef_consistency_position_loss_weight: float = field(default=1.0)
     base_eef_consistency_rotation_loss_weight: float = field(default=1.0)
@@ -79,6 +89,13 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
                 base_action_dim=config.base_action_dim,
                 manipulator_action_dim=config.manipulator_action_dim,
                 huber_beta=config.physical_loss_huber_beta,
+                eef_rotation_representation=config.eef_rotation_representation,
+                eef_rotation_sigma_weight_base=(
+                    config.eef_rotation_sigma_weight_base
+                ),
+                eef_rotation_sigma_weight_scale=(
+                    config.eef_rotation_sigma_weight_scale
+                ),
             )
             if physical_losses_enabled
             else None
@@ -173,6 +190,9 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
         timestep_weight = self.scheduler.training_weight(
             timestep.flatten(0, 1)
         ).unflatten(0, timestep.shape).to(self._device)
+        timestep_weight = timestep_weight.clamp_min(
+            float(self.config.action_flow_weight_floor)
+        )
         weighted = token_loss * timestep_weight * valid
         return weighted.sum() / valid.sum().clamp_min(1)
 
@@ -268,6 +288,16 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
             clean_actions,
             action_mask,
             has_real_action,
+            action_sigma=self.scheduler.sigma_from_timestep(
+                timestep_action,
+                device=clean_prediction.device,
+                dtype=clean_prediction.dtype,
+            ),
+            anchor_state=(
+                action_model_aux.get("physical_block_state")
+                if action_model_aux is not None
+                else None
+            ),
         )
         plan_component_loss = (
             self.config.base_xy_loss_weight * physical_terms["base_xy_loss"]
@@ -298,6 +328,12 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
             self.config.base_eef_consistency_loss_start_step,
             self.config.base_eef_consistency_loss_ramp_steps,
         )
+        effective_eef_rotation_x0_weight = self._ramped_weight(
+            self.config.eef_rotation_x0_loss_weight,
+            int(self.global_step),
+            self.config.eef_rotation_x0_loss_start_step,
+            self.config.eef_rotation_x0_loss_ramp_steps,
+        )
         weighted_plan_component_loss = (
             effective_plan_component_weight * plan_component_loss
         )
@@ -305,10 +341,15 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
             effective_base_eef_consistency_weight
             * base_eef_consistency_loss
         )
+        weighted_eef_rotation_x0_loss = (
+            effective_eef_rotation_x0_weight
+            * physical_terms["eef_rotation_loss"]
+        )
         losses["action_loss"] = (
             action_loss
             + weighted_plan_component_loss
             + weighted_base_eef_consistency_loss
+            + weighted_eef_rotation_x0_loss
         )
         losses.update(physical_terms)
         losses.update(
@@ -319,11 +360,16 @@ class MobilePlanFlowMatchingActionHead(WANPolicyHead):
                 "weighted_base_eef_consistency_loss": (
                     weighted_base_eef_consistency_loss
                 ),
+                "weighted_eef_rotation_x0_loss": weighted_eef_rotation_x0_loss,
                 "effective_plan_component_loss_weight": torch.as_tensor(
                     effective_plan_component_weight, device=action_loss.device
                 ),
                 "effective_base_eef_consistency_loss_weight": torch.as_tensor(
                     effective_base_eef_consistency_weight,
+                    device=action_loss.device,
+                ),
+                "effective_eef_rotation_x0_loss_weight": torch.as_tensor(
+                    effective_eef_rotation_x0_weight,
                     device=action_loss.device,
                 ),
             }

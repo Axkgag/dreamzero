@@ -18,6 +18,10 @@ from .wan_video_dit_dual_plan import (
     DualPlanActionDecoder,
     DualPlanActionEncoder,
 )
+from ....utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    eef_rotation_dim,
+)
 
 
 PRIOR_CONDITION_MODES = frozenset({"normal", "masked", "shuffled"})
@@ -40,9 +44,14 @@ class MobilePlanPriorConfig:
         )
         if not self.predict_base and not self.predict_eef:
             raise ValueError("At least one Prior target must be enabled")
-        if self.eef_frame not in {"current_base", "future_base"}:
+        if self.eef_frame not in {
+            "current_base",
+            "future_base",
+            "current_eef_delta",
+        }:
             raise ValueError(
-                "prior.eef_frame must be 'current_base' or 'future_base'"
+                "prior.eef_frame must be 'current_base', 'future_base', or "
+                "'current_eef_delta'"
             )
 
 
@@ -361,10 +370,15 @@ class CleanPriorDualPlanActionEncoder(DualPlanActionEncoder):
 
 
 class CleanPriorDualPlanActionDecoder(DualPlanActionDecoder):
-    eef_prior_dim = 9
-
-    def __init__(self, *args, prior_flow_indices: Sequence[int], **kwargs):
+    def __init__(
+        self,
+        *args,
+        prior_flow_indices: Sequence[int],
+        eef_prior_dim: int = 9,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self.eef_prior_dim = int(eef_prior_dim)
         if (
             2 * self.base_action_dim + self.eef_prior_dim
             > self.manipulator_action_dim
@@ -429,6 +443,7 @@ class WanVideoDiTDualPlanPrior(CausalWanModel):
         prior: MobilePlanPriorConfig | Mapping[str, Any] | None = None,
         prior_time_offsets: Sequence[int] | None = None,
         control_fps: float = 30.0,
+        eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
         prior_condition_mode: str = "normal",
         **kwargs,
     ):
@@ -443,6 +458,7 @@ class WanVideoDiTDualPlanPrior(CausalWanModel):
             plan_time_offsets, prior_config.time_offsets
         )
         prior_horizon = len(prior_flow_indices)
+        eef_prior_dim = 3 + eef_rotation_dim(eef_rotation_representation)
         kwargs["action_dim"] = manipulator_action_dim
         kwargs["num_action_per_block"] = 2 * plan_horizon + prior_horizon
         super().__init__(**kwargs)
@@ -496,6 +512,7 @@ class WanVideoDiTDualPlanPrior(CausalWanModel):
             num_embodiments=1,
             plan_horizon=plan_horizon,
             prior_flow_indices=prior_flow_indices,
+            eef_prior_dim=eef_prior_dim,
         )
 
     def _action_register_timesteps(

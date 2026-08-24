@@ -19,6 +19,7 @@ action_head_cfg:
     plan_local_offsets: ${plan_local_offsets}
     base_action_dim: ${base_action_dim}
     manipulator_action_dim: ${max_manipulator_action_dim}
+    eef_rotation_representation: ${eef_rotation_representation}
     plan_time_offsets: ${plan_local_offsets}
     control_fps: ${control_fps}
     base_flow_loss_weight: 1.0
@@ -26,6 +27,10 @@ action_head_cfg:
     plan_stats_path: ${mobilemanibench_plan_stats_path}
     plan_component_loss_weight: 0.0
     base_eef_consistency_loss_weight: 0.0
+    action_flow_weight_floor: 0.0
+    eef_rotation_sigma_weight_base: 1.0
+    eef_rotation_sigma_weight_scale: 0.0
+    eef_rotation_x0_loss_weight: 0.0
     diffusion_model_cfg:
       _target_: groot.vla.model.dreamzero.modules.wan_video_dit_dual_plan_multiblock.WanVideoDiTMultiBlockDualPlan
       action_dim: ${max_manipulator_action_dim}
@@ -34,5 +39,6 @@ action_head_cfg:
       plan_local_offsets: ${plan_local_offsets}
       base_action_dim: ${base_action_dim}
       manipulator_action_dim: ${max_manipulator_action_dim}
+      eef_rotation_representation: ${eef_rotation_representation}
       max_state_dim: ${max_state_dim}
       control_fps: ${control_fps}

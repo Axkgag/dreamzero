@@ -65,7 +65,10 @@ from groot.vla.utils.mobile_plan_spec import dynamic_block_plan_stats_path
 root, config_path = sys.argv[1:]
 config = yaml.safe_load(open(config_path))
 print(dynamic_block_plan_stats_path(
-    root, config["block_anchor_offsets"], config["plan_local_offsets"]
+    root,
+    config["block_anchor_offsets"],
+    config["plan_local_offsets"],
+    eef_rotation_representation=config["eef_rotation_representation"],
 ))
 ' "$MOBILEMANIBENCH_DATA_ROOT" "$PLAN_CONFIG")
 
@@ -88,10 +91,16 @@ assert max(local) <= block_stride, (
 stats = json.load(open(stats_path))
 assert stats["fit_split"] == "train"
 assert stats["label_source"] == "dynamic_world_trajectory"
-assert stats["label_spec_hash"] == block_plan_spec_hash(anchors, local)
+rotation_representation = config["eef_rotation_representation"]
+assert stats["label_spec_hash"] == block_plan_spec_hash(
+    anchors,
+    local,
+    eef_rotation_representation=rotation_representation,
+)
 assert stats["block_anchor_offsets"] == anchors
 assert stats["plan_time_offsets"] == local
 assert stats["coordinate_frame"] == "each_block_anchor_base"
+assert stats["eef_rotation_representation"] == rotation_representation
 extensions = json.load(open(root + "/meta/extensions.json"))
 assert float(extensions["time"]["control_fps"]) == float(config["control_fps"])
 assert config["num_plan_blocks"] == len(anchors)

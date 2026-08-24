@@ -18,6 +18,10 @@ from .wan_video_dit_dual_plan_prior import (
     resolve_prior_flow_indices,
 )
 from .wan_video_dit_action_casual_chunk import MultiEmbodimentActionEncoder
+from ....utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    eef_rotation_dim,
+)
 
 
 class MultiBlockDualPlanActionEncoder(nn.Module):
@@ -197,6 +201,7 @@ class WanVideoDiTMultiBlockDualPlan(CausalWanModel):
         manipulator_action_dim: int = 21,
         plan_local_offsets: Sequence[int] = (4, 8),
         control_fps: float = 30.0,
+        eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
         **kwargs,
     ) -> None:
         if len(plan_local_offsets) != plan_waypoints_per_block:
@@ -211,6 +216,7 @@ class WanVideoDiTMultiBlockDualPlan(CausalWanModel):
         self.flow_tokens_per_block = int(flow_tokens_per_block)
         self.base_action_dim = int(base_action_dim)
         self.manipulator_action_dim = int(manipulator_action_dim)
+        self.eef_rotation_representation = eef_rotation_representation
         self.register_buffer(
             "expected_plan_local_offsets",
             torch.as_tensor(plan_local_offsets, dtype=torch.long),
@@ -291,10 +297,15 @@ class MultiBlockCleanPriorActionEncoder(MultiBlockDualPlanActionEncoder):
 class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
     """Decode one clean Prior plus four noisy flow registers per block."""
 
-    eef_prior_dim = 9
-
-    def __init__(self, *args, prior_flow_index: int, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        prior_flow_index: int,
+        eef_prior_dim: int = 9,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self.eef_prior_dim = int(eef_prior_dim)
         if 2 * self.base_action_dim + self.eef_prior_dim > self.manipulator_action_dim:
             raise ValueError("Packed Base channels cannot hold Base and EEF Prior outputs")
         self.prior_flow_index = int(prior_flow_index)
@@ -409,6 +420,9 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
             num_embodiments=1,
             waypoints_per_block=self.plan_waypoints_per_block,
             prior_flow_index=self.prior_flow_index,
+            eef_prior_dim=3 + eef_rotation_dim(
+                self.eef_rotation_representation
+            ),
         )
 
     def _action_register_timesteps(

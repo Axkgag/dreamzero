@@ -114,6 +114,17 @@ class WANPolicyHeadConfig(PretrainedConfig):
     video_noise_beta_beta: float = field(
         default=1.0, metadata={"help": "Beta beta for video noise. Keep at 1.0."}
     )
+    action_high_noise_fraction: float = field(
+        default=0.0,
+        metadata={
+            "help": "Fraction of independently sampled action timesteps drawn "
+            "from sigma >= action_high_noise_min_sigma."
+        },
+    )
+    action_high_noise_min_sigma: float = field(
+        default=0.7,
+        metadata={"help": "Lower sigma bound for stratified high-noise actions."},
+    )
     # Decoupled inference config - allows video to stay noisy while action fully denoises
     decouple_inference_noise: bool = field(
         default=False, metadata={"help": "Use decoupled noise schedules during inference (video stays noisy, action fully denoises)."}
@@ -635,6 +646,33 @@ class WANPolicyHead(ActionHead):
         """Hook for multi-stream heads that require tied diffusion timesteps."""
         return timestep_action_id
 
+    def sample_decoupled_action_timestep_ids(
+        self, shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        """Sample a uniform/high-noise mixture without coupling to video time."""
+        fraction = float(self.config.action_high_noise_fraction)
+        minimum_sigma = float(self.config.action_high_noise_min_sigma)
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("action_high_noise_fraction must be in [0,1]")
+        if not 0.0 <= minimum_sigma <= 1.0:
+            raise ValueError("action_high_noise_min_sigma must be in [0,1]")
+        uniform = torch.randint(0, self.scheduler.num_train_timesteps, shape)
+        if fraction == 0.0:
+            return uniform
+        training_sigmas = self.scheduler.sigmas[:-1].detach().float().cpu()
+        eligible = torch.nonzero(
+            training_sigmas >= minimum_sigma, as_tuple=False
+        ).flatten()
+        if eligible.numel() == 0:
+            raise ValueError(
+                f"No training timestep has sigma >= {minimum_sigma}"
+            )
+        high_noise = eligible[
+            torch.randint(0, eligible.numel(), shape)
+        ]
+        select_high = torch.rand(shape) < fraction
+        return torch.where(select_high, high_noise, uniform)
+
     def validate_action_video_layout(
         self,
         actions: torch.Tensor,
@@ -808,12 +846,10 @@ class WANPolicyHead(ActionHead):
             # ============ ACTION TIMESTEP SAMPLING ============
             if self.config.decouple_video_action_noise:
                 # Decoupled: sample action timestep independently with full range
-                timestep_action_id = torch.randint(
-                    0, 
-                    self.scheduler.num_train_timesteps, 
+                timestep_action_id = self.sample_decoupled_action_timestep_ids(
                     (actions.shape[0], actions.shape[1])
                 )
-                action_mode = "INDEPENDENT"
+                action_mode = "INDEPENDENT_STRATIFIED"
             else:
                 # Original coupled: action timestep derived from video timestep
                 timestep_action_id = self.build_coupled_action_timestep_ids(
@@ -903,7 +939,11 @@ class WANPolicyHead(ActionHead):
                     timestep_action=timestep_action,
                     noisy_actions=noisy_actions,
                     clean_actions=actions,
-                    action_model_aux=None,
+                    action_model_aux={
+                        "physical_block_state": action_input.get(
+                            "physical_block_state"
+                        )
+                    },
                 )
                 weighted_action_loss = action_losses["action_loss"]
                 loss = weighted_dynamics_loss + weighted_action_loss
@@ -919,6 +959,22 @@ class WANPolicyHead(ActionHead):
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
         }
+        if timestep_action is not None:
+            action_sigma = self.scheduler.sigma_from_timestep(
+                timestep_action,
+                device=timestep_action.device,
+                dtype=torch.float32,
+            )
+            output_dict.update(
+                {
+                    "action_sigma_mean_metric": action_sigma.mean(),
+                    "action_sigma_min_metric": action_sigma.min(),
+                    "action_sigma_max_metric": action_sigma.max(),
+                    "action_sigma_ge_080_fraction_metric": (
+                        action_sigma >= 0.8
+                    ).float().mean(),
+                }
+            )
         output_dict.update(action_losses)
 
         return BatchFeature(data=output_dict)

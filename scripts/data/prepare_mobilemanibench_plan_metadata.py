@@ -22,9 +22,13 @@ import yaml
 
 from groot.vla.data.plan_geometry import build_dynamic_block_plan_labels
 from groot.vla.utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
     block_plan_spec_hash,
     canonical_block_plan_spec,
     dynamic_block_plan_stats_path,
+    eef_rotation_dim,
+    manipulator_plan_dim,
 )
 
 
@@ -119,6 +123,7 @@ def prepare(
     dynamic_multiblock: bool = False,
     block_anchor_offsets: tuple[int, ...] = (0, 8, 16, 24),
     local_waypoint_offsets: tuple[int, ...] = (4, 8),
+    eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
     stats_output_dir: Path | None = None,
     reuse_existing: bool = False,
 ) -> dict[str, Any]:
@@ -127,10 +132,15 @@ def prepare(
     label_spec: dict[str, object] | None = None
     if dynamic_multiblock:
         label_spec = canonical_block_plan_spec(
-            block_anchor_offsets, local_waypoint_offsets
+            block_anchor_offsets,
+            local_waypoint_offsets,
+            eef_rotation_representation=eef_rotation_representation,
         )
         default_output = dynamic_block_plan_stats_path(
-            root, block_anchor_offsets, local_waypoint_offsets
+            root,
+            block_anchor_offsets,
+            local_waypoint_offsets,
+            eef_rotation_representation=eef_rotation_representation,
         )
         output = (
             Path(stats_output_dir) / default_output.name
@@ -154,7 +164,11 @@ def prepare(
         if reuse_existing:
             existing = read_json(output)
             expected_hash = (
-                block_plan_spec_hash(block_anchor_offsets, local_waypoint_offsets)
+                block_plan_spec_hash(
+                    block_anchor_offsets,
+                    local_waypoint_offsets,
+                    eef_rotation_representation=eef_rotation_representation,
+                )
                 if dynamic_multiblock
                 else None
             )
@@ -197,7 +211,11 @@ def prepare(
     )
     slot_count = num_plan_blocks * horizon
     hand_dim = len(schema["hand_joint_indices"])
-    manipulator_dim = 9 + hand_dim
+    manipulator_dim = manipulator_plan_dim(
+        hand_dim, eef_rotation_representation
+    )
+    rotation_dim = eef_rotation_dim(eef_rotation_representation)
+    hand_start = 3 + rotation_dim
 
     info = read_json(root / "meta/info.json")
     selected_episode_ids: set[int] | None = None
@@ -232,6 +250,7 @@ def prepare(
     base_yaw_sincos_max_unit_norm_error = 0.0
     rotation6d_max_row_unit_norm_error = 0.0
     rotation6d_max_abs_row_dot = 0.0
+    rotvec_max_angle_rad = 0.0
     parquet_paths = sorted((root / "data").glob("*/*.parquet"))
     if selected_episode_ids is not None:
         parquet_paths = [
@@ -278,6 +297,7 @@ def prepare(
                 schema["hand_joint_indices"],
                 block_anchor_offsets,
                 local_waypoint_offsets,
+                eef_rotation_representation,
             )
             base = labels[0].reshape(-1, slot_count, 4).astype(
                 np.float64, copy=False
@@ -305,7 +325,7 @@ def prepare(
         base_summary.update(base_valid[:, 0:2], sample_mask)
         eef_summary.update(manipulator_valid[:, 0:3], sample_mask)
         if hand_dim:
-            hand_summary.update(manipulator_valid[:, 9:], sample_mask)
+            hand_summary.update(manipulator_valid[:, hand_start:], sample_mask)
         if write_core_stats:
             core_sample_mask = rng.random(len(frame)) < core_sample_probability
             state_summary.update(
@@ -330,23 +350,29 @@ def prepare(
                     )
                 ),
             )
-            rotation = manipulator_valid[:, 3:9].reshape(-1, 2, 3)
-            rotation6d_max_row_unit_norm_error = max(
-                rotation6d_max_row_unit_norm_error,
-                float(
-                    np.max(
-                        np.abs(np.linalg.norm(rotation, axis=-1) - 1.0)
-                    )
-                ),
-            )
-            rotation6d_max_abs_row_dot = max(
-                rotation6d_max_abs_row_dot,
-                float(
-                    np.max(
-                        np.abs(np.sum(rotation[:, 0] * rotation[:, 1], axis=-1))
-                    )
-                ),
-            )
+            if eef_rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+                rotation = manipulator_valid[:, 3:9].reshape(-1, 2, 3)
+                rotation6d_max_row_unit_norm_error = max(
+                    rotation6d_max_row_unit_norm_error,
+                    float(
+                        np.max(
+                            np.abs(np.linalg.norm(rotation, axis=-1) - 1.0)
+                        )
+                    ),
+                )
+                rotation6d_max_abs_row_dot = max(
+                    rotation6d_max_abs_row_dot,
+                    float(
+                        np.max(
+                            np.abs(np.sum(rotation[:, 0] * rotation[:, 1], axis=-1))
+                        )
+                    ),
+                )
+            elif eef_rotation_representation == EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+                rotvec_max_angle_rad = max(
+                    rotvec_max_angle_rad,
+                    float(np.linalg.norm(manipulator_valid[:, 3:6], axis=-1).max()),
+                )
         if file_index % 1000 == 0 or file_index == len(parquet_paths):
             print(
                 f"[{root.name}] plan stats {file_index}/{len(parquet_paths)} "
@@ -393,7 +419,7 @@ def prepare(
             "base_xy": "q99",
             "base_yaw_sincos": "identity",
             "eef_xyz": "q99",
-            "eef_rotation6d": "identity",
+            "eef_rotation": "identity",
             "hand": "per_joint_q99",
             "valid_mask": "identity",
         },
@@ -403,6 +429,9 @@ def prepare(
         "block_anchor_offsets": plan_meta.get("block_anchor_offsets", [0]),
         "global_plan_offsets": plan_meta.get("global_waypoint_offsets", offsets),
         "coordinate_frame": plan_meta.get("coordinate_frame", "current_base"),
+        "eef_rotation_representation": eef_rotation_representation,
+        "eef_rotation_dim": rotation_dim,
+        "hand_start_index": hand_start,
         "control_fps": float(extensions["time"]["control_fps"]),
         "base_dim": 4,
         "manipulator_dim": manipulator_dim,
@@ -423,13 +452,18 @@ def prepare(
             "base_yaw_sincos_max_unit_norm_error": base_yaw_sincos_max_unit_norm_error,
             "rotation6d_max_row_unit_norm_error": rotation6d_max_row_unit_norm_error,
             "rotation6d_max_abs_row_dot": rotation6d_max_abs_row_dot,
+            "rotvec_max_angle_rad": rotvec_max_angle_rad,
         },
         "label_source": (
             "dynamic_world_trajectory" if dynamic_multiblock else "materialized"
         ),
         "label_spec": label_spec,
         "label_spec_hash": (
-            block_plan_spec_hash(block_anchor_offsets, local_waypoint_offsets)
+            block_plan_spec_hash(
+                block_anchor_offsets,
+                local_waypoint_offsets,
+                eef_rotation_representation=eef_rotation_representation,
+            )
             if dynamic_multiblock
             else None
         ),
@@ -507,6 +541,14 @@ def main() -> None:
             config = yaml.safe_load(handle)
         block_anchor_offsets = tuple(int(v) for v in config["block_anchor_offsets"])
         local_waypoint_offsets = tuple(int(v) for v in config["plan_local_offsets"])
+        eef_rotation_representation = str(
+            config.get(
+                "eef_rotation_representation",
+                EEF_ROTATION_ANCHOR_BASE_6D,
+            )
+        )
+    else:
+        eef_rotation_representation = EEF_ROTATION_ANCHOR_BASE_6D
 
     for root in resolve_roots(args.dataset_root):
         result = prepare(
@@ -521,6 +563,7 @@ def main() -> None:
             args.dynamic_multiblock,
             block_anchor_offsets,
             local_waypoint_offsets,
+            eef_rotation_representation,
             args.stats_output_dir,
             args.reuse_existing,
         )

@@ -11,6 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ....utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
+    eef_rotation_dim,
+)
+
 
 def _safe_normalize(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
@@ -30,6 +36,54 @@ def rotation6d_rows_to_matrix(value: torch.Tensor) -> torch.Tensor:
     third = _safe_normalize(torch.linalg.cross(first, second, dim=-1))
     second = _safe_normalize(torch.linalg.cross(third, first, dim=-1))
     return torch.stack([first, second, third], dim=-2)
+
+
+def rotation_vector_to_matrix(value: torch.Tensor) -> torch.Tensor:
+    """Differentiable SO(3) exponential map for axis-angle vectors."""
+    value = value.float()
+    x, y, z = value.unbind(-1)
+    zero = torch.zeros_like(x)
+    skew = torch.stack(
+        [zero, -z, y, z, zero, -x, -y, x, zero], dim=-1
+    ).reshape(*value.shape[:-1], 3, 3)
+    theta_sq = value.square().sum(-1)
+    theta = torch.sqrt(theta_sq.clamp_min(1e-12))
+    small = theta_sq < 1e-8
+    a = torch.where(
+        small,
+        1.0 - theta_sq / 6.0 + theta_sq.square() / 120.0,
+        torch.sin(theta) / theta,
+    )
+    b = torch.where(
+        small,
+        0.5 - theta_sq / 24.0 + theta_sq.square() / 720.0,
+        (1.0 - torch.cos(theta)) / theta_sq.clamp_min(1e-12),
+    )
+    identity = torch.eye(3, device=value.device, dtype=value.dtype).expand(
+        *value.shape[:-1], 3, 3
+    )
+    return identity + a[..., None, None] * skew + b[..., None, None] * (skew @ skew)
+
+
+def euler_rpy_to_matrix(value: torch.Tensor) -> torch.Tensor:
+    roll, pitch, yaw = value.float().unbind(-1)
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    return torch.stack(
+        [
+            cy * cp,
+            cy * sp * sr - sy * cr,
+            cy * sp * cr + sy * sr,
+            sy * cp,
+            sy * sp * sr + cy * cr,
+            sy * sp * cr - cy * sr,
+            -sp,
+            cp * sr,
+            cp * cr,
+        ],
+        dim=-1,
+    ).reshape(*value.shape[:-1], 3, 3)
 
 
 def rotation_geodesic(
@@ -79,13 +133,17 @@ def _safe_base_pose_for_geometry(
 
 
 def _safe_eef_pose_for_geometry(
-    value: torch.Tensor, valid: torch.Tensor
+    value: torch.Tensor,
+    valid: torch.Tensor,
+    rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
 ) -> torch.Tensor:
     """Replace masked EEF poses by an identity rotation before geometry."""
-    pose = value[..., :9]
+    rotation_dim = eef_rotation_dim(rotation_representation)
+    pose = value[..., : 3 + rotation_dim]
     fallback = torch.zeros_like(pose)
-    fallback[..., 3] = 1.0
-    fallback[..., 7] = 1.0
+    if rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+        fallback[..., 3] = 1.0
+        fallback[..., 7] = 1.0
     return torch.where(valid.unsqueeze(-1), pose, fallback)
 
 
@@ -163,6 +221,9 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         base_action_dim: int = 4,
         manipulator_action_dim: int = 21,
         huber_beta: float = 0.1,
+        eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
+        eef_rotation_sigma_weight_base: float = 1.0,
+        eef_rotation_sigma_weight_scale: float = 0.0,
     ):
         super().__init__()
         with Path(stats_path).open("r", encoding="utf-8") as handle:
@@ -176,6 +237,24 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         self.manipulator_action_dim = manipulator_action_dim
         self.hand_dim = int(metadata["hand_dim"])
         self.huber_beta = float(huber_beta)
+        self.eef_rotation_representation = eef_rotation_representation
+        self.eef_rotation_dim = eef_rotation_dim(eef_rotation_representation)
+        self.eef_rotation_slice = slice(3, 3 + self.eef_rotation_dim)
+        self.hand_start = 3 + self.eef_rotation_dim
+        self.eef_rotation_sigma_weight_base = float(
+            eef_rotation_sigma_weight_base
+        )
+        self.eef_rotation_sigma_weight_scale = float(
+            eef_rotation_sigma_weight_scale
+        )
+        stats_representation = metadata.get(
+            "eef_rotation_representation", EEF_ROTATION_ANCHOR_BASE_6D
+        )
+        if stats_representation != eef_rotation_representation:
+            raise ValueError(
+                f"Physical-loss stats use {stats_representation}, but the model "
+                f"uses {eef_rotation_representation}"
+            )
 
         statistics = metadata["statistics"]
         for name in ("base_xy", "eef_xyz", "hand"):
@@ -211,7 +290,7 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             manipulator[..., :3], self.eef_xyz_q01, self.eef_xyz_q99
         )
         if self.hand_dim:
-            hand_slice = slice(9, 9 + self.hand_dim)
+            hand_slice = slice(self.hand_start, self.hand_start + self.hand_dim)
             manipulator[..., hand_slice] = self._denormalize(
                 manipulator[..., hand_slice], self.hand_q01, self.hand_q99
             )
@@ -225,11 +304,56 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         return base
 
     def physical_eef_prior(self, prediction: torch.Tensor) -> torch.Tensor:
-        eef = prediction[..., :9].float().clone()
+        eef = prediction[..., : 3 + self.eef_rotation_dim].float().clone()
         eef[..., :3] = self._denormalize(
             eef[..., :3], self.eef_xyz_q01, self.eef_xyz_q99
         )
         return eef
+
+    def _rotation_matrix(
+        self,
+        eef: torch.Tensor,
+        anchor_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        rotation_value = eef[..., self.eef_rotation_slice]
+        if self.eef_rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+            return rotation6d_rows_to_matrix(rotation_value)
+        if self.eef_rotation_representation == EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+            delta = rotation_vector_to_matrix(rotation_value)
+            if anchor_state is None:
+                return delta
+            anchor = anchor_state.float()
+            while anchor.ndim < eef.ndim:
+                anchor = anchor.unsqueeze(-2)
+            anchor = anchor.expand(*eef.shape[:-1], anchor.shape[-1])
+            return euler_rpy_to_matrix(anchor[..., 3:6]) @ delta
+        raise AssertionError(self.eef_rotation_representation)
+
+    @staticmethod
+    def _rotation_bucket_metrics(
+        angle: torch.Tensor,
+        sigma: torch.Tensor | None,
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if sigma is None:
+            return {}
+        result: dict[str, torch.Tensor] = {}
+        sigma = sigma.float()
+        bins = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01))
+        for lower, upper in bins:
+            bucket_mask = mask & (sigma >= lower) & (sigma < upper)
+            suffix = f"sigma_{int(lower * 100):03d}_{int(min(upper, 1.0) * 100):03d}"
+            key = f"eef_rotation_error_deg_{suffix}_metric"
+            result[key] = _masked_mean(torch.rad2deg(angle), bucket_mask)
+            result[f"eef_rotation_count_{suffix}_metric"] = (
+                bucket_mask.sum().float()
+            )
+        high_mask = mask & (sigma >= 0.8)
+        result["eef_rotation_error_deg_sigma_ge_080_metric"] = _masked_mean(
+            torch.rad2deg(angle), high_mask
+        )
+        result["eef_rotation_count_sigma_ge_080_metric"] = high_mask.sum().float()
+        return result
 
     def prior_terms(
         self,
@@ -240,24 +364,31 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         action_mask: torch.Tensor,
         has_real_action: torch.Tensor,
         eef_frame: str,
+        anchor_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute direct Base/EEF Prior terms and their composition loss."""
-        if eef_frame not in {"current_base", "future_base"}:
+        valid_eef_frames = {"current_base", "future_base"}
+        if self.eef_rotation_representation == EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+            valid_eef_frames = {"current_eef_delta"}
+        if eef_frame not in valid_eef_frames:
             raise ValueError(f"Unknown Prior EEF frame: {eef_frame}")
         horizon = self.plan_horizon
         base_gt, manip_gt = self.physical_plans(clean_target)
         base_mask = action_mask[:, :horizon, : self.base_action_dim].bool()
-        eef_mask = action_mask[:, horizon:, :9].bool()
+        eef_pose_dim = 3 + self.eef_rotation_dim
+        eef_mask = action_mask[:, horizon:, :eef_pose_dim].bool()
         sample_mask = has_real_action.bool().view(-1, 1, 1)
         base_mask = base_mask & sample_mask
         eef_mask = eef_mask & sample_mask
         base_geometry_valid = base_mask[..., :4].all(-1)
-        eef_geometry_valid = eef_mask[..., :9].all(-1)
+        eef_geometry_valid = eef_mask[..., :eef_pose_dim].all(-1)
         base_gt_geometry = _safe_base_pose_for_geometry(
             base_gt, base_geometry_valid
         )
         manip_gt_geometry = _safe_eef_pose_for_geometry(
-            manip_gt, eef_geometry_valid
+            manip_gt,
+            eef_geometry_valid,
+            self.eef_rotation_representation,
         )
         zero = clean_target.sum() * 0.0
         base_scale = self._scale(self.base_xy_q01, self.base_xy_q99)
@@ -315,13 +446,13 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
                     & base_mask[..., :2].all(-1)
                 )
                 direct_rotation_mask = (
-                    eef_mask[..., 3:9].all(-1)
+                    eef_mask[..., self.eef_rotation_slice].all(-1)
                     & base_mask[..., 2:4].all(-1)
                 )
             else:
                 eef_target = manip_gt_geometry
                 direct_position_mask = eef_mask[..., :3].all(-1)
-                direct_rotation_mask = eef_mask[..., 3:9].all(-1)
+                direct_rotation_mask = eef_mask[..., self.eef_rotation_slice].all(-1)
             eef_position_loss = _masked_smooth_l1(
                 eef_pred[..., :3] / eef_scale,
                 eef_target[..., :3] / eef_scale,
@@ -331,8 +462,8 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
                 self.huber_beta,
             )
             eef_rotation_angle = rotation_geodesic(
-                rotation6d_rows_to_matrix(eef_pred[..., 3:9]),
-                rotation6d_rows_to_matrix(eef_target[..., 3:9]),
+                self._rotation_matrix(eef_pred),
+                self._rotation_matrix(eef_target),
             )
             eef_rotation_loss = _masked_mean(
                 eef_rotation_angle / math.pi, direct_rotation_mask
@@ -355,7 +486,9 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
                 base_pred, base_geometry_valid
             )
             eef_pred_geometry = _safe_eef_pose_for_geometry(
-                eef_pred, eef_geometry_valid
+                eef_pred,
+                eef_geometry_valid,
+                self.eef_rotation_representation,
             )
             joint_position_mask = (
                 base_mask[..., :2].all(-1)
@@ -363,19 +496,78 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             )
             joint_rotation_mask = (
                 base_mask[..., 2:4].all(-1)
-                & eef_mask[..., 3:9].all(-1)
+                & eef_mask[..., self.eef_rotation_slice].all(-1)
             )
             if eef_frame == "future_base":
                 joint_prediction = eef_future_to_current_base(
                     base_pred_geometry, eef_pred_geometry
                 )
                 joint_target = manip_gt_geometry
+                joint_prediction_rotation = rotation6d_rows_to_matrix(
+                    joint_prediction[..., 3:9]
+                )
+                joint_target_rotation = rotation6d_rows_to_matrix(
+                    joint_target[..., 3:9]
+                )
+            elif eef_frame == "current_eef_delta":
+                if anchor_state is None:
+                    raise ValueError(
+                        "current_eef_delta Prior consistency requires anchor_state"
+                    )
+                base_prediction_rotation = yaw_matrix(
+                    base_pred_geometry[..., 2:4]
+                )
+                base_target_rotation = yaw_matrix(base_gt_geometry[..., 2:4])
+                base_prediction_translation = F.pad(
+                    base_pred_geometry[..., :2], (0, 1)
+                )
+                base_target_translation = F.pad(
+                    base_gt_geometry[..., :2], (0, 1)
+                )
+                joint_prediction_position = torch.einsum(
+                    "...ji,...j->...i",
+                    base_prediction_rotation,
+                    eef_pred_geometry[..., :3] - base_prediction_translation,
+                )
+                joint_target_position = torch.einsum(
+                    "...ji,...j->...i",
+                    base_target_rotation,
+                    manip_gt_geometry[..., :3] - base_target_translation,
+                )
+                joint_prediction_rotation = (
+                    base_prediction_rotation.transpose(-1, -2)
+                    @ self._rotation_matrix(eef_pred_geometry, anchor_state)
+                )
+                joint_target_rotation = (
+                    base_target_rotation.transpose(-1, -2)
+                    @ self._rotation_matrix(manip_gt_geometry, anchor_state)
+                )
+                joint_prediction = torch.cat(
+                    [
+                        joint_prediction_position,
+                        matrix_to_rotation6d_rows(joint_prediction_rotation),
+                    ],
+                    dim=-1,
+                )
+                joint_target = torch.cat(
+                    [
+                        joint_target_position,
+                        matrix_to_rotation6d_rows(joint_target_rotation),
+                    ],
+                    dim=-1,
+                )
             else:
                 joint_prediction = eef_current_to_future_base(
                     base_pred_geometry, eef_pred_geometry
                 )
                 joint_target = eef_current_to_future_base(
                     base_gt_geometry, manip_gt_geometry
+                )
+                joint_prediction_rotation = rotation6d_rows_to_matrix(
+                    joint_prediction[..., 3:9]
+                )
+                joint_target_rotation = rotation6d_rows_to_matrix(
+                    joint_target[..., 3:9]
                 )
             joint_position_loss = _masked_smooth_l1(
                 joint_prediction[..., :3] / eef_scale,
@@ -386,8 +578,8 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
                 self.huber_beta,
             )
             joint_rotation_angle = rotation_geodesic(
-                rotation6d_rows_to_matrix(joint_prediction[..., 3:9]),
-                rotation6d_rows_to_matrix(joint_target[..., 3:9]),
+                joint_prediction_rotation,
+                joint_target_rotation,
             )
             joint_rotation_loss = _masked_mean(
                 joint_rotation_angle / math.pi, joint_rotation_mask
@@ -412,6 +604,8 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         clean_target: torch.Tensor,
         action_mask: torch.Tensor,
         has_real_action: torch.Tensor,
+        action_sigma: torch.Tensor | None = None,
+        anchor_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         horizon = self.plan_horizon
         base_pred, manip_pred = self.physical_plans(clean_prediction)
@@ -422,7 +616,8 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
         base_mask = base_mask & sample_mask
         manip_mask = manip_mask & sample_mask
         base_geometry_valid = base_mask[..., :4].all(-1)
-        manip_geometry_valid = manip_mask[..., :9].all(-1)
+        eef_pose_dim = 3 + self.eef_rotation_dim
+        manip_geometry_valid = manip_mask[..., :eef_pose_dim].all(-1)
         base_pred_geometry = _safe_base_pose_for_geometry(
             base_pred, base_geometry_valid
         )
@@ -430,10 +625,14 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             base_gt, base_geometry_valid
         )
         manip_pred_geometry = _safe_eef_pose_for_geometry(
-            manip_pred, manip_geometry_valid
+            manip_pred,
+            manip_geometry_valid,
+            self.eef_rotation_representation,
         )
         manip_gt_geometry = _safe_eef_pose_for_geometry(
-            manip_gt, manip_geometry_valid
+            manip_gt,
+            manip_geometry_valid,
+            self.eef_rotation_representation,
         )
 
         base_xy_scale = self._scale(self.base_xy_q01, self.base_xy_q99)
@@ -464,20 +663,25 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             manip_mask[..., :3],
             self.huber_beta,
         )
-        rotation_pred = rotation6d_rows_to_matrix(
-            manip_pred_geometry[..., 3:9]
-        )
-        rotation_gt = rotation6d_rows_to_matrix(
-            manip_gt_geometry[..., 3:9]
-        )
-        rotation_token_mask = manip_mask[..., 3:9].all(-1)
+        rotation_pred = self._rotation_matrix(manip_pred_geometry, anchor_state)
+        rotation_gt = self._rotation_matrix(manip_gt_geometry, anchor_state)
+        rotation_token_mask = manip_mask[..., self.eef_rotation_slice].all(-1)
         rotation_angle = rotation_geodesic(rotation_pred, rotation_gt)
+        manipulator_sigma = (
+            action_sigma[:, horizon:].float() if action_sigma is not None else None
+        )
+        rotation_weight = (
+            self.eef_rotation_sigma_weight_base
+            + self.eef_rotation_sigma_weight_scale * manipulator_sigma
+            if manipulator_sigma is not None
+            else self.eef_rotation_sigma_weight_base
+        )
         eef_rotation_loss = _masked_mean(
-            rotation_angle / math.pi, rotation_token_mask
+            rotation_angle / math.pi * rotation_weight, rotation_token_mask
         )
 
         if self.hand_dim:
-            hand_slice = slice(9, 9 + self.hand_dim)
+            hand_slice = slice(self.hand_start, self.hand_start + self.hand_dim)
             hand_scale = self._scale(self.hand_q01, self.hand_q99)
             hand_loss = _masked_smooth_l1(
                 manip_pred[..., hand_slice] / hand_scale,
@@ -502,12 +706,8 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             base_rotation_gt,
             manip_gt_geometry[..., :3] - base_translation_gt,
         )
-        relative_rotation_pred = (
-            base_rotation_pred.transpose(-1, -2) @ rotation_pred
-        )
-        relative_rotation_gt = (
-            base_rotation_gt.transpose(-1, -2) @ rotation_gt
-        )
+        relative_rotation_pred = base_rotation_pred.transpose(-1, -2) @ rotation_pred
+        relative_rotation_gt = base_rotation_gt.transpose(-1, -2) @ rotation_gt
         consistency_position_mask = (
             base_mask[..., :2].all(-1)
             & manip_mask[..., :3].all(-1)
@@ -547,10 +747,13 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             torch.rad2deg(rotation_angle), rotation_token_mask
         )
         determinant_error = _masked_mean(
-            (torch.linalg.det(rotation_pred) - 1.0).abs(), rotation_token_mask
+            # CUDA linalg.det has no BF16 kernel.  This is a diagnostic metric;
+            # evaluate it in FP32 so BF16 autocast training remains supported.
+            (torch.linalg.det(rotation_pred.float()) - 1.0).abs(),
+            rotation_token_mask,
         )
 
-        return {
+        result = {
             "base_xy_loss": base_xy_loss,
             "base_yaw_loss": base_yaw_loss,
             "base_yaw_unit_loss": yaw_unit_loss,
@@ -564,3 +767,31 @@ class MobilePlanPhysicalConsistencyLosses(nn.Module):
             "eef_rotation_error_deg": eef_rotation_error_deg,
             "eef_rotation_determinant_error": determinant_error,
         }
+        result.update(
+            self._rotation_bucket_metrics(
+                rotation_angle,
+                manipulator_sigma,
+                rotation_token_mask,
+            )
+        )
+        if self.eef_rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+            raw = manip_pred[..., self.eef_rotation_slice].float().reshape(
+                -1, 2, 3
+            )
+            raw_mask = rotation_token_mask.reshape(-1)
+            row_norm = torch.linalg.vector_norm(raw, dim=-1)
+            row_dot = (raw[:, 0] * raw[:, 1]).sum(-1).abs()
+            result["eef_rotation6d_row_norm_error_metric"] = _masked_mean(
+                (row_norm - 1.0).abs().mean(-1), raw_mask
+            )
+            result["eef_rotation6d_abs_row_dot_metric"] = _masked_mean(
+                row_dot, raw_mask
+            )
+        else:
+            raw_angle = torch.linalg.vector_norm(
+                manip_pred[..., self.eef_rotation_slice].float(), dim=-1
+            )
+            result["eef_rotvec_pred_norm_rad_metric"] = _masked_mean(
+                raw_angle, rotation_token_mask
+            )
+        return result

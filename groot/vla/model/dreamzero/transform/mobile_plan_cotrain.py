@@ -107,13 +107,18 @@ class MobilePlanCotrainTransform(DreamTransform):
             black = np.zeros_like(head)
             result["video"] = np.stack([head, black, wrist], axis=1)
         if "state" not in result:
-            state = np.concatenate(
-                [
-                    _numpy(result["state.eef_position"]),
-                    _numpy(result["state.eef_rotation_rpy"]),
-                ],
-                axis=-1,
-            ).astype(np.float32)
+            state = (
+                _numpy(result["physical_block_state"]).astype(np.float32)
+                if "physical_block_state" in result
+                else np.concatenate(
+                    [
+                        _numpy(result["state.eef_position"]),
+                        _numpy(result["state.eef_rotation_rpy"]),
+                    ],
+                    axis=-1,
+                ).astype(np.float32)
+            )
+            result["physical_block_state"] = state.copy()
             result["state"] = self._normalize_state(state)
         return result
 
@@ -313,6 +318,7 @@ class MobileBlockPlanCotrainTransform(MobilePlanCotrainTransform):
             "block_anchor_offsets",
             "global_plan_offsets",
             "block_state_valid",
+            "physical_block_state",
         ):
             transformed[key] = _numpy(data[key])
         return transformed

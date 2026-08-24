@@ -13,8 +13,10 @@ from torch.utils.data import Dataset
 from .lerobot import LeRobotSingleDataset, ModalityConfig
 from ..plan_geometry import build_dynamic_block_plan_labels
 from ...utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
     canonical_block_plan_spec,
     dynamic_block_plan_stats_path,
+    manipulator_plan_dim,
 )
 
 
@@ -58,6 +60,7 @@ class MobileManiBenchBlockPlanDataset(Dataset):
         label_source: str = "dynamic",
         block_anchor_offsets: list[int] | tuple[int, ...] = (0, 8, 16, 24),
         plan_local_offsets: list[int] | tuple[int, ...] = (4, 8),
+        eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
     ) -> None:
         self.dataset_path = Path(dataset_path)
         self.max_manipulator_dim = int(max_manipulator_dim)
@@ -68,6 +71,11 @@ class MobileManiBenchBlockPlanDataset(Dataset):
             raise ValueError(f"Unknown block-plan label_source: {label_source}")
         self.label_source = label_source
         if label_source == "materialized":
+            if eef_rotation_representation != EEF_ROTATION_ANCHOR_BASE_6D:
+                raise ValueError(
+                    "Materialized block plans only contain anchor-base rotation6d; "
+                    "use label_source=dynamic for current-EEF delta rotations"
+                )
             plan_meta = self.extensions.get("action_plan_block")
             if plan_meta is None:
                 raise KeyError("Materialized labels require extensions.action_plan_block")
@@ -75,7 +83,14 @@ class MobileManiBenchBlockPlanDataset(Dataset):
                 raise ValueError(f"Unsupported plan packing: {plan_meta.get('packing')}")
             block_anchor_offsets = plan_meta["block_anchor_offsets"]
             plan_local_offsets = plan_meta["local_waypoint_offsets"]
-        spec = canonical_block_plan_spec(block_anchor_offsets, plan_local_offsets)
+        spec = canonical_block_plan_spec(
+            block_anchor_offsets,
+            plan_local_offsets,
+            eef_rotation_representation=eef_rotation_representation,
+        )
+        self.eef_rotation_representation = str(
+            spec["eef_rotation_representation"]
+        )
         self.block_anchor_offsets = np.asarray(
             spec["block_anchor_offsets"], dtype=np.int64
         )
@@ -89,7 +104,9 @@ class MobileManiBenchBlockPlanDataset(Dataset):
         self.waypoints_per_block = len(self.plan_local_offsets)
         self.control_fps = float(self.extensions["time"]["control_fps"])
         self.hand_dim = len(self.robot_schema["hand_joint_indices"])
-        self.manipulator_dim = 9 + self.hand_dim
+        self.manipulator_dim = manipulator_plan_dim(
+            self.hand_dim, self.eef_rotation_representation
+        )
         if label_source == "materialized":
             expected_base = (self.num_plan_blocks, self.waypoints_per_block, 4)
             expected_manipulator = (
@@ -189,6 +206,7 @@ class MobileManiBenchBlockPlanDataset(Dataset):
                 self.dataset_path,
                 self.block_anchor_offsets,
                 self.plan_local_offsets,
+                eef_rotation_representation=self.eef_rotation_representation,
             )
             if self.label_source == "dynamic"
             else self.dataset_path / "meta/multiblock_plan_stats.json"
@@ -245,6 +263,7 @@ class MobileManiBenchBlockPlanDataset(Dataset):
                     self.robot_schema["hand_joint_indices"],
                     self.block_anchor_offsets,
                     self.plan_local_offsets,
+                    self.eef_rotation_representation,
                 )
             self._trajectory_cache = {trajectory_id: (frame, labels)}
         return self._trajectory_cache[trajectory_id]
@@ -258,6 +277,7 @@ class MobileManiBenchBlockPlanDataset(Dataset):
             base = labels[0][int(frame_index)]
             native_manipulator = labels[1][int(frame_index)]
             valid = labels[2][int(frame_index)]
+            block_state = labels[3][int(frame_index)]
             state_valid = labels[4][int(frame_index)]
         else:
             base = np.asarray(
@@ -274,6 +294,9 @@ class MobileManiBenchBlockPlanDataset(Dataset):
             state_valid = np.asarray(
                 row["observation.plan.block.state_valid"], dtype=np.bool_
             ).reshape(self.num_plan_blocks)
+            block_state = np.asarray(
+                row["observation.plan.block.state"], dtype=np.float32
+            ).reshape(self.num_plan_blocks, 6)
         if self.require_full_video_window and (
             not valid.all() or not state_valid.all()
         ):
@@ -306,6 +329,8 @@ class MobileManiBenchBlockPlanDataset(Dataset):
                 "block_anchor_offsets": self.block_anchor_offsets.copy(),
                 "global_plan_offsets": self.global_plan_offsets.copy(),
                 "block_state_valid": state_valid,
+                "physical_block_state": block_state,
+                "eef_rotation_representation": self.eef_rotation_representation,
                 "episode_index": np.int64(trajectory_id),
                 "frame_index": np.int64(frame_index),
                 "hand_dim": np.int64(self.hand_dim),

@@ -11,6 +11,11 @@ import torch
 from pydantic import Field, PrivateAttr, model_validator
 
 from .base import InvertibleModalityTransform
+from ...utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
+    eef_rotation_dim,
+)
 
 
 class MobilePlanTransform(InvertibleModalityTransform):
@@ -23,6 +28,7 @@ class MobilePlanTransform(InvertibleModalityTransform):
     statistics: dict[str, Any] | None = None
     validate_geometry: bool = True
     geometry_atol: float = 5e-3
+    eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D
     _stats: dict[str, Any] = PrivateAttr()
 
     @model_validator(mode="after")
@@ -70,19 +76,32 @@ class MobilePlanTransform(InvertibleModalityTransform):
         base_active = base[active]
         manip_active = manipulator[active]
         yaw_norm = torch.linalg.vector_norm(base_active[..., 2:4], dim=-1)
-        rot = manip_active[..., 3:9].reshape(-1, 2, 3)
-        row_norm = torch.linalg.vector_norm(rot, dim=-1)
-        row_dot = torch.sum(rot[:, 0] * rot[:, 1], dim=-1)
         if not torch.allclose(
             yaw_norm, torch.ones_like(yaw_norm), atol=self.geometry_atol, rtol=0
         ):
             raise ValueError("Base yaw sin/cos does not have unit norm")
-        if not torch.allclose(
-            row_norm, torch.ones_like(row_norm), atol=self.geometry_atol, rtol=0
-        ) or not torch.allclose(
-            row_dot, torch.zeros_like(row_dot), atol=self.geometry_atol, rtol=0
-        ):
-            raise ValueError("EEF rotation6d rows are not orthonormal")
+        if self.eef_rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+            rot = manip_active[..., 3:9].reshape(-1, 2, 3)
+            row_norm = torch.linalg.vector_norm(rot, dim=-1)
+            row_dot = torch.sum(rot[:, 0] * rot[:, 1], dim=-1)
+            if not torch.allclose(
+                row_norm,
+                torch.ones_like(row_norm),
+                atol=self.geometry_atol,
+                rtol=0,
+            ) or not torch.allclose(
+                row_dot,
+                torch.zeros_like(row_dot),
+                atol=self.geometry_atol,
+                rtol=0,
+            ):
+                raise ValueError("EEF rotation6d rows are not orthonormal")
+        elif self.eef_rotation_representation == EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+            angle = torch.linalg.vector_norm(manip_active[..., 3:6], dim=-1)
+            if torch.any(angle >= torch.pi):
+                raise ValueError("EEF delta rotvec must use the principal angle below pi")
+        else:
+            eef_rotation_dim(self.eef_rotation_representation)
 
     def apply(self, data: dict[str, Any]) -> dict[str, Any]:
         base = self._tensor(data["base_plan"], dtype=torch.float32)
@@ -105,9 +124,10 @@ class MobilePlanTransform(InvertibleModalityTransform):
             manipulator[..., 0:3], "eef_xyz"
         )
         hand_dim = len(self._stats["statistics"]["hand"]["q01"])
+        hand_start = 3 + eef_rotation_dim(self.eef_rotation_representation)
         if hand_dim:
-            manipulator_action[..., 9 : 9 + hand_dim] = self._q99(
-                manipulator[..., 9 : 9 + hand_dim], "hand"
+            manipulator_action[..., hand_start : hand_start + hand_dim] = self._q99(
+                manipulator[..., hand_start : hand_start + hand_dim], "hand"
             )
 
         data["base_action"] = base_action
@@ -131,9 +151,12 @@ class MobilePlanTransform(InvertibleModalityTransform):
             manipulator_action[..., 0:3], "eef_xyz", inverse=True
         )
         hand_dim = len(self._stats["statistics"]["hand"]["q01"])
+        hand_start = 3 + eef_rotation_dim(self.eef_rotation_representation)
         if hand_dim:
-            manipulator_plan[..., 9 : 9 + hand_dim] = self._q99(
-                manipulator_action[..., 9 : 9 + hand_dim], "hand", inverse=True
+            manipulator_plan[..., hand_start : hand_start + hand_dim] = self._q99(
+                manipulator_action[..., hand_start : hand_start + hand_dim],
+                "hand",
+                inverse=True,
             )
         data["base_plan"] = base_plan
         data["manipulator_plan"] = manipulator_plan
@@ -180,5 +203,19 @@ class MobileBlockPlanTransform(MobilePlanTransform):
         if data_anchors != stats_anchors:
             raise ValueError(
                 f"Block anchors {data_anchors} do not match stats {stats_anchors}"
+            )
+        stats_rotation = self._stats.get(
+            "eef_rotation_representation", EEF_ROTATION_ANCHOR_BASE_6D
+        )
+        data_rotation = str(data.get("eef_rotation_representation", stats_rotation))
+        if data_rotation != self.eef_rotation_representation:
+            raise ValueError(
+                f"Dataset EEF rotation {data_rotation} does not match transform "
+                f"{self.eef_rotation_representation}"
+            )
+        if stats_rotation != self.eef_rotation_representation:
+            raise ValueError(
+                f"Stats EEF rotation {stats_rotation} does not match transform "
+                f"{self.eef_rotation_representation}"
             )
         return super().apply(data)

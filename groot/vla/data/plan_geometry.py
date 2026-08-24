@@ -6,7 +6,11 @@ from typing import Sequence
 
 import numpy as np
 
-from groot.vla.utils.mobile_plan_spec import canonical_block_plan_spec
+from groot.vla.utils.mobile_plan_spec import (
+    EEF_ROTATION_ANCHOR_BASE_6D,
+    EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
+    canonical_block_plan_spec,
+)
 
 
 def euler_rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
@@ -39,6 +43,45 @@ def matrix_to_euler_rpy(matrix: np.ndarray) -> np.ndarray:
     return np.stack([roll, pitch, yaw], axis=-1)
 
 
+def matrix_to_rotation_vector(matrix: np.ndarray) -> np.ndarray:
+    """Convert SO(3) matrices to axis-angle vectors with a stable small-angle path."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    cosine = np.clip(
+        (np.trace(matrix, axis1=-2, axis2=-1) - 1.0) * 0.5,
+        -1.0,
+        1.0,
+    )
+    angle = np.arccos(cosine)
+    vee = 0.5 * np.stack(
+        [
+            matrix[..., 2, 1] - matrix[..., 1, 2],
+            matrix[..., 0, 2] - matrix[..., 2, 0],
+            matrix[..., 1, 0] - matrix[..., 0, 1],
+        ],
+        axis=-1,
+    )
+    sine = np.sin(angle)
+    scale = np.empty_like(angle)
+    small = angle < 1e-5
+    scale[small] = 1.0 + np.square(angle[small]) / 6.0
+    near_pi = (np.pi - angle) < 1e-4
+    regular = ~(small | near_pi)
+    scale[regular] = angle[regular] / np.maximum(sine[regular], 1e-12)
+    result = vee * scale[..., None]
+    if np.any(near_pi):
+        flat_matrix = matrix.reshape(-1, 3, 3)
+        flat_vee = vee.reshape(-1, 3)
+        flat_angle = angle.reshape(-1)
+        flat_result = result.reshape(-1, 3)
+        for index in np.flatnonzero(near_pi.reshape(-1)):
+            _, eigenvectors = np.linalg.eigh(flat_matrix[index])
+            axis = eigenvectors[:, -1]
+            if np.dot(axis, flat_vee[index]) < 0:
+                axis = -axis
+            flat_result[index] = axis * flat_angle[index]
+    return result
+
+
 def relative_pose(
     target_position_w: np.ndarray,
     target_rpy_w: np.ndarray,
@@ -64,10 +107,13 @@ def build_dynamic_block_plan_labels(
     hand_joint_indices: Sequence[int],
     block_anchor_offsets: Sequence[int] = (0, 8, 16, 24),
     local_waypoint_offsets: Sequence[int] = (4, 8),
+    eef_rotation_representation: str = EEF_ROTATION_ANCHOR_BASE_6D,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build labels for every possible start row of one canonical trajectory."""
     spec = canonical_block_plan_spec(
-        block_anchor_offsets, local_waypoint_offsets
+        block_anchor_offsets,
+        local_waypoint_offsets,
+        eef_rotation_representation=eef_rotation_representation,
     )
     anchors = np.asarray(spec["block_anchor_offsets"], dtype=np.int64)
     local = np.asarray(spec["local_waypoint_offsets"], dtype=np.int64)
@@ -131,16 +177,25 @@ def build_dynamic_block_plan_labels(
         anchor_rotation,
         future_eef_position - anchor_position[:, :, None, :],
     )
-    eef_relative_rotation = np.einsum(
-        "tbji,tbwjk->tbwik", anchor_rotation, future_eef_rotation
-    )
-    eef_rotation_6d = eef_relative_rotation[..., :2, :].reshape(
-        length, num_blocks, waypoints_per_block, 6
-    )
+    if eef_rotation_representation == EEF_ROTATION_ANCHOR_BASE_6D:
+        eef_relative_rotation = np.einsum(
+            "tbji,tbwjk->tbwik", anchor_rotation, future_eef_rotation
+        )
+        eef_rotation = eef_relative_rotation[..., :2, :].reshape(
+            length, num_blocks, waypoints_per_block, 6
+        )
+    elif eef_rotation_representation == EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC:
+        anchor_eef_rotation = euler_rpy_to_matrix(robot_hand[safe_anchors, 3:6])
+        eef_delta_rotation = np.einsum(
+            "tbji,tbwjk->tbwik", anchor_eef_rotation, future_eef_rotation
+        )
+        eef_rotation = matrix_to_rotation_vector(eef_delta_rotation)
+    else:  # canonical_block_plan_spec validates this before any geometry is built.
+        raise AssertionError(eef_rotation_representation)
     joint_position = robot_joint[..., 0]
     hand_configuration = joint_position[safe_targets][..., list(hand_indices)]
     manipulator_plan = np.concatenate(
-        [eef_relative_position, eef_rotation_6d, hand_configuration], axis=-1
+        [eef_relative_position, eef_rotation, hand_configuration], axis=-1
     )
 
     anchor_eef_position = robot_hand[safe_anchors, :3]
