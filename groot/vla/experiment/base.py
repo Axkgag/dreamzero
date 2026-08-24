@@ -57,6 +57,11 @@ from groot.vla.experiment.utils import (
     mprint,
     safe_save_model_for_hf_trainer,
 )
+from groot.vla.utils.checkpoint_state import (
+    collect_required_checkpoint_state_keys,
+    select_parameter_efficient_state_dict,
+    write_checkpoint_manifest,
+)
 from groot.vla.utils.timer import ContextTimer
 
 # Fix resume: https://github.com/huggingface/transformers/pull/34632/files
@@ -93,7 +98,9 @@ class LossLoggerCallback(TrainerCallback):
             return
         entry = {"step": state.global_step}
         for key, value in logs.items():
-            if key in ("loss", "learning_rate") or key.endswith("_loss_avg"):
+            if key in ("loss", "learning_rate") or key.endswith(
+                ("_loss_avg", "_metric_avg")
+            ):
                 entry[key] = value
         if len(entry) > 1:  # more than just "step"
             with open(self.output_path, "a") as f:
@@ -557,14 +564,27 @@ class BaseTrainer(transformers.Trainer):
         else:
             state_dict = self.model.state_dict()
 
+        required_checkpoint_keys = collect_required_checkpoint_state_keys(
+            self.model
+        )
         if self.base_cfg.save_lora_only:
-            # Save only the trainable parameters
-            train_key = [k for k, v in self.model.named_parameters() if v.requires_grad]
-            lora_state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
-            state_dict = lora_state_dict
+            # Trainable-only is insufficient when the architecture adds
+            # frozen tensors absent from the upstream checkpoint.  Preserve
+            # both sets so reconstruction never depends on the init seed.
+            state_dict, required_checkpoint_keys = (
+                select_parameter_efficient_state_dict(
+                    self.model,
+                    state_dict,
+                )
+            )
 
         if self.args.should_save:
             ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
+            write_checkpoint_manifest(
+                output_dir,
+                parameter_efficient=bool(self.base_cfg.save_lora_only),
+                required_state_keys=required_checkpoint_keys,
+            )
 
             # can separately save the VLM model for downstream evalualtion
             if self.base_cfg.save_llm:

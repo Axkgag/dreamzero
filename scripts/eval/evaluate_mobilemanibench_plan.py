@@ -34,6 +34,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from transformers import set_seed
 
 # UniPC's compiled update specializes on the Python ``step_index`` argument.
 # A 16-step sampling run therefore exceeds PyTorch 2.5's default per-function
@@ -45,6 +46,7 @@ torch._dynamo.config.cache_size_limit = max(
 
 from groot.vla.data.dataset import MobileManiBenchPlanDataset
 from groot.vla.data.transform import MobilePlanTransform
+from groot.vla.utils.checkpoint_state import validate_checkpoint_required_keys
 from mobilemanibench_sampling import (
     count_tasks_for_indices,
     select_task_balanced_indices,
@@ -272,7 +274,7 @@ def load_weights_into_model(
     label: str,
     *,
     allow_unexpected: bool = False,
-) -> None:
+) -> set[str]:
     index_path = checkpoint_dir / "model.safetensors.index.json"
     single_path = checkpoint_dir / "model.safetensors"
     if index_path.is_file():
@@ -286,10 +288,12 @@ def load_weights_into_model(
         )
 
     unexpected: set[str] = set()
+    loaded_keys: set[str] = set()
     for filename in files:
         path = checkpoint_dir / filename
         print(f"[weights] {label}: {path}", flush=True)
         state = load_file(str(path), device="cpu")
+        loaded_keys.update(state)
         incompatible = model.load_state_dict(state, strict=False)
         unexpected.update(incompatible.unexpected_keys)
         del state
@@ -305,6 +309,7 @@ def load_weights_into_model(
             "keys from the source checkpoint",
             flush=True,
         )
+    return loaded_keys
 
 
 def resolve_optional_checkpoint(value: Any) -> Path | None:
@@ -322,11 +327,23 @@ def load_model(
     device: torch.device,
     mesh: DeviceMesh | None,
     num_inference_steps: int,
+    *,
+    merge_lora: bool = True,
 ):
     config_path = checkpoint / "experiment_cfg/conf.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
     cfg = OmegaConf.load(config_path)
+    training_seed = cfg.get("seed")
+    if training_seed is None and cfg.get("training_args") is not None:
+        training_seed = cfg.training_args.get("seed")
+    if training_seed is None:
+        training_seed = 42
+    # Legacy parameter-efficient checkpoints omitted frozen Wan extensions.
+    # Matching the training initialization seed is the only deterministic
+    # compatibility path for those old checkpoints; new checkpoints save the
+    # tensors explicitly and are validated below.
+    set_seed(int(training_seed))
     model = instantiate(cfg.model)
 
     # Legacy DreamZero runs may reference an additional Hugging Face-format
@@ -356,11 +373,29 @@ def load_model(
         and action_head.config.defer_lora_injection
     ):
         action_head.inject_lora_after_loading()
-    load_weights_into_model(model, checkpoint, "trained overlay")
+    trained_keys = load_weights_into_model(
+        model,
+        checkpoint,
+        "trained overlay",
+    )
+    missing_required, has_manifest = validate_checkpoint_required_keys(
+        checkpoint,
+        trained_keys,
+        model,
+    )
+    if missing_required and not has_manifest:
+        preview = sorted(missing_required)[:12]
+        print(
+            "[weights] WARNING: legacy checkpoint omitted "
+            f"{len(missing_required)} frozen tensors absent from the Wan base; "
+            f"they were reconstructed with training seed {training_seed}. "
+            f"First keys={preview}",
+            flush=True,
+        )
 
     model.eval()
     model.requires_grad_(False)
-    if action_head.train_architecture == "lora":
+    if action_head.train_architecture == "lora" and merge_lora:
         action_head.model = action_head.model.merge_and_unload()
     action_head.num_inference_steps = int(num_inference_steps)
     if not 1 <= action_head.num_inference_steps <= len(action_head.dit_step_mask):

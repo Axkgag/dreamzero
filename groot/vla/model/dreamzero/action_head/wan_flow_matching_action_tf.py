@@ -235,6 +235,10 @@ class WANPolicyHead(ActionHead):
         self.cpu_offload = False
 
         self.model = instantiate(config.diffusion_model_cfg)
+        # Tensor identities recorded here survive PEFT wrapping.  They let the
+        # trainer save frozen, randomly initialized extensions that are absent
+        # from the upstream Wan checkpoint (for example k_img/v_img/img_emb).
+        self._pretrained_missing_state_tensor_ids: set[int] = set()
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -304,6 +308,14 @@ class WANPolicyHead(ActionHead):
 
                 missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
 
+                named_state_tensors = dict(self.model.named_parameters())
+                named_state_tensors.update(dict(self.model.named_buffers()))
+                self._pretrained_missing_state_tensor_ids.update(
+                    id(named_state_tensors[key])
+                    for key in missing_keys
+                    if key in named_state_tensors
+                )
+
                 if missing_keys:
                     print(f"Missing keys when loading pretrained weights: {missing_keys}")
                 if unexpected_keys:
@@ -321,6 +333,19 @@ class WANPolicyHead(ActionHead):
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+    def checkpoint_required_state_keys(self) -> list[str]:
+        """Return frozen state that the upstream Wan checkpoint cannot restore."""
+        if not self._pretrained_missing_state_tensor_ids:
+            return []
+        persistent_state = set(self.state_dict())
+        named_tensors = list(self.named_parameters()) + list(self.named_buffers())
+        return sorted(
+            name
+            for name, tensor in named_tensors
+            if id(tensor) in self._pretrained_missing_state_tensor_ids
+            and name in persistent_state
+        )
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
