@@ -48,6 +48,9 @@ from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchSche
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
+from groot.vla.utils.checkpoint_state import (
+    is_reconstructible_checkpoint_state_key,
+)
 
 
 KVCacheType: TypeAlias = torch.Tensor
@@ -346,7 +349,13 @@ class WANPolicyHead(ActionHead):
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def checkpoint_required_state_keys(self) -> list[str]:
-        """Return frozen state that the upstream Wan checkpoint cannot restore."""
+        """Return non-reconstructible state absent from the upstream Wan weights.
+
+        ``offset_seconds`` is a deterministic cache derived from the configured
+        waypoint offsets and control frequency.  It remains persistent for full
+        checkpoint compatibility, but parameter-efficient checkpoints do not
+        need to carry it in their required-state contract.
+        """
         if not self._pretrained_missing_state_tensor_ids:
             return []
         persistent_state = set(self.state_dict())
@@ -356,6 +365,7 @@ class WANPolicyHead(ActionHead):
             for name, tensor in named_tensors
             if id(tensor) in self._pretrained_missing_state_tensor_ids
             and name in persistent_state
+            and not is_reconstructible_checkpoint_state_key(name)
         )
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):

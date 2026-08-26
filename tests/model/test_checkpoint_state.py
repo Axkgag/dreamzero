@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from groot.vla.utils.checkpoint_state import (
+    is_reconstructible_checkpoint_state_key,
     select_parameter_efficient_state_dict,
     validate_checkpoint_required_keys,
     write_checkpoint_manifest,
@@ -26,6 +27,19 @@ class RequiredFrozenModule(torch.nn.Module):
 
 
 class CheckpointStateTest(unittest.TestCase):
+    def test_wan_required_state_excludes_reconstructible_offset_seconds(self) -> None:
+        self.assertTrue(is_reconstructible_checkpoint_state_key("offset_seconds"))
+        self.assertTrue(
+            is_reconstructible_checkpoint_state_key(
+                "model.action_encoder.offset_seconds"
+            )
+        )
+        self.assertFalse(
+            is_reconstructible_checkpoint_state_key(
+                "model.blocks.0.cross_attn.k_img.weight"
+            )
+        )
+
     def test_parameter_efficient_state_keeps_required_frozen_tensor(self) -> None:
         model = RequiredFrozenModule()
         selected, required = select_parameter_efficient_state_dict(

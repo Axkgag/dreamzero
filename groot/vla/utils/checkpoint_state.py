@@ -13,6 +13,11 @@ CHECKPOINT_MANIFEST_NAME = "dreamzero_checkpoint_manifest.json"
 CHECKPOINT_FORMAT_VERSION = 2
 
 
+def is_reconstructible_checkpoint_state_key(name: str) -> bool:
+    """Return whether a persistent state entry is derived entirely from config."""
+    return name == "offset_seconds" or name.endswith(".offset_seconds")
+
+
 def collect_required_checkpoint_state_keys(
     model: torch.nn.Module,
 ) -> set[str]:
