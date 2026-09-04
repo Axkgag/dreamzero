@@ -15,7 +15,13 @@ CHECKPOINT_FORMAT_VERSION = 2
 
 def is_reconstructible_checkpoint_state_key(name: str) -> bool:
     """Return whether a persistent state entry is derived entirely from config."""
-    return name == "offset_seconds" or name.endswith(".offset_seconds")
+    reconstructible_names = {
+        "expected_plan_local_offsets",
+        "offset_seconds",
+    }
+    return name in reconstructible_names or any(
+        name.endswith(f".{suffix}") for suffix in reconstructible_names
+    )
 
 
 def collect_required_checkpoint_state_keys(

@@ -38,25 +38,46 @@ from groot.vla.utils.mobile_plan_spec import (
     dynamic_block_plan_stats_path,
 )
 
-from evaluate_mobilemanibench_plan import (
-    initialize_distributed,
-    load_episode_tasks,
-    load_model,
-    read_json,
-    read_jsonl,
-    reset_sampler_state,
-    resolve_episode_split,
-    rotation6d_rows_to_matrix,
-    rotation_geodesic_deg,
-    sample_seed,
-    to_numpy,
-    wrap_angle,
-    write_json,
-)
-from mobilemanibench_sampling import (
-    count_tasks_for_indices,
-    select_task_balanced_indices,
-)
+try:
+    from .evaluate_mobilemanibench_plan import (
+        initialize_distributed,
+        load_episode_tasks,
+        load_model,
+        read_json,
+        read_jsonl,
+        reset_sampler_state,
+        resolve_episode_split,
+        rotation6d_rows_to_matrix,
+        rotation_geodesic_deg,
+        sample_seed,
+        to_numpy,
+        wrap_angle,
+        write_json,
+    )
+    from .mobilemanibench_sampling import (
+        count_tasks_for_indices,
+        select_task_balanced_indices,
+    )
+except ImportError:
+    from evaluate_mobilemanibench_plan import (
+        initialize_distributed,
+        load_episode_tasks,
+        load_model,
+        read_json,
+        read_jsonl,
+        reset_sampler_state,
+        resolve_episode_split,
+        rotation6d_rows_to_matrix,
+        rotation_geodesic_deg,
+        sample_seed,
+        to_numpy,
+        wrap_angle,
+        write_json,
+    )
+    from mobilemanibench_sampling import (
+        count_tasks_for_indices,
+        select_task_balanced_indices,
+    )
 
 
 INFERENCE_MODES = (
@@ -68,6 +89,35 @@ TEACHER_FORCED_OPEN_LOOP_MODE = "teacher_forced_open_loop"
 ORACLE_MODE = "oracle_four_block_teacher_forced"
 FULL_WINDOW_MODES = (TEACHER_FORCED_OPEN_LOOP_MODE, ORACLE_MODE)
 ALL_MODES = (*INFERENCE_MODES, *FULL_WINDOW_MODES)
+
+
+def load_phase_ranges(
+    dataset_root: Path, split: str
+) -> dict[int, list[tuple[int, int, str]]]:
+    candidates = [
+        dataset_root / f"meta/phase_index_{split}.jsonl",
+        dataset_root / "meta/phase_index.jsonl",
+    ]
+    path = next((value for value in candidates if value.is_file()), None)
+    if path is None:
+        return {}
+    result: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
+    for row in read_jsonl(path):
+        result[int(row["episode_index"])].append(
+            (int(row["start_frame"]), int(row["end_frame"]), str(row["phase"]))
+        )
+    return result
+
+
+def phase_at(
+    phase_ranges: Mapping[int, list[tuple[int, int, str]]],
+    episode_index: int,
+    frame_index: int,
+) -> str:
+    for start, end, phase in phase_ranges.get(episode_index, []):
+        if start <= frame_index <= end:
+            return phase
+    return "unindexed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -284,6 +334,9 @@ class MetricAccumulator:
         self.by_task: dict[str, dict[str, list[float]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self.by_phase: dict[str, dict[str, list[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         self.by_task_block: dict[
             tuple[str, int], dict[str, list[float]]
         ] = defaultdict(lambda: defaultdict(list))
@@ -303,10 +356,13 @@ class MetricAccumulator:
         global_offset: int | None,
         name: str,
         value: float,
+        phase: str | None = None,
     ) -> None:
         self._append(self.overall, name, value)
         self._append(self.by_block[block_index], name, value)
         self._append(self.by_task[task], name, value)
+        if phase is not None:
+            self._append(self.by_phase[phase], name, value)
         self._append(self.by_task_block[(task, block_index)], name, value)
         if global_offset is not None:
             self._append(self.by_global_offset[global_offset], name, value)
@@ -327,7 +383,8 @@ class MetricAccumulator:
         hand_dim: int,
         base_prior_pred: np.ndarray | None = None,
         eef_prior_pred: np.ndarray | None = None,
-        prior_waypoint_index: int | None = None,
+        prior_waypoint_indices: tuple[int, ...] | None = None,
+        waypoint_phases: list[str] | None = None,
     ) -> None:
         valid = np.asarray(valid, dtype=bool)
         errors = _waypoint_errors(
@@ -341,6 +398,11 @@ class MetricAccumulator:
                 global_offset,
                 "valid_waypoint_ratio",
                 float(valid[waypoint_index]),
+                (
+                    waypoint_phases[waypoint_index]
+                    if waypoint_phases is not None
+                    else None
+                ),
             )
             if not valid[waypoint_index]:
                 continue
@@ -351,6 +413,11 @@ class MetricAccumulator:
                     global_offset,
                     name,
                     float(values[waypoint_index]),
+                    (
+                        waypoint_phases[waypoint_index]
+                        if waypoint_phases is not None
+                        else None
+                    ),
                 )
 
         valid_indices = np.flatnonzero(valid)
@@ -398,11 +465,14 @@ class MetricAccumulator:
                 float(errors["eef_position_l2_m"][endpoint]),
             )
 
-        if prior_waypoint_index is not None:
-            prior_index = int(prior_waypoint_index)
+        if prior_waypoint_indices is not None:
+          for prior_slot, prior_index in enumerate(prior_waypoint_indices):
+            prior_index = int(prior_index)
+            prior_offset = self.plan_local_offsets[prior_index]
+            global_offset = self.block_anchor_offsets[block_index] + prior_offset
             if valid[prior_index] and base_prior_pred is not None:
                 prior_error = _waypoint_errors(
-                    np.asarray(base_prior_pred).reshape(1, 4),
+                    np.asarray(base_prior_pred)[prior_slot : prior_slot + 1].reshape(1, 4),
                     base_gt[prior_index : prior_index + 1],
                     manip_gt[prior_index : prior_index + 1],
                     manip_gt[prior_index : prior_index + 1],
@@ -413,10 +483,21 @@ class MetricAccumulator:
                     ("base_yaw_error_deg", "base_prior_yaw_error_deg"),
                 ):
                     value = float(prior_error[source][0])
-                    row[target] = value
-                    self._append_grouped(task, block_index, None, target, value)
+                    row[f"{target}@{prior_offset}"] = value
+                    self._append_grouped(
+                        task,
+                        block_index,
+                        global_offset,
+                        target,
+                        value,
+                        (
+                            waypoint_phases[prior_index]
+                            if waypoint_phases is not None
+                            else None
+                        ),
+                    )
             if valid[prior_index] and eef_prior_pred is not None:
-                eef = np.asarray(eef_prior_pred).reshape(1, -1)
+                eef = np.asarray(eef_prior_pred)[prior_slot : prior_slot + 1]
                 target = manip_gt[prior_index : prior_index + 1]
                 position_error = float(np.linalg.norm(eef[:, :3] - target[:, :3]))
                 rotation_error = float(
@@ -425,21 +506,33 @@ class MetricAccumulator:
                         rotation6d_rows_to_matrix(target[:, 3:9]),
                     )[0]
                 )
-                row["eef_prior_position_l2_m"] = position_error
-                row["eef_prior_rotation_geodesic_deg"] = rotation_error
+                row[f"eef_prior_position_l2_m@{prior_offset}"] = position_error
+                row[
+                    f"eef_prior_rotation_geodesic_deg@{prior_offset}"
+                ] = rotation_error
                 self._append_grouped(
                     task,
                     block_index,
-                    None,
+                    global_offset,
                     "eef_prior_position_l2_m",
                     position_error,
+                    (
+                        waypoint_phases[prior_index]
+                        if waypoint_phases is not None
+                        else None
+                    ),
                 )
                 self._append_grouped(
                     task,
                     block_index,
-                    None,
+                    global_offset,
                     "eef_prior_rotation_geodesic_deg",
                     rotation_error,
+                    (
+                        waypoint_phases[prior_index]
+                        if waypoint_phases is not None
+                        else None
+                    ),
                 )
 
         self.per_prediction.append(row)
@@ -587,6 +680,10 @@ class MetricAccumulator:
                 task: self._summarize_bucket(bucket)
                 for task, bucket in sorted(self.by_task.items())
             },
+            "per_phase": {
+                phase: self._summarize_bucket(bucket)
+                for phase, bucket in sorted(self.by_phase.items())
+            },
             "per_task_block": [
                 {
                     "task": task,
@@ -727,13 +824,18 @@ def build_datasets(
 ) -> dict[str, Any]:
     common = _dataset_kwargs(dataset_root, cfg, anchors, local_offsets)
     needs_full_video = mode in FULL_WINDOW_MODES
+    configured_video_indices = [
+        int(value) for value in cfg.train_dataset.video_delta_indices
+    ]
+    video_stride = int(cfg.get("video_sample_stride", 1))
     root_dataset = MobileManiBenchBlockPlanDataset(
         **common,
         load_videos=needs_full_video,
         video_delta_indices=(
-            list(range(int(cfg.num_frames))) if needs_full_video else [0]
+            configured_video_indices if needs_full_video else [0]
         ),
-        require_full_video_window=True,
+        require_full_video_window=False,
+        require_complete_first_block=needs_full_video,
     )
     result: dict[str, Any] = {"root": root_dataset}
     if mode in INFERENCE_MODES:
@@ -749,7 +851,7 @@ def build_datasets(
             history = MobileManiBenchBlockPlanDataset(
                 **common,
                 load_videos=True,
-                video_delta_indices=list(range(block_stride + 1)),
+                video_delta_indices=list(range(0, block_stride + 1, video_stride)),
                 require_full_video_window=False,
             )
             result["history"] = history
@@ -795,6 +897,7 @@ def teacher_forced_block_observation(
     block_index: int,
     anchors: list[int],
     block_stride: int,
+    video_sample_stride: int = 1,
 ) -> dict[str, Any]:
     """Slice one causal inference input from a complete clean root window.
 
@@ -808,8 +911,14 @@ def teacher_forced_block_observation(
     if not 0 <= block_index < len(anchors):
         raise IndexError(f"Invalid block index {block_index} for {len(anchors)} blocks")
     anchor_offset = int(anchors[block_index])
-    video_start = 0 if block_index == 0 else anchor_offset - block_stride
-    video_stop = anchor_offset + 1
+    if block_stride % video_sample_stride:
+        raise ValueError("block_stride must be divisible by video_sample_stride")
+    sampled_frames_per_block = block_stride // video_sample_stride
+    anchor_sample_index = anchor_offset // video_sample_stride
+    video_start = (
+        0 if block_index == 0 else anchor_sample_index - sampled_frames_per_block
+    )
+    video_stop = anchor_sample_index + 1
     if video_start < 0:
         raise ValueError(
             f"Block {block_index} has invalid history range "
@@ -921,12 +1030,19 @@ def _physical_predictions(
     return base, manipulator, base_prior, eef_prior
 
 
-def _prior_waypoint_index(action_head: Any, local_offsets: list[int]) -> int | None:
+def _prior_waypoint_indices(
+    action_head: Any, local_offsets: list[int]
+) -> tuple[int, ...] | None:
+    if hasattr(action_head, "prior_flow_indices"):
+        indices = tuple(int(value) for value in action_head.prior_flow_indices)
+        if any(not 0 <= index < len(local_offsets) for index in indices):
+            raise ValueError(f"Invalid prior_flow_indices={indices}")
+        return indices
     if hasattr(action_head, "prior_flow_index"):
         index = int(action_head.prior_flow_index)
         if not 0 <= index < len(local_offsets):
             raise ValueError(f"Invalid prior_flow_index={index}")
-        return index
+        return (index,)
     return None
 
 
@@ -1101,11 +1217,13 @@ def run_teacher_forced_open_loop(
     anchors: list[int],
     local_offsets: list[int],
     block_stride: int,
+    video_sample_stride: int,
     rollout_blocks: int,
     rank: int,
     world_size: int,
     output_dir: Path,
     metadata: dict[str, Any],
+    phase_ranges: Mapping[int, list[tuple[int, int, str]]],
 ) -> None:
     """Run every configured Flow block and export matching supervised losses."""
     accumulator = MetricAccumulator(anchors, local_offsets)
@@ -1118,7 +1236,7 @@ def run_teacher_forced_open_loop(
             f"Checkpoint action_horizon={action_head.action_horizon} does not "
             f"match 2*K={flow_tokens_per_block}"
         )
-    prior_index = _prior_waypoint_index(action_head, local_offsets)
+    prior_indices = _prior_waypoint_indices(action_head, local_offsets)
     rotation_representation = str(
         getattr(
             action_head.config,
@@ -1184,6 +1302,7 @@ def run_teacher_forced_open_loop(
                 block_index,
                 anchors,
                 block_stride,
+                video_sample_stride,
             )
             inference_seed = sample_seed(
                 args.seed,
@@ -1199,7 +1318,9 @@ def run_teacher_forced_open_loop(
                 collator,
                 flow_tokens_per_block,
             )
-            expected_video_frames = 1 if block_index == 0 else block_stride + 1
+            expected_video_frames = (
+                1 if block_index == 0 else block_stride // video_sample_stride + 1
+            )
             if int(batch["images"].shape[1]) != expected_video_frames:
                 raise ValueError(
                     f"{args.mode} block {block_index} expected "
@@ -1242,6 +1363,14 @@ def run_teacher_forced_open_loop(
                         0,
                     )
                 valid = to_numpy(root["plan_valid"])[block_index].astype(bool)
+                waypoint_phases = [
+                    phase_at(
+                        phase_ranges,
+                        episode_index,
+                        anchor_frame + int(offset),
+                    )
+                    for offset in local_offsets
+                ]
                 accumulator.add_block(
                     episode_index=episode_index,
                     root_frame_index=root_frame,
@@ -1256,7 +1385,8 @@ def run_teacher_forced_open_loop(
                     hand_dim=hand_dim,
                     base_prior_pred=base_prior,
                     eef_prior_pred=eef_prior,
-                    prior_waypoint_index=prior_index,
+                    prior_waypoint_indices=prior_indices,
+                    waypoint_phases=waypoint_phases,
                 )
                 block_base_predictions.append(base_pred)
                 block_manip_predictions.append(manip_pred)
@@ -1329,7 +1459,7 @@ def run_inference(
             f"Checkpoint action_horizon={action_head.action_horizon} does not "
             f"match 2*K={flow_tokens_per_block}"
         )
-    prior_index = _prior_waypoint_index(action_head, local_offsets)
+    prior_indices = _prior_waypoint_indices(action_head, local_offsets)
     rotation_representation = str(
         getattr(
             action_head.config,
@@ -1437,7 +1567,7 @@ def run_inference(
                     hand_dim=hand_dim,
                     base_prior_pred=base_prior,
                     eef_prior_pred=eef_prior,
-                    prior_waypoint_index=prior_index,
+                    prior_waypoint_indices=prior_indices,
                 )
                 block_base_predictions.append(base_pred)
                 block_manip_predictions.append(manip_pred)
@@ -1474,6 +1604,7 @@ def main() -> int:
     dataset_root = args.dataset_root.resolve()
     episode_ids, split_source = resolve_episode_split(dataset_root, args.split)
     episode_tasks = load_episode_tasks(dataset_root)
+    phase_ranges = load_phase_ranges(dataset_root, args.split)
 
     if args.checkpoint is None:
         if not args.inspect_only:
@@ -1610,11 +1741,13 @@ def main() -> int:
         anchors=anchors,
         local_offsets=local_offsets,
         block_stride=block_stride,
+        video_sample_stride=int(cfg.get("video_sample_stride", 1)),
         rollout_blocks=rollout_blocks,
         rank=rank,
         world_size=world_size,
         output_dir=output_dir,
         metadata=metadata,
+        phase_ranges=phase_ranges,
     )
     if rank == 0:
         print(f"Wrote evaluation to {output_dir}", flush=True)

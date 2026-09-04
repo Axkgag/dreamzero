@@ -266,11 +266,18 @@ class MultiBlockCleanPriorActionEncoder(MultiBlockDualPlanActionEncoder):
 
     def __init__(self, *args, prior_flow_indices: Sequence[int], **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if len(prior_flow_indices) != 1:
-            raise ValueError("Multiblock endpoint prior requires one local offset")
-        self.prior_flow_index = int(prior_flow_indices[0])
+        self.prior_horizon = len(prior_flow_indices)
+        if self.prior_horizon <= 0:
+            raise ValueError("Multiblock clean Prior requires at least one offset")
+        self.register_buffer(
+            "prior_flow_indices",
+            torch.as_tensor(prior_flow_indices, dtype=torch.long),
+            persistent=False,
+        )
         hidden_size = self.type_embedding.shape[-1]
-        self.prior_query = nn.Parameter(torch.empty(1, hidden_size))
+        self.prior_query = nn.Parameter(
+            torch.empty(self.prior_horizon, hidden_size)
+        )
         self.prior_type_embedding = nn.Parameter(torch.empty(hidden_size))
         nn.init.normal_(self.prior_query, std=0.02)
         nn.init.normal_(self.prior_type_embedding, std=0.02)
@@ -280,27 +287,34 @@ class MultiBlockCleanPriorActionEncoder(MultiBlockDualPlanActionEncoder):
         batch = flow.shape[0]
         num_blocks = flow.shape[1] // self.flow_tokens_per_block
         flow = flow.reshape(batch, num_blocks, self.flow_tokens_per_block, -1)
-        seconds = self.offset_seconds[self.prior_flow_index].to(
-            device=packed_action.device
+        seconds = self.offset_seconds.to(device=packed_action.device).index_select(
+            0, self.prior_flow_indices
         )
-        seconds = seconds.reshape(1, 1).expand(batch * num_blocks, 1)
+        seconds = seconds.reshape(1, self.prior_horizon).expand(
+            batch * num_blocks, -1
+        )
         offset = self.offset_embedding(seconds, flow.dtype).reshape(
-            batch, num_blocks, 1, -1
+            batch, num_blocks, self.prior_horizon, -1
         )
-        prior = self.prior_query.to(flow.dtype).reshape(1, 1, 1, -1) + offset
+        prior = self.prior_query.to(flow.dtype).reshape(
+            1, 1, self.prior_horizon, -1
+        ) + offset
         prior = prior + self.prior_type_embedding.to(flow.dtype)
         return torch.cat([prior.expand(batch, num_blocks, -1, -1), flow], dim=2).reshape(
-            batch, num_blocks * (self.flow_tokens_per_block + 1), -1
+            batch,
+            num_blocks * (self.flow_tokens_per_block + self.prior_horizon),
+            -1,
         )
 
 
 class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
-    """Decode one clean Prior plus four noisy flow registers per block."""
+    """Decode configurable clean Priors plus noisy Flow registers per block."""
 
     def __init__(
         self,
         *args,
-        prior_flow_index: int,
+        prior_flow_indices: Sequence[int] | None = None,
+        prior_flow_index: int | None = None,
         eef_prior_dim: int = 9,
         **kwargs,
     ) -> None:
@@ -308,7 +322,18 @@ class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
         self.eef_prior_dim = int(eef_prior_dim)
         if 2 * self.base_action_dim + self.eef_prior_dim > self.manipulator_action_dim:
             raise ValueError("Packed Base channels cannot hold Base and EEF Prior outputs")
-        self.prior_flow_index = int(prior_flow_index)
+        if prior_flow_indices is None:
+            if prior_flow_index is None:
+                raise ValueError("Provide prior_flow_indices")
+            prior_flow_indices = (int(prior_flow_index),)
+        elif prior_flow_index is not None:
+            raise ValueError("Provide prior_flow_indices or prior_flow_index, not both")
+        self.prior_horizon = len(prior_flow_indices)
+        self.register_buffer(
+            "prior_flow_indices",
+            torch.as_tensor(prior_flow_indices, dtype=torch.long),
+            persistent=False,
+        )
         model_dim = self.base_decoder.layer1.W.shape[1]
         hidden_size = self.base_decoder.layer1.W.shape[2]
         num_embodiments = self.base_decoder.layer1.W.shape[0]
@@ -326,14 +351,16 @@ class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
         )
 
     def forward(self, hidden, category_ids):
-        internal_width = self.flow_tokens_per_block + 1
+        internal_width = self.flow_tokens_per_block + self.prior_horizon
         if hidden.shape[1] % internal_width:
             raise ValueError("Prior hidden registers do not align with action blocks")
         batch = hidden.shape[0]
         num_blocks = hidden.shape[1] // internal_width
         block = hidden.reshape(batch, num_blocks, internal_width, -1)
-        prior_hidden = block[:, :, 0].reshape(batch, num_blocks, -1)
-        flow_hidden = block[:, :, 1:].reshape(
+        prior_hidden = block[:, :, : self.prior_horizon].reshape(
+            batch, num_blocks * self.prior_horizon, -1
+        )
+        flow_hidden = block[:, :, self.prior_horizon :].reshape(
             batch, num_blocks * self.flow_tokens_per_block, -1
         )
         flow = super().forward(flow_hidden, category_ids).reshape(
@@ -342,14 +369,20 @@ class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
             self.flow_tokens_per_block,
             self.manipulator_action_dim,
         ).clone()
-        base_prior = self.base_prior_head(prior_hidden, category_ids)
-        eef_prior = self.eef_prior_head(prior_hidden, category_ids)
-        slot = self.prior_flow_index
-        flow[:, :, slot, self.base_action_dim : 2 * self.base_action_dim] = base_prior
+        base_prior = self.base_prior_head(prior_hidden, category_ids).reshape(
+            batch, num_blocks, self.prior_horizon, self.base_action_dim
+        )
+        eef_prior = self.eef_prior_head(prior_hidden, category_ids).reshape(
+            batch, num_blocks, self.prior_horizon, self.eef_prior_dim
+        )
+        flow[
+            :, :, self.prior_flow_indices,
+            self.base_action_dim : 2 * self.base_action_dim,
+        ] = base_prior
         flow[
             :,
             :,
-            slot,
+            self.prior_flow_indices,
             2 * self.base_action_dim : 2 * self.base_action_dim + self.eef_prior_dim,
         ] = eef_prior
         return flow.reshape(
@@ -358,7 +391,7 @@ class MultiBlockCleanPriorActionDecoder(MultiBlockDualPlanActionDecoder):
 
 
 class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
-    """Multiblock dual plan with one directed clean endpoint Prior per block."""
+    """Multiblock dual plan with configurable directed clean Priors per block."""
 
     def __init__(
         self,
@@ -376,15 +409,18 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
         prior_indices = resolve_prior_flow_indices(
             plan_local_offsets, prior_config.time_offsets
         )
-        if len(prior_indices) != 1:
-            raise ValueError("Multiblock WAM supports one endpoint Prior per block")
         if prior_condition_mode not in PRIOR_CONDITION_MODES:
             raise ValueError(f"Unknown prior_condition_mode: {prior_condition_mode}")
         super().__init__(**kwargs)
         self.prior_config = prior_config
         self.prior_condition_mode = prior_condition_mode
-        self.prior_flow_index = int(prior_indices[0])
-        internal_width = self.flow_tokens_per_block + 1
+        self.prior_horizon = len(prior_indices)
+        self.register_buffer(
+            "prior_flow_indices",
+            torch.as_tensor(prior_indices, dtype=torch.long),
+            persistent=False,
+        )
+        internal_width = self.flow_tokens_per_block + self.prior_horizon
         self.num_action_per_block = internal_width
         for block in self.blocks:
             previous = block.self_attn
@@ -399,7 +435,7 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
                 eps=previous.eps,
                 num_action_per_block=internal_width,
                 num_state_per_block=previous.num_state_per_block,
-                num_base_prior_tokens=1,
+                num_base_prior_tokens=self.prior_horizon,
             )
             replacement.load_state_dict(previous.state_dict())
             block.self_attn = replacement
@@ -419,7 +455,7 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
             model_dim=self.dim,
             num_embodiments=1,
             waypoints_per_block=self.plan_waypoints_per_block,
-            prior_flow_index=self.prior_flow_index,
+            prior_flow_indices=prior_indices,
             eef_prior_dim=3 + eef_rotation_dim(
                 self.eef_rotation_representation
             ),
@@ -432,7 +468,10 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
             raise ValueError("Flow timesteps do not align with multiblock actions")
         batch = timestep_action.shape[0]
         num_blocks = timestep_action.shape[1] // self.flow_tokens_per_block
-        expected_registers = num_blocks * (self.flow_tokens_per_block + 1)
+        prior_horizon = int(getattr(self, "prior_horizon", 1))
+        expected_registers = num_blocks * (
+            self.flow_tokens_per_block + prior_horizon
+        )
         if action_features.shape[1] != expected_registers:
             raise ValueError(
                 f"Expected {expected_registers} internal action registers, got "
@@ -443,7 +482,9 @@ class WanVideoDiTMultiBlockDualPlanPrior(WanVideoDiTMultiBlockDualPlan):
         flow_timestep = timestep_action.reshape(
             batch, num_blocks, self.flow_tokens_per_block
         )
-        prior_timestep = torch.zeros_like(flow_timestep[:, :, :1])
+        prior_timestep = torch.zeros_like(
+            flow_timestep[:, :, :1]
+        ).expand(-1, -1, prior_horizon)
         internal = torch.cat([prior_timestep, flow_timestep], dim=2).reshape(
             batch, expected_registers
         )

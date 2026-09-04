@@ -13,7 +13,7 @@ export PATH="$DREAMZERO_ENV/bin:$PATH"
 export NO_ALBUMENTATIONS_UPDATE=1
 cd "$REPO_ROOT"
 
-DEFAULT_RUN_DIR="$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_multiblock_k2_wp2"
+DEFAULT_RUN_DIR="$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_multiblock_wamv2_1p6s"
 DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1"
 
 RUN_DIR=${RUN_DIR:-"$DEFAULT_RUN_DIR"}

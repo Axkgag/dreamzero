@@ -154,6 +154,8 @@ class MobilePlanCotrainTransform(DreamTransform):
             "base_action_mask",
             "manipulator_action_mask",
             "plan_valid",
+            "plan_real_valid",
+            "plan_hold_valid",
             "plan_time_offsets",
             "plan_time_seconds",
         ):
@@ -236,6 +238,12 @@ class MobileBlockPlanDataCollator(DefaultDataCollator):
                 raise ValueError(
                     f"{key}: expected {shape}, got {tuple(batch[key].shape)}"
                 )
+        for key in ("block_valid", "block_state_valid"):
+            if key in batch and tuple(batch[key].shape) != (batch_size, blocks):
+                raise ValueError(
+                    f"{key}: expected {(batch_size, blocks)}, "
+                    f"got {tuple(batch[key].shape)}"
+                )
         expected_action = (blocks * packed_width, self.manipulator_action_dim)
         if tuple(batch["action"].shape[1:]) != expected_action:
             raise ValueError(
@@ -304,6 +312,16 @@ class MobileBlockPlanCotrainTransform(MobilePlanCotrainTransform):
         action_mask = block_mask.reshape(action.shape)
         return action, action_mask, action.shape[0]
 
+    def _prepare_state(self, data: dict):
+        state, state_mask, count = super()._prepare_state(data)
+        valid = _numpy(data.get("block_state_valid", np.ones(count))).astype(bool)
+        if valid.shape != (count,):
+            raise ValueError(
+                f"Expected block_state_valid [{count}], got {valid.shape}"
+            )
+        state_mask &= valid[:, None]
+        return state, state_mask, count
+
     def apply_single(self, data: dict) -> dict:
         data = self._canonicalize(data)
         transformed = DreamTransform.apply_single(self, data)
@@ -313,12 +331,32 @@ class MobileBlockPlanCotrainTransform(MobilePlanCotrainTransform):
             "base_action_mask",
             "manipulator_action_mask",
             "plan_valid",
+            "plan_real_valid",
+            "plan_hold_valid",
             "plan_local_offsets",
             "plan_time_seconds",
             "block_anchor_offsets",
             "global_plan_offsets",
             "block_state_valid",
             "physical_block_state",
+            "block_valid",
+            "video_valid",
+            "video_real_valid",
+            "video_hold_valid",
+            "video_latent_valid",
+            "video_latent_real_valid",
+            "video_latent_hold_valid",
+            "sample_phase_id",
+            "sample_task_id",
+            "sampled_block_slot",
+            "sampled_horizon",
+            "full_window",
+            "num_valid_blocks",
+            "num_real_blocks",
+            "terminal_block_slot",
+            "terminal_local_offset",
+            "hold_ticks",
+            "success_hold",
         ):
             transformed[key] = _numpy(data[key])
         return transformed

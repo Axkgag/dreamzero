@@ -14,7 +14,7 @@ cd "$REPO_ROOT"
 DEFAULT_DATA_ROOT="/mnt/yihao/datasets/MobileManiBench/MobileManipVLA_dreamzero_g1_5tasks/g1"
 MOBILEMANIBENCH_DATA_ROOT=${MOBILEMANIBENCH_DATA_ROOT:-"$DEFAULT_DATA_ROOT"}
 PLAN_CONFIG="$REPO_ROOT/groot/vla/configs/data/dreamzero/mobilemanibench_multiblock_plan.yaml"
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_multiblock_k2_wp2"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/work_dirs/mobilemanibench_g1_5tasks_wan22_5b_multiblock_wamv2_1p6s"}
 ACTION_HEAD_CONFIG=${ACTION_HEAD_CONFIG:-mobile_plan_multiblock_clean_prior_physical_consistency_wan22}
 NUM_ACTION_PER_BLOCK=${NUM_ACTION_PER_BLOCK:-}
 NUM_GPUS=${NUM_GPUS:-4}
@@ -52,6 +52,21 @@ for required_file in \
 done
 
 "$DREAMZERO_ENV/bin/python" \
+  scripts/data/prepare_mobilemanibench_phase_index.py \
+  --dataset-root "$MOBILEMANIBENCH_DATA_ROOT" \
+  --plan-config "$PLAN_CONFIG" \
+  --split train \
+  --reuse-existing
+
+"$DREAMZERO_ENV/bin/python" \
+  scripts/data/prepare_mobilemanibench_phase_index.py \
+  --dataset-root "$MOBILEMANIBENCH_DATA_ROOT" \
+  --plan-config "$PLAN_CONFIG" \
+  --split val \
+  --output "$MOBILEMANIBENCH_DATA_ROOT/meta/phase_index_val.jsonl" \
+  --reuse-existing
+
+"$DREAMZERO_ENV/bin/python" \
   scripts/data/prepare_mobilemanibench_plan_metadata.py \
   --dataset-root "$MOBILEMANIBENCH_DATA_ROOT" \
   --split train \
@@ -79,15 +94,36 @@ root, config_path, stats_path = sys.argv[1:]
 config = yaml.safe_load(open(config_path))
 anchors = config["block_anchor_offsets"]
 local = config["plan_local_offsets"]
-block_stride = 8
+control_fps = float(config["control_fps"])
+video_fps = float(config["video_fps"])
+video_stride = int(config["video_sample_stride"])
+assert control_fps % video_fps == 0
+assert video_stride == int(control_fps / video_fps)
+prediction_horizon = int(config["inference"]["prediction_horizon_ticks"])
+execution_horizon = int(config["inference"]["execution_horizon_ticks"])
+block_stride = prediction_horizon
 expected_anchors = [index * block_stride for index in range(len(anchors))]
 assert anchors == expected_anchors, (
     f"block_anchor_offsets must follow video block boundaries {expected_anchors}, "
     f"got {anchors}"
 )
-assert max(local) <= block_stride, (
-    f"local waypoint offsets must remain inside one {block_stride}-frame block"
-)
+assert local == sorted(set(local)) and min(local) >= 1
+assert max(local) == block_stride
+assert 0 < execution_horizon <= prediction_horizon
+prior = config["prior"]
+prior_offsets = prior["time_offsets"]
+assert prior_offsets == sorted(set(prior_offsets))
+assert set(prior_offsets).issubset(local)
+sampling = config["sampling"]
+assert abs(float(sampling["phase_balanced_ratio"]) + float(sampling["natural_ratio"]) - 1.0) < 1e-8
+assert config["success_hold"]["enabled"] is True
+assert int(config["success_hold"]["min_success_frames"]) > 0
+for dataset_name in ("train_dataset", "val_dataset"):
+    dataset_success_hold = config[dataset_name]["success_hold"]
+    assert dataset_success_hold in ("${success_hold}", config["success_hold"]), (
+        f"{dataset_name}.success_hold must reference the global success_hold "
+        f"configuration, got {dataset_success_hold!r}"
+    )
 stats = json.load(open(stats_path))
 assert stats["fit_split"] == "train"
 assert stats["label_source"] == "dynamic_world_trajectory"
@@ -108,14 +144,20 @@ assert config["plan_horizon"] == len(local)
 assert config["plan_waypoints_per_block"] == len(local)
 assert config["action_horizon"] == 2 * len(local)
 global_offsets = [anchor + offset for anchor in anchors for offset in local]
-assert config["num_frames"] > max(global_offsets)
-print(len(anchors), len(local), config["num_frames"], config["action_horizon"])
+video_indices = config["train_dataset"]["video_delta_indices"]
+assert len(video_indices) == config["num_frames"] == 33
+assert video_indices == list(range(0, anchors[-1] + prediction_horizon + 1, video_stride))
+assert max(video_indices) == max(global_offsets)
+print(
+    len(anchors), len(local), config["num_frames"], config["action_horizon"],
+    len(prior_offsets), prediction_horizon, execution_horizon, video_stride,
+)
 ' "$MOBILEMANIBENCH_DATA_ROOT" "$PLAN_CONFIG" "$PLAN_STATS_PATH"
 )
-read -r NUM_PLAN_BLOCKS PLAN_WAYPOINTS NUM_VIDEO_FRAMES PLAN_ACTION_HORIZON <<< "$PLAN_SHAPE"
+read -r NUM_PLAN_BLOCKS PLAN_WAYPOINTS NUM_VIDEO_FRAMES PLAN_ACTION_HORIZON PRIOR_TOKENS PREDICTION_HORIZON EXECUTION_HORIZON VIDEO_STRIDE <<< "$PLAN_SHAPE"
 if [ -z "$NUM_ACTION_PER_BLOCK" ]; then
   if [[ "$ACTION_HEAD_CONFIG" == *clean_prior* ]]; then
-    NUM_ACTION_PER_BLOCK=$((2 * PLAN_WAYPOINTS + 1))
+    NUM_ACTION_PER_BLOCK=$((2 * PLAN_WAYPOINTS + PRIOR_TOKENS))
   else
     NUM_ACTION_PER_BLOCK=$((2 * PLAN_WAYPOINTS))
   fi
@@ -130,7 +172,11 @@ echo "  action_head=$ACTION_HEAD_CONFIG"
 echo "  plan_blocks=$NUM_PLAN_BLOCKS"
 echo "  waypoints_per_block=$PLAN_WAYPOINTS"
 echo "  video_frames=$NUM_VIDEO_FRAMES"
+echo "  video_stride_ticks=$VIDEO_STRIDE"
+echo "  prediction_horizon_ticks=$PREDICTION_HORIZON"
+echo "  execution_horizon_ticks=$EXECUTION_HORIZON"
 echo "  flow_tokens_per_block=$PLAN_ACTION_HORIZON"
+echo "  prior_tokens_per_block=$PRIOR_TOKENS"
 echo "  internal_action_registers_per_block=$NUM_ACTION_PER_BLOCK"
 echo "  global_batch=$((NUM_GPUS * PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
 

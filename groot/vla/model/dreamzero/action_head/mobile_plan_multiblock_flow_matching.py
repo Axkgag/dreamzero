@@ -282,7 +282,7 @@ class MobilePlanMultiBlockCleanPriorPolicyHeadConfig(
 class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
     MobilePlanMultiBlockFlowMatchingActionHead
 ):
-    """Multiblock flow head with one clean endpoint Prior per block."""
+    """Multiblock flow head with configurable clean Priors per block."""
 
     config_class = MobilePlanMultiBlockCleanPriorPolicyHeadConfig
 
@@ -294,12 +294,11 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
         prior_indices = resolve_prior_flow_indices(
             config.plan_local_offsets, self.prior_config.time_offsets
         )
-        if len(prior_indices) != 1:
-            raise ValueError("Multiblock WAM supports one endpoint Prior per block")
-        self.prior_flow_index = int(prior_indices[0])
+        self.prior_flow_indices = tuple(int(value) for value in prior_indices)
+        self.prior_horizon = len(self.prior_flow_indices)
         self.prior_physical_losses = MobilePlanPhysicalConsistencyLosses(
             config.plan_stats_path,
-            plan_horizon=1,
+            plan_horizon=self.prior_horizon,
             base_action_dim=config.base_action_dim,
             manipulator_action_dim=config.manipulator_action_dim,
             huber_beta=config.physical_loss_huber_beta,
@@ -358,14 +357,14 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
         )
         clean_block = clean_actions.reshape_as(prediction_block)
         mask_block = action_mask.reshape_as(prediction_block)
-        endpoint = self.prior_flow_index
+        endpoints = self.prior_flow_indices
         base_prior = (
             prediction_block[
                 :,
                 :,
-                endpoint,
+                endpoints,
                 self.base_action_dim : 2 * self.base_action_dim,
-            ].reshape(batch * num_blocks, 1, self.base_action_dim)
+            ].reshape(batch * num_blocks, self.prior_horizon, self.base_action_dim)
             if self.prior_config.predict_base
             else None
         )
@@ -373,7 +372,7 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
             prediction_block[
                 :,
                 :,
-                endpoint,
+                endpoints,
                 2 * self.base_action_dim : (
                     2 * self.base_action_dim
                     + 3
@@ -381,27 +380,29 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
                 ),
             ].reshape(
                 batch * num_blocks,
-                1,
+                self.prior_horizon,
                 3 + self.prior_physical_losses.eef_rotation_dim,
             )
             if self.prior_config.predict_eef
             else None
         )
-        base_target = clean_block[:, :, endpoint : endpoint + 1]
-        manipulator_index = self.waypoints_per_block + endpoint
-        manipulator_target = clean_block[
-            :, :, manipulator_index : manipulator_index + 1
-        ]
+        base_target = clean_block[:, :, endpoints]
+        manipulator_indices = tuple(
+            self.waypoints_per_block + endpoint for endpoint in endpoints
+        )
+        manipulator_target = clean_block[:, :, manipulator_indices]
         prior_target = torch.cat([base_target, manipulator_target], dim=2).reshape(
-            batch * num_blocks, 2, clean_actions.shape[-1]
+            batch * num_blocks, 2 * self.prior_horizon, clean_actions.shape[-1]
         )
         prior_mask = torch.cat(
             [
-                mask_block[:, :, endpoint : endpoint + 1],
-                mask_block[:, :, manipulator_index : manipulator_index + 1],
+                mask_block[:, :, endpoints],
+                mask_block[:, :, manipulator_indices],
             ],
             dim=2,
-        ).reshape(batch * num_blocks, 2, action_mask.shape[-1])
+        ).reshape(
+            batch * num_blocks, 2 * self.prior_horizon, action_mask.shape[-1]
+        )
         repeated_real = has_real_action.repeat_interleave(num_blocks)
         terms = self.prior_physical_losses.prior_terms(
             base_prediction=base_prior,
@@ -507,19 +508,18 @@ class MobilePlanMultiBlockCleanPriorFlowMatchingActionHead(
             self.flow_tokens_per_block,
             action_model_prediction.shape[-1],
         )
-        endpoint = self.prior_flow_index
         if self.prior_config.predict_base:
             self._latest_base_prior = block[
                 :,
                 :,
-                endpoint,
+                self.prior_flow_indices,
                 self.base_action_dim : 2 * self.base_action_dim,
             ].detach()
         if self.prior_config.predict_eef:
             self._latest_eef_prior = block[
                 :,
                 :,
-                endpoint,
+                self.prior_flow_indices,
                 2 * self.base_action_dim : (
                     2 * self.base_action_dim
                     + 3

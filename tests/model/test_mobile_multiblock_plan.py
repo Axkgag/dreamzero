@@ -226,6 +226,36 @@ class MobileMultiBlockPlanTest(unittest.TestCase):
         self.assertGreater(block[:, :, 1, 4:17].abs().sum().item(), 0)
         torch.testing.assert_close(block[:, :, 0, 4:17], torch.zeros(2, 3, 13))
 
+    def test_four_priors_support_seven_waypoint_blocks(self) -> None:
+        prior_indices = [2, 4, 5, 6]
+        encoder = MultiBlockCleanPriorActionEncoder(
+            base_action_dim=4,
+            manipulator_action_dim=21,
+            hidden_size=32,
+            num_embodiments=1,
+            plan_local_offsets=[1, 2, 4, 8, 16, 32, 48],
+            prior_flow_indices=prior_indices,
+            control_fps=30.0,
+        )
+        decoder = MultiBlockCleanPriorActionDecoder(
+            base_action_dim=4,
+            manipulator_action_dim=21,
+            hidden_size=16,
+            model_dim=32,
+            num_embodiments=1,
+            waypoints_per_block=7,
+            prior_flow_indices=prior_indices,
+        )
+        action = torch.randn(2, 56, 21)
+        timestep = torch.randint(0, 1000, (2, 56))
+        category = torch.zeros(2, dtype=torch.long)
+        hidden = encoder(action, timestep, category)
+        self.assertEqual(tuple(hidden.shape), (2, 72, 32))
+        prediction = decoder(hidden, category)
+        self.assertEqual(tuple(prediction.shape), (2, 56, 21))
+        block = prediction.reshape(2, 4, 14, 21)
+        self.assertGreater(block[:, :, prior_indices, 4:17].abs().sum().item(), 0)
+
     def test_prior_timestep_is_clean_per_block(self) -> None:
         model = WanVideoDiTMultiBlockDualPlanPrior.__new__(
             WanVideoDiTMultiBlockDualPlanPrior

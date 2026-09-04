@@ -5,6 +5,10 @@ import unittest
 import numpy as np
 
 from groot.vla.data.plan_geometry import build_dynamic_block_plan_labels
+from groot.vla.data.dataset.mobilemanibench_block_plan import (
+    coherent_block_masks,
+    variable_block_layout,
+)
 from groot.vla.utils.mobile_plan_spec import (
     EEF_ROTATION_CURRENT_EEF_DELTA_ROTVEC,
     block_plan_spec_hash,
@@ -127,6 +131,50 @@ class MobileManiBenchBlockPlanLabelsTest(unittest.TestCase):
         np.testing.assert_array_equal(base_plan[-1], 0)
         np.testing.assert_array_equal(manipulator[-1], 0)
         np.testing.assert_array_equal(state[-1, 1], 0)
+
+    def test_terminal_may_end_inside_any_later_block(self) -> None:
+        self.assertEqual(
+            variable_block_layout(171, 0, 48, 4, True),
+            (3, 3, 26, 22),
+        )
+        self.assertEqual(
+            variable_block_layout(171, 74, 48, 4, True),
+            (2, -1, 0, 0),
+        )
+        self.assertEqual(
+            variable_block_layout(171, 100, 48, 4, True),
+            (1, 1, 22, 26),
+        )
+        self.assertEqual(
+            variable_block_layout(171, 100, 48, 4, False),
+            (1, -1, 22, 0),
+        )
+
+    def test_root_must_have_one_complete_block(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no complete"):
+            variable_block_layout(171, 123, 48, 4, True)
+
+    def test_partial_supervision_is_reduced_to_complete_block_prefix(self) -> None:
+        plan_valid = np.asarray(
+            [
+                [True, True],
+                [True, False],
+                [True, True],
+                [True, True],
+            ]
+        )
+        state_valid = np.ones(4, dtype=bool)
+        latent_valid = np.ones(9, dtype=bool)
+        plan, state, latent, blocks = coherent_block_masks(
+            plan_valid, state_valid, latent_valid
+        )
+        np.testing.assert_array_equal(blocks, [True, False, False, False])
+        self.assertTrue(plan[0].all())
+        self.assertFalse(plan[1:].any())
+        np.testing.assert_array_equal(state, [True, False, False, False])
+        np.testing.assert_array_equal(
+            latent, [True, True, True, False, False, False, False, False, False]
+        )
 
 
 if __name__ == "__main__":

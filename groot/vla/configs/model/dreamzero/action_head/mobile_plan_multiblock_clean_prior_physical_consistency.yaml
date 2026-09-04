@@ -4,18 +4,14 @@ defaults:
   - mobile_plan_multiblock_flow_matching
   - _self_
 
-num_action_per_block: 5
+num_action_per_block: 18
 
 action_head_cfg:
   _target_: groot.vla.model.dreamzero.action_head.mobile_plan_multiblock_flow_matching.MobilePlanMultiBlockCleanPriorFlowMatchingActionHead
   config:
     _target_: groot.vla.model.dreamzero.action_head.mobile_plan_multiblock_flow_matching.MobilePlanMultiBlockCleanPriorPolicyHeadConfig
     prior_condition_mode: normal
-    prior:
-      time_offsets: [8]
-      predict_base: true
-      predict_eef: false
-      eef_frame: future_base
+    prior: ${prior}
     base_prior_loss_weight: 0.1
     base_prior_xy_loss_weight: 1.0
     base_prior_yaw_loss_weight: 1.0

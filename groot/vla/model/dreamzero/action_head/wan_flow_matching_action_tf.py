@@ -938,7 +938,22 @@ class WANPolicyHead(ActionHead):
             ).mean(dim=(1,3,4))  # shape: [B, ...]
 
             weight_dynamics = dynamics_loss_per_sample * self.scheduler.training_weight(timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1])).to(self._device)
-            weighted_dynamics_loss = weight_dynamics.mean()
+            video_latent_valid = action_input.get("video_latent_valid")
+            if video_latent_valid is not None:
+                video_latent_valid = video_latent_valid.to(
+                    device=weight_dynamics.device, dtype=weight_dynamics.dtype
+                )
+                if video_latent_valid.shape != weight_dynamics.shape:
+                    raise ValueError(
+                        "video_latent_valid must match encoded video latents: "
+                        f"mask={tuple(video_latent_valid.shape)}, "
+                        f"loss={tuple(weight_dynamics.shape)}"
+                    )
+                weighted_dynamics_loss = (
+                    weight_dynamics * video_latent_valid
+                ).sum() / video_latent_valid.sum().clamp_min(1.0)
+            else:
+                weighted_dynamics_loss = weight_dynamics.mean()
             
             if actions.numel() > 0:
                 action_losses = self.compute_action_losses(
@@ -952,7 +967,8 @@ class WANPolicyHead(ActionHead):
                     action_model_aux={
                         "physical_block_state": action_input.get(
                             "physical_block_state"
-                        )
+                        ),
+                        "block_valid": action_input.get("block_valid"),
                     },
                 )
                 weighted_action_loss = action_losses["action_loss"]
@@ -969,6 +985,53 @@ class WANPolicyHead(ActionHead):
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
         }
+        if video_latent_valid is not None:
+            output_dict["valid_video_ratio_metric"] = video_latent_valid.mean()
+        block_valid = action_input.get("block_valid")
+        if block_valid is not None:
+            output_dict["valid_block_ratio_metric"] = block_valid.float().mean()
+        output_dict["valid_plan_ratio_metric"] = action_mask.float().mean()
+        phase_ids = action_input.get("sample_phase_id")
+        if phase_ids is not None:
+            for phase_id, phase_name in enumerate(
+                ("navigation", "approach", "grasp", "manipulation")
+            ):
+                output_dict[f"sampled_phase_ratio/{phase_name}_metric"] = (
+                    phase_ids == phase_id
+                ).float().mean()
+        sampled_block_slot = action_input.get("sampled_block_slot")
+        if sampled_block_slot is not None:
+            for block_index in range(int(getattr(self, "num_plan_blocks", 1))):
+                output_dict[f"sampled_block_slot_ratio/{block_index}_metric"] = (
+                    sampled_block_slot == block_index
+                ).float().mean()
+        sampled_horizon = action_input.get("sampled_horizon")
+        if sampled_horizon is not None and hasattr(self.config, "plan_local_offsets"):
+            for horizon in self.config.plan_local_offsets:
+                output_dict[f"sampled_waypoint_horizon_ratio/{horizon}_metric"] = (
+                    sampled_horizon == int(horizon)
+                ).float().mean()
+        full_window = action_input.get("full_window")
+        if full_window is not None:
+            output_dict["full_window_ratio_metric"] = full_window.float().mean()
+        for field, metric_name in (
+            ("plan_real_valid", "real_plan_ratio_metric"),
+            ("plan_hold_valid", "hold_plan_ratio_metric"),
+            ("video_latent_real_valid", "real_video_ratio_metric"),
+            ("video_latent_hold_valid", "hold_video_ratio_metric"),
+        ):
+            semantic_mask = action_input.get(field)
+            if semantic_mask is not None:
+                output_dict[metric_name] = semantic_mask.float().mean()
+        success_hold = action_input.get("success_hold")
+        if success_hold is not None:
+            output_dict["success_hold_ratio_metric"] = (
+                success_hold.float().mean()
+            )
+        for field in ("num_real_blocks", "num_valid_blocks"):
+            block_count = action_input.get(field)
+            if block_count is not None:
+                output_dict[f"{field}_mean_metric"] = block_count.float().mean()
         if timestep_action is not None:
             action_sigma = self.scheduler.sigma_from_timestep(
                 timestep_action,

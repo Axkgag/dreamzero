@@ -27,11 +27,22 @@ class RequiredFrozenModule(torch.nn.Module):
 
 
 class CheckpointStateTest(unittest.TestCase):
-    def test_wan_required_state_excludes_reconstructible_offset_seconds(self) -> None:
+    def test_wan_required_state_excludes_reconstructible_buffers(self) -> None:
         self.assertTrue(is_reconstructible_checkpoint_state_key("offset_seconds"))
         self.assertTrue(
             is_reconstructible_checkpoint_state_key(
                 "model.action_encoder.offset_seconds"
+            )
+        )
+        self.assertTrue(
+            is_reconstructible_checkpoint_state_key(
+                "expected_plan_local_offsets"
+            )
+        )
+        self.assertTrue(
+            is_reconstructible_checkpoint_state_key(
+                "action_head.model.base_model.model."
+                "expected_plan_local_offsets"
             )
         )
         self.assertFalse(
